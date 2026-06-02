@@ -1,0 +1,1298 @@
+"""
+PDF Conversion Tool
+Converts .eml, .msg, and .html files to PDF.
+Email conversion uses Microsoft Outlook/Word via COM automation.
+HTML conversion uses Microsoft Word via COM automation.
+Requires: Microsoft Office installed on the machine.
+"""
+
+import os
+import sys
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from pathlib import Path
+import tempfile
+import shutil
+import html as htmllib
+import re
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    HAS_DND = True
+except ImportError:
+    HAS_DND = False
+
+try:
+    import win32com.client
+    import pythoncom
+    HAS_COM = True
+except ImportError:
+    HAS_COM = False
+
+
+# ─────────────────────────────────────────────
+# Outlook COM conversion
+# ─────────────────────────────────────────────
+
+# Outlook constants
+olFolderInbox      = 6
+olMsg              = 3      # .msg save format
+PR_ATTACH_METHOD   = 0x37200003
+
+def _ensure_outlook():
+    """Return an Outlook Application COM object, raising clearly if unavailable."""
+    if not HAS_COM:
+        raise RuntimeError(
+            "pywin32 is not installed.\n"
+            "Run: pip install pywin32"
+        )
+    try:
+        pythoncom.CoInitialize()
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        return outlook
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not launch Outlook.\n"
+            f"Make sure Microsoft Outlook is installed and has been set up.\n\n"
+            f"Detail: {e}"
+        )
+
+
+def _safe_filename(name: str) -> str:
+    """Strip characters that are illegal in Windows filenames."""
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip() or "attachment"
+
+
+def _attachments_dir(out_path: Path) -> Path:
+    """Return the attachments subfolder path for a given PDF output path."""
+    return out_path.parent / out_path.stem
+
+
+def _save_eml_attachments(src_path: Path, out_path: Path):
+    """
+    Extract real (non-inline) attachments from a .eml file and save them
+    into a subfolder named after the PDF. Returns the number saved.
+    """
+    import email as emaillib
+    import email.policy
+    from email.header import decode_header, make_header
+    import base64
+
+    def decode_str(value):
+        if not value:
+            return ""
+        try:
+            return str(make_header(decode_header(value)))
+        except Exception:
+            return str(value)
+
+    with open(src_path, "rb") as f:
+        msg = emaillib.message_from_binary_file(f, policy=emaillib.policy.compat32)
+
+    saved = 0
+    att_dir = None
+
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        ct  = part.get_content_type()
+        cd  = str(part.get("Content-Disposition") or "")
+        cid = part.get("Content-ID", "").strip("<>")
+
+        # Skip inline images (embedded in the body) and body text parts
+        is_inline_image = ct.startswith("image/") and cid and "attachment" not in cd
+        is_body = ct in ("text/html", "text/plain") and "attachment" not in cd
+        if is_inline_image or is_body:
+            continue
+
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+
+        fname = decode_str(part.get_filename() or "")
+        if not fname:
+            # Build a sensible name from content-type
+            ext = ct.split("/")[-1].split(";")[0].strip()
+            fname = f"attachment_{saved + 1}.{ext}"
+
+        if att_dir is None:
+            att_dir = _attachments_dir(out_path)
+            att_dir.mkdir(parents=True, exist_ok=True)
+
+        dest = att_dir / _safe_filename(fname)
+        # Avoid overwriting if two attachments share a name
+        if dest.exists():
+            dest = att_dir / f"{dest.stem}_{saved + 1}{dest.suffix}"
+        dest.write_bytes(payload)
+        saved += 1
+
+    return saved
+
+
+def _save_msg_attachments(mail, out_path: Path) -> int:
+    """
+    Extract attachments from an open Outlook COM mail item and save them
+    into a subfolder named after the PDF. Returns the number saved.
+    """
+    try:
+        attachments = mail.Attachments
+        count = attachments.Count
+    except Exception:
+        return 0
+
+    if count == 0:
+        return 0
+
+    att_dir = _attachments_dir(out_path)
+    att_dir.mkdir(parents=True, exist_ok=True)
+    saved = 0
+
+    for i in range(1, count + 1):   # COM collections are 1-indexed
+        try:
+            att = attachments.Item(i)
+
+            # PR_ATTACH_METHOD: 5 = OLE object (skip), 6 = embedded message
+            # Type 5/6 are rarely useful as files; skip them
+            try:
+                att_type = att.Type
+                if att_type in (5, 6):
+                    continue
+            except Exception:
+                pass
+
+            fname = _safe_filename(att.FileName or f"attachment_{i}")
+            dest = att_dir / fname
+            if dest.exists():
+                dest = att_dir / f"{dest.stem}_{i}{dest.suffix}"
+
+            att.SaveAsFile(str(dest.resolve()))
+            saved += 1
+        except Exception:
+            pass   # skip attachments that can't be saved
+
+    # Remove the folder if nothing was actually saved
+    if saved == 0:
+        try:
+            att_dir.rmdir()
+        except Exception:
+            pass
+
+    return saved
+
+
+def _msg_to_pdf(src_path: Path, out_path: Path, outlook, word):
+    """Convert a .msg file to PDF and extract attachments via Outlook COM."""
+    mail = outlook.Session.OpenSharedItem(str(src_path.resolve()))
+    try:
+        _print_mail_to_pdf(mail, out_path, word)
+        _save_msg_attachments(mail, out_path)
+    finally:
+        mail.Close(0)   # 0 = olDiscard
+
+
+def _parse_eml_to_html(src_path: Path) -> str:
+    """
+    Parse a .eml file using Python's stdlib email module and return a
+    fully self-contained HTML document (inline images embedded as data URIs).
+    """
+    import email as emaillib
+    import email.policy
+    from email.header import decode_header, make_header
+    import base64
+
+    def decode_str(value):
+        if not value:
+            return ""
+        try:
+            return str(make_header(decode_header(value)))
+        except Exception:
+            return str(value)
+
+    with open(src_path, "rb") as f:
+        msg = emaillib.message_from_binary_file(f, policy=emaillib.policy.compat32)
+
+    subject = decode_str(msg.get("Subject", "(No Subject)"))
+    from_   = decode_str(msg.get("From", ""))
+    to_     = decode_str(msg.get("To", ""))
+    cc_     = decode_str(msg.get("CC", ""))
+    date_   = decode_str(msg.get("Date", ""))
+
+    html_body  = None
+    plain_body = None
+    cid_map    = {}
+    attachments = []
+
+    for part in msg.walk():
+        ct  = part.get_content_type()
+        cd  = str(part.get("Content-Disposition") or "")
+        cid = part.get("Content-ID", "").strip("<>")
+
+        if part.is_multipart():
+            continue
+
+        def _decode(p):
+            payload = p.get_payload(decode=True)
+            if payload is None:
+                return ""
+            charset = p.get_content_charset() or "utf-8"
+            return payload.decode(charset, errors="replace")
+
+        if ct == "text/html" and "attachment" not in cd and html_body is None:
+            html_body = _decode(part)
+        elif ct == "text/plain" and "attachment" not in cd and plain_body is None:
+            plain_body = _decode(part)
+        elif ct.startswith("image/") and cid:
+            payload = part.get_payload(decode=True)
+            if payload:
+                b64 = base64.b64encode(payload).decode()
+                cid_map[cid] = f"data:{ct};base64,{b64}"
+        elif "attachment" in cd:
+            fname = part.get_filename() or "attachment"
+            attachments.append(decode_str(fname))
+
+    # Inline CID images
+    if html_body and cid_map:
+        for cid, data_uri in cid_map.items():
+            html_body = re.sub(
+                re.escape(f"cid:{cid}"), data_uri, html_body, flags=re.IGNORECASE
+            )
+
+    # Build header block
+    def hrow(label, value):
+        if not value:
+            return ""
+        return (
+            f'<tr>'
+            f'<td style="font-weight:bold;color:#444;white-space:nowrap;padding:2px 8px 2px 0;vertical-align:top">{label}:</td>'
+            f'<td style="color:#111">{htmllib.escape(value)}</td>'
+            f'</tr>'
+        )
+
+    header_html = (
+        '<div style="border-bottom:2px solid #0078d4;padding-bottom:10px;margin-bottom:16px;">'
+        '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:10pt">'
+        + hrow("From", from_)
+        + hrow("To", to_)
+        + hrow("CC", cc_)
+        + hrow("Date", date_)
+        + f'<tr><td style="font-weight:bold;color:#444;padding:2px 8px 2px 0;vertical-align:top">Subject:</td>'
+          f'<td style="font-size:13pt;font-weight:bold;color:#0078d4">{htmllib.escape(subject)}</td></tr>'
+        + '</table></div>'
+    )
+
+    if attachments:
+        names = htmllib.escape(", ".join(attachments))
+        header_html += (
+            f'<div style="margin-bottom:12px;font-family:Arial,sans-serif;font-size:9pt;color:#555;">'
+            f'📎 Attachments: {names}</div>'
+        )
+
+    if html_body:
+        if re.search(r"<body[^>]*>", html_body, re.IGNORECASE):
+            full_html = re.sub(
+                r"(<body[^>]*>)", r"\1" + header_html,
+                html_body, count=1, flags=re.IGNORECASE,
+            )
+        else:
+            full_html = (
+                "<html><head><meta charset='utf-8'></head><body>"
+                + header_html + html_body + "</body></html>"
+            )
+    else:
+        body_escaped = htmllib.escape(plain_body or "(No message body)")
+        full_html = (
+            "<html><head><meta charset='utf-8'></head><body>"
+            + header_html
+            + f"<pre style='font-family:Arial,sans-serif;white-space:pre-wrap'>{body_escaped}</pre>"
+            + "</body></html>"
+        )
+
+    return full_html
+
+
+def _eml_to_pdf(src_path: Path, out_path: Path, outlook, word):
+    """
+    Convert a .eml file to PDF and extract attachments.
+    Parses the .eml directly in Python (no Outlook involvement) then
+    exports via Word — avoids the 'Invalid path or URL' COM error entirely.
+    """
+    if word is None:
+        raise RuntimeError(
+            "Microsoft Word is required to convert .eml files on this version of Outlook.\n"
+            "Please ensure Word is installed."
+        )
+
+    html_doc = _parse_eml_to_html(src_path)
+    tmp_dir = Path(tempfile.mkdtemp())
+    doc = None
+    try:
+        tmp_html = tmp_dir / "email.html"
+        tmp_html.write_text(html_doc, encoding="utf-8")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        doc = word.Documents.Open(
+            str(tmp_html.resolve()),
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+        )
+        doc.ExportAsFixedFormat(
+            OutputFileName=str(out_path.resolve()),
+            ExportFormat=17,        # wdExportFormatPDF
+            OpenAfterExport=False,
+            OptimizeFor=0,
+            Range=0,
+            Item=0,
+            IncludeDocProps=True,
+            KeepIRM=True,
+            CreateBookmarks=0,
+            DocStructureTags=True,
+            BitmapMissingFonts=True,
+            UseISO19005_1=False,
+        )
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=False)
+            except Exception:
+                pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # Extract attachments into a subfolder alongside the PDF
+    _save_eml_attachments(src_path, out_path)
+
+
+
+def _mail_to_pdf_via_outlook(mail, out_path: Path) -> bool:
+    """
+    Method 1: Outlook's native ExportAsFixedFormat (Outlook 2010+).
+    Returns True on success, False if the method simply doesn't exist on this version.
+    Raises on any other error so the caller can see the real problem.
+    """
+    try:
+        mail.ExportAsFixedFormat(
+            0,                          # olPDF
+            str(out_path.resolve()),
+            False,                      # open after export
+            False,                      # optimise for print
+        )
+        return True
+    except AttributeError:
+        return False   # method doesn't exist on this Outlook version
+    except Exception as e:
+        err = str(e).lower()
+        # "unknown name" or "does not support" means the method isn't there
+        if "unknown name" in err or "not supported" in err or "0x80020006" in err:
+            return False
+        raise   # real error — surface it
+
+
+def _mail_to_pdf_via_word(mail, out_path: Path, word) -> bool:
+    """
+    Method 2: Pull HTML body from the Outlook COM item, write a temp HTML file,
+    open it in the provided Word instance, export as PDF.
+    Works on Office 2007+ without any printer or admin access.
+    `word` is a shared Word.Application COM object (may be None if Word unavailable).
+    Raises on failure so the caller can surface the real error message.
+    """
+    if word is None:
+        raise RuntimeError(
+            "Microsoft Word is not installed or could not be launched.\n"
+            "Word is required as a fallback PDF renderer on this version of Outlook."
+        )
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    doc = None
+    try:
+        # ── Pull content from the COM mail item ───────────────────────────
+        html_body = None
+        plain_body = None
+        try:
+            html_body = mail.HTMLBody
+        except Exception:
+            pass
+        if not html_body:
+            try:
+                plain_body = mail.Body
+            except Exception:
+                pass
+
+        def safe_get(attr):
+            try:
+                return str(getattr(mail, attr) or "").strip()
+            except Exception:
+                return ""
+
+        subject  = safe_get("Subject") or "(No Subject)"
+        from_    = safe_get("SenderName") or safe_get("SenderEmailAddress")
+        to_      = safe_get("To")
+        cc_      = safe_get("CC")
+        try:
+            received = str(mail.ReceivedTime)
+        except Exception:
+            received = ""
+
+        # ── Build header block ────────────────────────────────────────────
+        def hrow(label, value):
+            if not value:
+                return ""
+            return (
+                f'<tr>'
+                f'<td style="font-weight:bold;color:#444;white-space:nowrap;padding:2px 8px 2px 0;vertical-align:top">{label}:</td>'
+                f'<td style="color:#111">{htmllib.escape(value)}</td>'
+                f'</tr>'
+            )
+
+        header_html = (
+            '<div style="border-bottom:2px solid #0078d4;padding-bottom:10px;margin-bottom:16px;">'
+            '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:10pt">'
+            + hrow("From", from_)
+            + hrow("To", to_)
+            + hrow("CC", cc_)
+            + hrow("Date", received)
+            + f'<tr><td style="font-weight:bold;color:#444;padding:2px 8px 2px 0;vertical-align:top">Subject:</td>'
+              f'<td style="font-size:13pt;font-weight:bold;color:#0078d4">{htmllib.escape(subject)}</td></tr>'
+            + '</table></div>'
+        )
+
+        if html_body:
+            if re.search(r"<body[^>]*>", html_body, re.IGNORECASE):
+                full_html = re.sub(
+                    r"(<body[^>]*>)",
+                    r"\1" + header_html,
+                    html_body, count=1, flags=re.IGNORECASE,
+                )
+            else:
+                full_html = (
+                    "<html><head><meta charset='utf-8'></head><body>"
+                    + header_html + html_body + "</body></html>"
+                )
+        else:
+            body_escaped = htmllib.escape(plain_body or "(No message body)")
+            full_html = (
+                "<html><head><meta charset='utf-8'></head><body>"
+                + header_html
+                + f"<pre style='font-family:Arial,sans-serif;white-space:pre-wrap'>{body_escaped}</pre>"
+                + "</body></html>"
+            )
+
+        # ── Write temp HTML and open in Word ──────────────────────────────
+        tmp_html = tmp_dir / "email.html"
+        tmp_html.write_text(full_html, encoding="utf-8")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        doc = word.Documents.Open(
+            str(tmp_html.resolve()),
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+        )
+
+        doc.ExportAsFixedFormat(
+            OutputFileName=str(out_path.resolve()),
+            ExportFormat=17,        # wdExportFormatPDF
+            OpenAfterExport=False,
+            OptimizeFor=0,          # wdExportOptimizeForPrint
+            Range=0,                # wdExportAllDocument
+            Item=0,                 # wdExportDocumentContent
+            IncludeDocProps=True,
+            KeepIRM=True,
+            CreateBookmarks=0,
+            DocStructureTags=True,
+            BitmapMissingFonts=True,
+            UseISO19005_1=False,
+        )
+        return True
+
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=False)
+            except Exception:
+                pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _ensure_word():
+    """
+    Launch a hidden Word Application COM instance.
+    Returns the COM object, or None if Word is not installed.
+    """
+    try:
+        w = win32com.client.Dispatch("Word.Application")
+        w.Visible = False
+        w.DisplayAlerts = False
+        return w
+    except Exception:
+        return None
+
+
+def _print_mail_to_pdf(mail, out_path: Path, word):
+    """
+    Convert an open Outlook mail item to PDF.
+    Tries Outlook-native export first, falls back to Word.
+    `word` is a shared Word.Application COM object (or None).
+    Raises RuntimeError with a descriptive message on failure.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Method 1 — Outlook native (2010+)
+    try:
+        if _mail_to_pdf_via_outlook(mail, out_path):
+            return
+    except Exception as e:
+        raise RuntimeError(f"Outlook PDF export failed: {e}")
+
+    # Method 2 — Word fallback
+    try:
+        _mail_to_pdf_via_word(mail, out_path, word)
+    except Exception as e:
+        raise RuntimeError(f"Word PDF export failed: {e}")
+
+
+def _ensure_visio():
+    """
+    Launch a hidden Visio Application COM instance.
+    Returns the COM object, or None if Visio is not installed.
+    """
+    try:
+        v = win32com.client.Dispatch("Visio.Application")
+        v.Visible = False
+        return v
+    except Exception:
+        return None
+
+
+def _visio_to_pdf(src_path: Path, out_path: Path, visio):
+    """
+    Convert a .vsd or .vsdx file to PDF via Visio COM.
+    Visio's Document.ExportAsFixedFormat handles both formats natively.
+    """
+    if visio is None:
+        raise RuntimeError(
+            "Microsoft Visio is required for Visio conversion.\n"
+            "Please ensure Visio is installed."
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    doc = None
+    try:
+        doc = visio.Documents.Open(str(src_path.resolve()))
+
+        # visFixedFormatPDF = 1
+        doc.ExportAsFixedFormat(
+            1,                          # visFixedFormatPDF
+            str(out_path.resolve()),    # output path
+            1,                          # Intent: print (visIntentPrint)
+            0,                          # All pages
+        )
+    except Exception as e:
+        raise RuntimeError(f"Visio to PDF conversion failed: {e}")
+    finally:
+        if doc is not None:
+            try:
+                doc.Close()
+            except Exception:
+                pass
+
+
+def _ensure_excel():
+    """
+    Launch a hidden Excel Application COM instance.
+    Returns the COM object, or None if Excel is not installed.
+    """
+    try:
+        xl = win32com.client.Dispatch("Excel.Application")
+        xl.Visible = False
+        xl.DisplayAlerts = False
+        return xl
+    except Exception:
+        return None
+
+
+def _excel_to_pdf(src_path: Path, out_path: Path, excel):
+    """
+    Convert a .xls, .xlsx, .xlsm, or .xlsb file to PDF via Excel COM.
+    Prints all sheets to a single PDF.
+    """
+    if excel is None:
+        raise RuntimeError(
+            "Microsoft Excel is required for Excel conversion.\n"
+            "Please ensure Excel is installed."
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb = None
+    try:
+        wb = excel.Workbooks.Open(
+            str(src_path.resolve()),
+            UpdateLinks=False,
+            ReadOnly=True,
+            AddToMru=False,
+        )
+
+        # xlTypePDF = 0, xlQualityStandard = 0
+        wb.ExportAsFixedFormat(
+            0,                          # xlTypePDF
+            str(out_path.resolve()),    # output path
+            0,                          # xlQualityStandard
+            True,                       # IncludeDocProperties
+            False,                      # IgnorePrintAreas
+            OpenAfterPublish=False,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Excel to PDF conversion failed: {e}")
+    finally:
+        if wb is not None:
+            try:
+                wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+
+
+def _word_to_pdf(src_path: Path, out_path: Path, word):
+    """
+    Convert a .doc or .docx file to PDF via Word COM.
+    """
+    if word is None:
+        raise RuntimeError(
+            "Microsoft Word is required for Word document conversion.\n"
+            "Please ensure Word is installed."
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    doc = None
+    try:
+        doc = word.Documents.Open(
+            str(src_path.resolve()),
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+        )
+        doc.ExportAsFixedFormat(
+            OutputFileName=str(out_path.resolve()),
+            ExportFormat=17,        # wdExportFormatPDF
+            OpenAfterExport=False,
+            OptimizeFor=0,          # wdExportOptimizeForPrint
+            Range=0,                # wdExportAllDocument
+            Item=0,                 # wdExportDocumentContent
+            IncludeDocProps=True,
+            KeepIRM=True,
+            CreateBookmarks=0,
+            DocStructureTags=True,
+            BitmapMissingFonts=True,
+            UseISO19005_1=False,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Word document to PDF conversion failed: {e}")
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=False)
+            except Exception:
+                pass
+
+
+def _ensure_powerpoint():
+    """
+    Launch a hidden PowerPoint Application COM instance.
+    Returns the COM object, or None if PowerPoint is not installed.
+    """
+    try:
+        ppt = win32com.client.Dispatch("PowerPoint.Application")
+        # PowerPoint doesn't support Visible=False the same way;
+        # minimise the window instead so it doesn't steal focus
+        ppt.WindowState = 2   # ppWindowMinimized
+        return ppt
+    except Exception:
+        return None
+
+
+def _ppt_to_pdf(src_path: Path, out_path: Path, powerpoint):
+    """
+    Convert a .ppt, .pptx, .pps, or .ppsx file to PDF via PowerPoint COM.
+    """
+    if powerpoint is None:
+        raise RuntimeError(
+            "Microsoft PowerPoint is required for PowerPoint conversion.\n"
+            "Please ensure PowerPoint is installed."
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    prs = None
+    try:
+        prs = powerpoint.Presentations.Open(
+            str(src_path.resolve()),
+            ReadOnly=True,
+            Untitled=False,
+            WithWindow=False,   # don't show a window
+        )
+
+        # ppFixedFormatTypePDF = 2, ppFixedFormatIntentPrint = 2
+        prs.ExportAsFixedFormat(
+            str(out_path.resolve()),
+            2,      # ppFixedFormatTypePDF
+            Intent=2,           # ppFixedFormatIntentPrint
+            FrameSlides=False,
+            HandoutOrder=1,
+            OutputType=1,       # ppPrintOutputSlides
+            PrintHiddenSlides=False,
+            PrintRange=None,
+            RangeType=1,        # ppPrintAll
+            SlideShowName="",
+            IncludeDocProperties=True,
+            KeepIRMSettings=True,
+            DocStructureTags=True,
+            BitmapMissingFonts=True,
+            UseISO19005_1=False,
+        )
+    except Exception as e:
+        raise RuntimeError(f"PowerPoint to PDF conversion failed: {e}")
+    finally:
+        if prs is not None:
+            try:
+                prs.Close()
+            except Exception:
+                pass
+
+
+def convert_file(src_path: Path, out_dir: Path, outlook, word, visio, excel, powerpoint, mode: str) -> Path:
+    """
+    Convert a single file to PDF.
+    mode: 'email', 'html', 'visio', 'excel', 'word_doc', 'powerpoint'
+    Returns the path of the created PDF.
+    """
+    ext = src_path.suffix.lower()
+    out_path = out_dir / (src_path.stem + ".pdf")
+
+    if mode == "email":
+        if ext == ".msg":
+            _msg_to_pdf(src_path, out_path, outlook, word)
+        elif ext == ".eml":
+            _eml_to_pdf(src_path, out_path, outlook, word)
+        else:
+            raise ValueError(f"Unsupported file type for Email mode: {ext}")
+    elif mode == "html":
+        _html_to_pdf(src_path, out_path, word)
+    elif mode == "visio":
+        _visio_to_pdf(src_path, out_path, visio)
+    elif mode == "excel":
+        _excel_to_pdf(src_path, out_path, excel)
+    elif mode == "word_doc":
+        _word_to_pdf(src_path, out_path, word)
+    elif mode == "powerpoint":
+        _ppt_to_pdf(src_path, out_path, powerpoint)
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    return out_path
+
+
+def _html_to_pdf(src_path: Path, out_path: Path, word):
+    """
+    Convert a .html / .htm file to PDF via Word COM.
+    Word opens the HTML file and exports it as PDF — no Outlook needed.
+    """
+    if word is None:
+        raise RuntimeError(
+            "Microsoft Word is required for HTML conversion.\n"
+            "Please ensure Word is installed."
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    doc = None
+    try:
+        doc = word.Documents.Open(
+            str(src_path.resolve()),
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+        )
+        doc.ExportAsFixedFormat(
+            OutputFileName=str(out_path.resolve()),
+            ExportFormat=17,        # wdExportFormatPDF
+            OpenAfterExport=False,
+            OptimizeFor=0,
+            Range=0,
+            Item=0,
+            IncludeDocProps=True,
+            KeepIRM=True,
+            CreateBookmarks=0,
+            DocStructureTags=True,
+            BitmapMissingFonts=True,
+            UseISO19005_1=False,
+        )
+    except Exception as e:
+        raise RuntimeError(f"HTML to PDF conversion failed: {e}")
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=False)
+            except Exception:
+                pass
+
+
+# ─────────────────────────────────────────────
+# GUI
+# ─────────────────────────────────────────────
+
+APP_BG  = "#f0f4f8"
+ACCENT  = "#0078d4"
+BTN_FG  = "#ffffff"
+DROP_BG = "#e8f0fe"
+DROP_BD = "#aac4e8"
+
+
+class ConverterApp:
+    def __init__(self):
+        if HAS_DND:
+            self.root = TkinterDnD.Tk()
+        else:
+            self.root = tk.Tk()
+
+        self.root.title("PDF Conversion Tool")
+        self.root.resizable(True, True)
+        self.root.minsize(480, 520)
+        self.root.configure(bg=APP_BG)
+        self._center_window(560, 580)
+        self._set_icon()
+
+        self.files    = []           # list of Path objects
+        self._out_dir = None         # None → same as source file
+        self._mode    = tk.StringVar(value="Email (.eml, .msg)")
+        self._build_ui()
+
+    def _set_icon(self):
+        """Load icon.ico and set both the title bar and taskbar icon at a legible size."""
+        if getattr(sys, "frozen", False):
+            base = Path(sys.executable).parent
+        else:
+            base = Path(__file__).parent
+        ico = base / "icon.ico"
+        if not ico.exists():
+            return
+        try:
+            # iconbitmap — sets the title bar icon (Windows native)
+            self.root.iconbitmap(str(ico))
+        except Exception:
+            pass
+        try:
+            # iconphoto — sets the taskbar / Alt+Tab icon at full size
+            # Using Pillow to load the largest frame from the .ico
+            from PIL import Image, ImageTk
+            img = Image.open(str(ico))
+            # Pick the largest available size in the .ico (up to 64px for title bar)
+            img = img.resize((64, 64), Image.LANCZOS).convert("RGBA")
+            self._icon_photo = ImageTk.PhotoImage(img)  # keep reference
+            self.root.iconphoto(True, self._icon_photo)
+        except Exception:
+            pass
+
+    # ── layout ──────────────────────────────
+    def _build_ui(self):
+        root = self.root
+
+        # Title bar
+        title_frame = tk.Frame(root, bg=ACCENT)
+        title_frame.pack(fill="x")
+        tk.Label(
+            title_frame,
+            text="  🦉  PDF Conversion Tool",
+            bg=ACCENT, fg=BTN_FG,
+            font=("Segoe UI", 13, "bold"),
+            anchor="w", pady=10,
+        ).pack(fill="x")
+
+        # Mode selector row
+        mode_frame = tk.Frame(root, bg=APP_BG)
+        mode_frame.pack(fill="x", padx=18, pady=(10, 2))
+        tk.Label(
+            mode_frame, text="Conversion mode:",
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+        ).pack(side="left")
+        mode_menu = ttk.Combobox(
+            mode_frame,
+            textvariable=self._mode,
+            values=["Email (.eml, .msg)", "HTML (.html, .htm)", "Visio (.vsd, .vsdx)", "Excel (.xls, .xlsx)", "Word (.doc, .docx)", "PowerPoint (.ppt, .pptx)"],
+            state="readonly",
+            width=26,
+            font=("Segoe UI", 9),
+        )
+        mode_menu.pack(side="left", padx=8)
+        mode_menu.bind("<<ComboboxSelected>>", self._on_mode_change)
+
+        # Drop zone
+        self.drop_frame = tk.Frame(
+            root, bg=DROP_BG,
+            highlightbackground=DROP_BD,
+            highlightthickness=2,
+            relief="flat",
+        )
+        self.drop_frame.pack(fill="both", expand=True, padx=18, pady=(16, 6))
+
+        self.drop_label = tk.Label(
+            self.drop_frame,
+            text="Drop .eml / .msg files here\nor click 'Add Files'",
+            bg=DROP_BG, fg="#4a6fa5",
+            font=("Segoe UI", 11),
+            justify="center",
+        )
+        self.drop_label.pack(expand=True, pady=20)
+        # File list
+        list_frame = tk.Frame(self.drop_frame, bg=DROP_BG)
+        list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical")
+        self.file_list = tk.Listbox(
+            list_frame,
+            yscrollcommand=scrollbar.set,
+            selectmode="extended",
+            bg="#ffffff", fg="#1a1a1a",
+            font=("Segoe UI", 9),
+            relief="flat", bd=1,
+            activestyle="none",
+            highlightthickness=0,
+        )
+        scrollbar.config(command=self.file_list.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.file_list.pack(fill="both", expand=True)
+
+        if HAS_DND:
+            for widget in (self.drop_frame, self.drop_label, list_frame, self.file_list):
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._on_drop)
+
+        # Buttons row
+        btn_frame = tk.Frame(root, bg=APP_BG)
+        btn_frame.pack(fill="x", padx=18, pady=(4, 4))
+
+        for label, cmd in [
+            ("Add Files",        self._add_files),
+            ("Remove Selected",  self._remove_selected),
+            ("Clear All",        self._clear_files),
+        ]:
+            tk.Button(
+                btn_frame, text=label, command=cmd,
+                bg="#e0e8f0", fg="#333",
+                font=("Segoe UI", 9), relief="flat",
+                padx=12, pady=4, cursor="hand2",
+            ).pack(side="left", padx=(0, 6))
+
+        # Output folder row
+        out_frame = tk.Frame(root, bg=APP_BG)
+        out_frame.pack(fill="x", padx=18, pady=(2, 2))
+
+        tk.Label(
+            out_frame, text="Output folder:",
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+        ).pack(side="left")
+
+        self.out_var = tk.StringVar(value="Same as source file")
+        tk.Label(
+            out_frame, textvariable=self.out_var,
+            bg=APP_BG, fg=ACCENT, font=("Segoe UI", 9, "italic"),
+        ).pack(side="left", padx=4)
+
+        tk.Button(
+            out_frame, text="Choose…", command=self._choose_output,
+            bg="#e0e8f0", fg="#333",
+            font=("Segoe UI", 9), relief="flat",
+            padx=8, pady=2, cursor="hand2",
+        ).pack(side="left", padx=4)
+
+        # Progress bar
+        self.progress = ttk.Progressbar(root, mode="determinate")
+        self.progress.pack(fill="x", padx=18, pady=(4, 2))
+
+        # Status label
+        self.status_var = tk.StringVar(value="Ready — add files to get started.")
+        tk.Label(
+            root, textvariable=self.status_var,
+            bg=APP_BG, fg="#555", font=("Segoe UI", 8),
+            anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 4))
+
+        # Convert button
+        self.convert_btn = tk.Button(
+            root, text="Convert",
+            command=self._start_convert,
+            bg=ACCENT, fg=BTN_FG,
+            font=("Segoe UI", 12, "bold"),
+            relief="flat", padx=30, pady=8,
+            cursor="hand2",
+            activebackground="#005a9e",
+            activeforeground=BTN_FG,
+        )
+        self.convert_btn.pack(pady=(4, 14))
+
+    def _allowed_extensions(self):
+        m = self._mode.get()
+        if m.startswith("HTML"):
+            return (".html", ".htm")
+        if m.startswith("Visio"):
+            return (".vsd", ".vsdx")
+        if m.startswith("Excel"):
+            return (".xls", ".xlsx", ".xlsm", ".xlsb")
+        if m.startswith("Word"):
+            return (".doc", ".docx")
+        if m.startswith("PowerPoint"):
+            return (".ppt", ".pptx", ".pps", ".ppsx")
+        return (".eml", ".msg")
+
+    def _on_mode_change(self, event=None):
+        # Clear files when mode changes — they may be wrong type
+        self._clear_files()
+        self._update_drop_label()
+
+    # ── file management ──────────────────────
+    def _add_files(self):
+        m = self._mode.get()
+        if m.startswith("HTML"):
+            filetypes = [("HTML files", "*.html *.htm"), ("All files", "*.*")]
+            title = "Select HTML files"
+        elif m.startswith("Visio"):
+            filetypes = [("Visio files", "*.vsd *.vsdx"), ("All files", "*.*")]
+            title = "Select Visio files"
+        elif m.startswith("Excel"):
+            filetypes = [("Excel files", "*.xls *.xlsx *.xlsm *.xlsb"), ("All files", "*.*")]
+            title = "Select Excel files"
+        elif m.startswith("Word"):
+            filetypes = [("Word files", "*.doc *.docx"), ("All files", "*.*")]
+            title = "Select Word files"
+        elif m.startswith("PowerPoint"):
+            filetypes = [("PowerPoint files", "*.ppt *.pptx *.pps *.ppsx"), ("All files", "*.*")]
+            title = "Select PowerPoint files"
+        else:
+            filetypes = [("Email files", "*.eml *.msg"), ("All files", "*.*")]
+            title = "Select email files"
+        paths = filedialog.askopenfilenames(title=title, filetypes=filetypes)
+        for p in paths:
+            self._add_path(p)
+
+    def _on_drop(self, event):
+        for p in self.root.tk.splitlist(event.data):
+            self._add_path(p)
+
+    def _add_path(self, p):
+        path = Path(p)
+        if path.suffix.lower() not in self._allowed_extensions():
+            return
+        if path not in self.files:
+            self.files.append(path)
+            self.file_list.insert("end", path.name)
+        self._update_drop_label()
+
+    def _remove_selected(self):
+        for i in sorted(self.file_list.curselection(), reverse=True):
+            self.file_list.delete(i)
+            del self.files[i]
+        self._update_drop_label()
+
+    def _clear_files(self):
+        self.files.clear()
+        self.file_list.delete(0, "end")
+        self._update_drop_label()
+
+    def _update_drop_label(self):
+        if self.files:
+            self.drop_label.config(text=f"{len(self.files)} file(s) queued")
+        elif self._mode.get().startswith("HTML"):
+            self.drop_label.config(text="Drop .html / .htm files here\nor click 'Add Files'")
+        elif self._mode.get().startswith("Visio"):
+            self.drop_label.config(text="Drop .vsd / .vsdx files here\nor click 'Add Files'")
+        elif self._mode.get().startswith("Excel"):
+            self.drop_label.config(text="Drop .xls / .xlsx files here\nor click 'Add Files'")
+        elif self._mode.get().startswith("Word"):
+            self.drop_label.config(text="Drop .doc / .docx files here\nor click 'Add Files'")
+        elif self._mode.get().startswith("PowerPoint"):
+            self.drop_label.config(text="Drop .ppt / .pptx files here\nor click 'Add Files'")
+        else:
+            self.drop_label.config(text="Drop .eml / .msg files here\nor click 'Add Files'")
+
+    def _choose_output(self):
+        d = filedialog.askdirectory(title="Select output folder")
+        if d:
+            self._out_dir = Path(d)
+            self.out_var.set(str(self._out_dir))
+        else:
+            self._out_dir = None
+            self.out_var.set("Same as source file")
+
+    # ── conversion ───────────────────────────
+    def _start_convert(self):
+        if not self.files:
+            m = self._mode.get()
+            if m.startswith("HTML"):         label = "HTML"
+            elif m.startswith("Visio"):      label = "Visio"
+            elif m.startswith("Excel"):      label = "Excel"
+            elif m.startswith("Word"):       label = "Word"
+            elif m.startswith("PowerPoint"): label = "PowerPoint"
+            else:                            label = "email"
+            messagebox.showwarning("No Files", f"Please add {label} files first.")
+            return
+        self.convert_btn.config(state="disabled")
+        self.progress["value"] = 0
+        self.progress["maximum"] = len(self.files)
+        threading.Thread(target=self._convert_worker, daemon=True).start()
+
+    def _convert_worker(self):
+        m = self._mode.get()
+        html_mode   = m.startswith("HTML")
+        visio_mode  = m.startswith("Visio")
+        excel_mode  = m.startswith("Excel")
+        word_mode   = m.startswith("Word")
+        ppt_mode    = m.startswith("PowerPoint")
+        email_mode  = not any([html_mode, visio_mode, excel_mode, word_mode, ppt_mode])
+
+        pythoncom.CoInitialize()
+
+        # Outlook — email only
+        outlook = None
+        if email_mode:
+            try:
+                outlook = _ensure_outlook()
+            except Exception as exc:
+                self.root.after(0, lambda: (
+                    self.convert_btn.config(state="normal"),
+                    messagebox.showerror("Outlook Error", str(exc)),
+                ))
+                pythoncom.CoUninitialize()
+                return
+
+        # Word — email, HTML, Word doc modes
+        word = None
+        if email_mode or html_mode or word_mode:
+            word = _ensure_word()
+            if word is None and (html_mode or word_mode):
+                label = "HTML" if html_mode else "Word document"
+                self.root.after(0, lambda: (
+                    self.convert_btn.config(state="normal"),
+                    messagebox.showerror(
+                        "Word Not Found",
+                        f"Microsoft Word is required for {label} conversion.\n"
+                        "Please ensure Word is installed."
+                    ),
+                ))
+                pythoncom.CoUninitialize()
+                return
+
+        # Visio — Visio only
+        visio = None
+        if visio_mode:
+            visio = _ensure_visio()
+            if visio is None:
+                self.root.after(0, lambda: (
+                    self.convert_btn.config(state="normal"),
+                    messagebox.showerror(
+                        "Visio Not Found",
+                        "Microsoft Visio is required for Visio conversion.\n"
+                        "Please ensure Visio is installed."
+                    ),
+                ))
+                pythoncom.CoUninitialize()
+                return
+
+        # Excel — Excel only
+        excel = None
+        if excel_mode:
+            excel = _ensure_excel()
+            if excel is None:
+                self.root.after(0, lambda: (
+                    self.convert_btn.config(state="normal"),
+                    messagebox.showerror(
+                        "Excel Not Found",
+                        "Microsoft Excel is required for Excel conversion.\n"
+                        "Please ensure Excel is installed."
+                    ),
+                ))
+                pythoncom.CoUninitialize()
+                return
+
+        # PowerPoint — PowerPoint only
+        powerpoint = None
+        if ppt_mode:
+            powerpoint = _ensure_powerpoint()
+            if powerpoint is None:
+                self.root.after(0, lambda: (
+                    self.convert_btn.config(state="normal"),
+                    messagebox.showerror(
+                        "PowerPoint Not Found",
+                        "Microsoft PowerPoint is required for PowerPoint conversion.\n"
+                        "Please ensure PowerPoint is installed."
+                    ),
+                ))
+                pythoncom.CoUninitialize()
+                return
+
+        success, failed = 0, []
+        total = len(self.files)
+        if visio_mode:      mode_key = "visio"
+        elif html_mode:     mode_key = "html"
+        elif excel_mode:    mode_key = "excel"
+        elif word_mode:     mode_key = "word_doc"
+        elif ppt_mode:      mode_key = "powerpoint"
+        else:               mode_key = "email"
+
+        for i, src in enumerate(self.files):
+            self._set_status(f"Converting: {src.name}  ({i + 1}/{total})")
+            try:
+                out_dir = self._out_dir if self._out_dir else src.parent
+                convert_file(src, out_dir, outlook, word, visio, excel, powerpoint, mode_key)
+                success += 1
+            except Exception as exc:
+                failed.append((src.name, str(exc)))
+            self.root.after(0, lambda: self.progress.step(1))
+
+        for app in (word, visio, excel, powerpoint):
+            if app is not None:
+                try:
+                    app.Quit()
+                except Exception:
+                    pass
+
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+        self.root.after(0, lambda: self._finish(success, failed))
+
+    def _set_status(self, msg):
+        self.root.after(0, lambda: self.status_var.set(msg))
+
+    def _finish(self, success, failed):
+        self.convert_btn.config(state="normal")
+        if not failed:
+            self.status_var.set(f"✅  Done! {success} file(s) converted successfully.")
+            messagebox.showinfo(
+                "Conversion Complete",
+                f"{success} file(s) converted to PDF successfully.",
+            )
+        else:
+            err_lines = "\n".join(f"• {n}: {e}" for n, e in failed)
+            self.status_var.set(f"⚠️  {success} converted, {len(failed)} failed.")
+            messagebox.showerror(
+                "Conversion Errors",
+                f"{success} succeeded, {len(failed)} failed:\n\n{err_lines}",
+            )
+
+    # ── window ───────────────────────────────
+    def _center_window(self, w, h):
+        self.root.update_idletasks()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        self.root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    def run(self):
+        self.root.mainloop()
+
+
+# ─────────────────────────────────────────────
+def main():
+    app = ConverterApp()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
