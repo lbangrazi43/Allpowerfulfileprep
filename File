@@ -16,6 +16,7 @@ import tempfile
 import shutil
 import html as htmllib
 import re
+import zipfile
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -760,7 +761,7 @@ def _ppt_to_pdf(src_path: Path, out_path: Path, powerpoint):
 def convert_file(src_path: Path, out_dir: Path, outlook, word, visio, excel, powerpoint, mode: str) -> Path:
     """
     Convert a single file to PDF.
-    mode: 'email', 'html', 'visio', 'excel', 'word_doc', 'powerpoint'
+    mode: 'email', 'html', 'visio', 'excel', 'word_doc', 'powerpoint', 'image'
     Returns the path of the created PDF.
     """
     ext = src_path.suffix.lower()
@@ -783,6 +784,8 @@ def convert_file(src_path: Path, out_dir: Path, outlook, word, visio, excel, pow
         _word_to_pdf(src_path, out_path, word)
     elif mode == "powerpoint":
         _ppt_to_pdf(src_path, out_path, powerpoint)
+    elif mode == "image":
+        _image_to_pdf(src_path, out_path, word)
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -834,14 +837,303 @@ def _html_to_pdf(src_path: Path, out_path: Path, word):
 
 
 # ─────────────────────────────────────────────
+# Unzip helpers
+# ─────────────────────────────────────────────
+
+def _find_extraction_root(path: Path) -> Path:
+    """Drill down through single-folder wrappers to find the real content root.
+
+    If the extracted directory contains exactly one subdirectory and no files,
+    descend into that subdirectory and repeat. This strips the common pattern
+    where a zip wraps everything inside a single named folder.
+    """
+    current = path
+    while True:
+        children = list(current.iterdir())
+        subdirs = [c for c in children if c.is_dir()]
+        files   = [c for c in children if c.is_file()]
+        if len(subdirs) == 1 and len(files) == 0:
+            current = subdirs[0]
+        else:
+            return current
+
+
+def _recursive_unzip_in_place(directory: Path):
+    """Find and extract every nested zip anywhere inside directory, repeatedly.
+
+    Each zip is extracted into a folder named after the zip file, then the zip
+    is deleted. The loop repeats until no more zips exist in the tree —
+    handling arbitrary nesting depth (zip inside zip inside zip …).
+    Zips that fail to extract (corrupted, encrypted) are tracked so the loop
+    cannot spin forever on an unextractable file.
+    """
+    failed_zips: set = set()
+    while True:
+        zips = [p for p in directory.rglob("*.zip") if p not in failed_zips]
+        if not zips:
+            break
+        for zip_path in zips:
+            if not zip_path.exists() or zip_path in failed_zips:
+                continue
+            tmp = Path(tempfile.mkdtemp())
+            try:
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    zf.extractall(tmp)
+                content_root = _find_extraction_root(tmp)
+                target_dir = zip_path.parent / zip_path.stem
+                target_dir.mkdir(parents=True, exist_ok=True)
+                for item in content_root.iterdir():
+                    target = target_dir / item.name
+                    if item.is_dir():
+                        if target.exists():
+                            shutil.copytree(str(item), str(target), dirs_exist_ok=True)
+                        else:
+                            shutil.copytree(str(item), str(target))
+                    else:
+                        shutil.copy2(str(item), str(target))
+                zip_path.unlink()
+            except Exception:
+                failed_zips.add(zip_path)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _collect_and_flatten(src_dir: Path, dest_dir: Path):
+    """Copy every file found anywhere inside src_dir into dest_dir as a flat list.
+
+    Folder structure is not preserved. Name collisions get a numeric suffix:
+    report.docx, report_2.docx, report_3.docx, etc.
+    """
+    for item in src_dir.rglob("*"):
+        if item.is_file():
+            target = dest_dir / item.name
+            if target.exists():
+                stem, suffix = item.stem, item.suffix
+                counter = 2
+                while target.exists():
+                    target = dest_dir / f"{stem}_{counter}{suffix}"
+                    counter += 1
+            shutil.copy2(str(item), str(target))
+
+
+def _image_to_pdf(src: Path, out_path: Path, word):
+    """Embed an image in a blank Word document and export as PDF."""
+    doc = word.Documents.Add()
+    try:
+        doc.InlineShapes.AddPicture(
+            FileName=str(src.resolve()),
+            LinkToFile=False,
+            SaveWithDocument=True,
+        )
+        doc.SaveAs2(str(out_path.resolve()), FileFormat=17)  # wdFormatPDF
+    finally:
+        try:
+            doc.Close(SaveChanges=False)
+        except Exception:
+            pass
+
+
+# File-extension → conversion mode for the auto-PDF feature.
+# Word handles txt/rtf/csv/xml natively; images are embedded via _image_to_pdf.
+AUTO_PDF_EXTS = {
+    ".eml": "email",      ".msg": "email",
+    ".html": "html",      ".htm": "html",    ".mht": "html",   ".mhtml": "html",
+    ".vsd": "visio",      ".vsdx": "visio",
+    ".xls": "excel",      ".xlsx": "excel",   ".xlsm": "excel",  ".xlsb": "excel",
+    ".csv": "excel",
+    ".doc": "word_doc",   ".docx": "word_doc",
+    ".txt": "word_doc",   ".rtf": "word_doc",  ".xml": "word_doc",
+    ".ppt": "powerpoint", ".pptx": "powerpoint",
+    ".pps": "powerpoint", ".ppsx": "powerpoint",
+    ".jpg": "image",      ".jpeg": "image",   ".png": "image",
+    ".bmp": "image",      ".gif": "image",    ".tiff": "image",  ".tif": "image",
+}
+
+
+def _auto_pdf_scan_and_convert(output_dir: Path, status_cb):
+    """Scan output_dir recursively for non-PDF files and convert each to PDF.
+
+    Files with no extension are treated as plain text and converted via Word.
+    Existing .pdf files are always skipped and never deleted.
+    The original is deleted ONLY if the output PDF exists and has non-zero size.
+    Returns a list of filenames that could not be converted.
+    COM applications are initialized lazily and quit when done.
+    """
+    if not HAS_COM:
+        status_cb("Auto-PDF skipped: pywin32 is not installed.")
+        return []
+
+    pdf_failed = []
+    pythoncom.CoInitialize()
+    word = excel = visio = powerpoint = outlook = None
+
+    try:
+        files = [
+            f for f in output_dir.rglob("*")
+            if f.is_file()
+            and f.suffix.lower() != ".pdf"          # never touch existing PDFs
+            and (f.suffix == "" or f.suffix.lower() in AUTO_PDF_EXTS)
+        ]
+        if not files:
+            status_cb("Auto-PDF: no convertible files found.")
+        else:
+            total = len(files)
+            converted = 0
+
+            for i, src in enumerate(files):
+                if not src.exists():
+                    continue
+                ext = src.suffix.lower()
+
+                if ext == "":
+                    # No extension — treat as plain text via a temp .txt copy so
+                    # Word opens it without a format-detection dialog.
+                    status_cb(f"Auto-PDF ({i + 1}/{total}): {src.name}  (no extension, treating as text)")
+                    tmp_txt = src.parent / (src.name + ".txt")
+                    out_path = src.parent / (src.name + ".pdf")
+                    try:
+                        if word is None:
+                            word = _ensure_word()
+                        shutil.copy2(str(src), str(tmp_txt))
+                        _word_to_pdf(tmp_txt, out_path, word)
+                        if out_path.exists() and out_path.stat().st_size > 0:
+                            src.unlink()
+                            converted += 1
+                        else:
+                            pdf_failed.append(src.name)
+                    except Exception:
+                        pdf_failed.append(src.name)
+                    finally:
+                        try:
+                            tmp_txt.unlink()
+                        except Exception:
+                            pass
+                    continue
+
+                mode = AUTO_PDF_EXTS[ext]
+                status_cb(f"Auto-PDF ({i + 1}/{total}): {src.name}")
+                try:
+                    if mode == "image":
+                        if word is None:
+                            word = _ensure_word()
+                        out_path = src.parent / (src.stem + ".pdf")
+                        _image_to_pdf(src, out_path, word)
+                    else:
+                        if mode in ("word_doc", "html") and word is None:
+                            word = _ensure_word()
+                        if mode == "excel" and excel is None:
+                            excel = _ensure_excel()
+                        if mode == "visio" and visio is None:
+                            visio = _ensure_visio()
+                        if mode == "powerpoint" and powerpoint is None:
+                            powerpoint = _ensure_powerpoint()
+                        if mode == "email":
+                            if outlook is None:
+                                outlook = _ensure_outlook()
+                            if word is None:
+                                word = _ensure_word()
+                        out_path = convert_file(
+                            src, src.parent, outlook, word, visio, excel, powerpoint, mode
+                        )
+
+                    # Only delete the original if the PDF was actually written
+                    if out_path.exists() and out_path.stat().st_size > 0:
+                        src.unlink()
+                        converted += 1
+                    else:
+                        pdf_failed.append(src.name)
+                except Exception:
+                    pdf_failed.append(src.name)
+
+            status_cb(f"Auto-PDF done: {converted}/{total} file(s) converted.")
+
+    finally:
+        for app in (word, excel, visio, powerpoint):
+            if app is not None:
+                try:
+                    app.Quit()
+                except Exception:
+                    pass
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+    return pdf_failed
+
+
+def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
+                  status_cb, progress_cb, finish_cb):
+    """Thread worker: extract zips, handle flat vs structured output, then
+    optionally auto-convert all non-PDF files to PDF."""
+    success, failed = 0, []
+    total = len(zip_paths)
+
+    for i, zip_path in enumerate(zip_paths):
+        status_cb(f"Extracting: {zip_path.name}  ({i + 1}/{total})")
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(tmp)
+
+            if separate_folders:
+                # Preserve structure; expand nested zips in the destination folder.
+                content_root = _find_extraction_root(tmp)
+                dest = output_dir / zip_path.stem
+                dest.mkdir(parents=True, exist_ok=True)
+                for item in content_root.iterdir():
+                    target = dest / item.name
+                    if item.is_dir():
+                        if target.exists():
+                            shutil.copytree(str(item), str(target), dirs_exist_ok=True)
+                        else:
+                            shutil.copytree(str(item), str(target))
+                    else:
+                        shutil.copy2(str(item), str(target))
+                status_cb(f"Expanding nested zips in {zip_path.stem}…")
+                _recursive_unzip_in_place(dest)
+            else:
+                # Flat mode: expand ALL nested zips inside the temp dir first,
+                # then copy every file at any depth into a single master folder.
+                status_cb(f"Expanding all nested zips in {zip_path.stem}…")
+                _recursive_unzip_in_place(tmp)
+                dest = output_dir
+                dest.mkdir(parents=True, exist_ok=True)
+                status_cb(f"Flattening files from {zip_path.stem} into master folder…")
+                _collect_and_flatten(tmp, dest)
+
+            success += 1
+        except zipfile.BadZipFile:
+            failed.append((zip_path.name, "Not a valid ZIP file or the file is corrupted."))
+        except RuntimeError as e:
+            failed.append((zip_path.name, f"Cannot extract (possibly encrypted): {e}"))
+        except Exception as e:
+            failed.append((zip_path.name, str(e)))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            progress_cb()
+
+    pdf_failed = []
+    if auto_pdf and success > 0:
+        status_cb("Auto-PDF: scanning output folder for convertible files…")
+        pdf_failed = _auto_pdf_scan_and_convert(output_dir, status_cb)
+
+    finish_cb(success, failed, pdf_failed)
+
+
+# ─────────────────────────────────────────────
 # GUI
 # ─────────────────────────────────────────────
 
-APP_BG  = "#f0f4f8"
-ACCENT  = "#0078d4"
-BTN_FG  = "#ffffff"
-DROP_BG = "#e8f0fe"
-DROP_BD = "#aac4e8"
+APP_BG      = "#f0f4f8"
+ACCENT      = "#0078d4"
+BTN_FG      = "#ffffff"
+DROP_BG     = "#e8f0fe"
+DROP_BD     = "#aac4e8"
+SIDEBAR_BG  = "#1e2d3d"
+SIDEBAR_FG  = "#c9d8e8"
+SIDEBAR_SEL = "#0078d4"
+SIDEBAR_W   = 190
 
 
 class ConverterApp:
@@ -851,17 +1143,29 @@ class ConverterApp:
         else:
             self.root = tk.Tk()
 
-        self.root.title("PDF Conversion Tool")
+        self.root.title("All Powerful File Prep")
         self.root.resizable(True, True)
-        self.root.minsize(480, 520)
+        self.root.minsize(860, 600)
         self.root.configure(bg=APP_BG)
-        self._center_window(560, 580)
+        self._center_window(1000, 680)
         self._set_icon()
 
-        self.files    = []           # list of Path objects
-        self._out_dir = None         # None → same as source file
+        # PDF page state
+        self.files    = []
+        self._out_dir = None
         self._mode    = tk.StringVar(value="Email (.eml, .msg)")
-        self._build_ui()
+
+        # Unzip page state
+        self._zip_files     = []
+        self._unzip_out_dir = None
+
+        # Navigation state
+        self._active_page = None
+        self._page_frames = {}
+        self._nav_buttons = {}
+
+        self._build_shell()
+        self._show_page("pdf")
 
     def _set_icon(self):
         """Load icon.ico and set both the title bar and taskbar icon at a legible size."""
@@ -889,23 +1193,76 @@ class ConverterApp:
         except Exception:
             pass
 
-    # ── layout ──────────────────────────────
-    def _build_ui(self):
-        root = self.root
+    # ── shell / navigation ───────────────────
+    def _build_shell(self):
+        """Create the two-column sidebar + content frame layout."""
+        self._sidebar = tk.Frame(self.root, bg=SIDEBAR_BG, width=SIDEBAR_W)
+        self._sidebar.pack(side="left", fill="y")
+        self._sidebar.pack_propagate(False)
 
-        # Title bar
-        title_frame = tk.Frame(root, bg=ACCENT)
-        title_frame.pack(fill="x")
+        self._content = tk.Frame(self.root, bg=APP_BG)
+        self._content.pack(side="left", fill="both", expand=True)
+
         tk.Label(
-            title_frame,
-            text="  🦉  PDF Conversion Tool",
-            bg=ACCENT, fg=BTN_FG,
-            font=("Segoe UI", 13, "bold"),
-            anchor="w", pady=10,
+            self._sidebar,
+            text="🦉\nAll Powerful\nFile Prep",
+            bg=SIDEBAR_BG, fg="#ffffff",
+            font=("Segoe UI", 11, "bold"),
+            justify="center", pady=20,
         ).pack(fill="x")
 
+        tk.Frame(self._sidebar, bg="#3a5068", height=1).pack(fill="x", padx=12, pady=(0, 8))
+
+        for page_key, label in [("pdf", "  PDF Conversion"), ("unzip", "  Folder Unzipping")]:
+            btn = tk.Button(
+                self._sidebar,
+                text=label,
+                bg=SIDEBAR_BG, fg=SIDEBAR_FG,
+                font=("Segoe UI", 10),
+                relief="flat", anchor="w",
+                padx=12, pady=10,
+                cursor="hand2",
+                activebackground=SIDEBAR_SEL,
+                activeforeground="#ffffff",
+                bd=0,
+                command=lambda k=page_key: self._show_page(k),
+            )
+            btn.pack(fill="x")
+            self._nav_buttons[page_key] = btn
+
+    def _show_page(self, key: str):
+        """Switch the visible content page, building it lazily on first visit."""
+        for btn in self._nav_buttons.values():
+            btn.config(bg=SIDEBAR_BG, fg=SIDEBAR_FG)
+        self._nav_buttons[key].config(bg=SIDEBAR_SEL, fg="#ffffff")
+        self._active_page = key
+
+        for frame in self._page_frames.values():
+            frame.pack_forget()
+
+        if key not in self._page_frames:
+            frame = tk.Frame(self._content, bg=APP_BG)
+            self._page_frames[key] = frame
+            if key == "pdf":
+                self._build_pdf_page(frame)
+            elif key == "unzip":
+                self._build_unzip_page(frame)
+
+        self._page_frames[key].pack(fill="both", expand=True)
+
+    # ── layout ──────────────────────────────
+    def _build_pdf_page(self, parent):
+        # Section header
+        tk.Label(
+            parent,
+            text="PDF Conversion",
+            bg=APP_BG, fg="#1a1a1a",
+            font=("Segoe UI", 14, "bold"),
+            anchor="w", padx=18,
+        ).pack(fill="x", pady=(14, 4))
+
         # Mode selector row
-        mode_frame = tk.Frame(root, bg=APP_BG)
+        mode_frame = tk.Frame(parent, bg=APP_BG)
         mode_frame.pack(fill="x", padx=18, pady=(10, 2))
         tk.Label(
             mode_frame, text="Conversion mode:",
@@ -914,7 +1271,7 @@ class ConverterApp:
         mode_menu = ttk.Combobox(
             mode_frame,
             textvariable=self._mode,
-            values=["Email (.eml, .msg)", "HTML (.html, .htm)", "Visio (.vsd, .vsdx)", "Excel (.xls, .xlsx)", "Word (.doc, .docx)", "PowerPoint (.ppt, .pptx)"],
+            values=["Email (.eml, .msg)", "HTML / MHT (.html, .htm, .mht)", "Visio (.vsd, .vsdx)", "Excel (.xls, .xlsx, .csv)", "Word (.doc, .docx, .txt, .rtf, .xml)", "PowerPoint (.ppt, .pptx)", "Image (.jpg, .png, .bmp, .gif, .tiff)"],
             state="readonly",
             width=26,
             font=("Segoe UI", 9),
@@ -924,7 +1281,7 @@ class ConverterApp:
 
         # Drop zone
         self.drop_frame = tk.Frame(
-            root, bg=DROP_BG,
+            parent, bg=DROP_BG,
             highlightbackground=DROP_BD,
             highlightthickness=2,
             relief="flat",
@@ -964,7 +1321,7 @@ class ConverterApp:
                 widget.dnd_bind("<<Drop>>", self._on_drop)
 
         # Buttons row
-        btn_frame = tk.Frame(root, bg=APP_BG)
+        btn_frame = tk.Frame(parent, bg=APP_BG)
         btn_frame.pack(fill="x", padx=18, pady=(4, 4))
 
         for label, cmd in [
@@ -980,7 +1337,7 @@ class ConverterApp:
             ).pack(side="left", padx=(0, 6))
 
         # Output folder row
-        out_frame = tk.Frame(root, bg=APP_BG)
+        out_frame = tk.Frame(parent, bg=APP_BG)
         out_frame.pack(fill="x", padx=18, pady=(2, 2))
 
         tk.Label(
@@ -1002,20 +1359,20 @@ class ConverterApp:
         ).pack(side="left", padx=4)
 
         # Progress bar
-        self.progress = ttk.Progressbar(root, mode="determinate")
+        self.progress = ttk.Progressbar(parent, mode="determinate")
         self.progress.pack(fill="x", padx=18, pady=(4, 2))
 
         # Status label
         self.status_var = tk.StringVar(value="Ready — add files to get started.")
         tk.Label(
-            root, textvariable=self.status_var,
+            parent, textvariable=self.status_var,
             bg=APP_BG, fg="#555", font=("Segoe UI", 8),
             anchor="w",
         ).pack(fill="x", padx=20, pady=(0, 4))
 
         # Convert button
         self.convert_btn = tk.Button(
-            root, text="Convert",
+            parent, text="Convert",
             command=self._start_convert,
             bg=ACCENT, fg=BTN_FG,
             font=("Segoe UI", 12, "bold"),
@@ -1026,18 +1383,268 @@ class ConverterApp:
         )
         self.convert_btn.pack(pady=(4, 14))
 
+    # ── unzip page ───────────────────────────
+    def _build_unzip_page(self, parent):
+        tk.Label(
+            parent,
+            text="Folder Unzipping",
+            bg=APP_BG, fg="#1a1a1a",
+            font=("Segoe UI", 14, "bold"),
+            anchor="w", padx=18,
+        ).pack(fill="x", pady=(14, 4))
+
+        # Drop zone
+        uz_drop_frame = tk.Frame(
+            parent, bg=DROP_BG,
+            highlightbackground=DROP_BD,
+            highlightthickness=2,
+            relief="flat",
+        )
+        uz_drop_frame.pack(fill="both", expand=True, padx=18, pady=(10, 6))
+
+        self._uz_drop_label = tk.Label(
+            uz_drop_frame,
+            text="Drop .zip files here\nor click 'Add Zip Files'",
+            bg=DROP_BG, fg="#4a6fa5",
+            font=("Segoe UI", 11),
+            justify="center",
+        )
+        self._uz_drop_label.pack(expand=True, pady=20)
+
+        uz_list_frame = tk.Frame(uz_drop_frame, bg=DROP_BG)
+        uz_list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        uz_scrollbar = tk.Scrollbar(uz_list_frame, orient="vertical")
+        self._uz_file_list = tk.Listbox(
+            uz_list_frame,
+            yscrollcommand=uz_scrollbar.set,
+            selectmode="extended",
+            bg="#ffffff", fg="#1a1a1a",
+            font=("Segoe UI", 9),
+            relief="flat", bd=1,
+            activestyle="none",
+            highlightthickness=0,
+        )
+        uz_scrollbar.config(command=self._uz_file_list.yview)
+        uz_scrollbar.pack(side="right", fill="y")
+        self._uz_file_list.pack(fill="both", expand=True)
+
+        if HAS_DND:
+            for widget in (uz_drop_frame, self._uz_drop_label, uz_list_frame, self._uz_file_list):
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._uz_on_drop)
+
+        # Buttons row
+        uz_btn_frame = tk.Frame(parent, bg=APP_BG)
+        uz_btn_frame.pack(fill="x", padx=18, pady=(4, 4))
+
+        for label, cmd in [
+            ("Add Zip Files",    self._uz_add_files),
+            ("Remove Selected",  self._uz_remove_selected),
+            ("Clear All",        self._uz_clear_files),
+        ]:
+            tk.Button(
+                uz_btn_frame, text=label, command=cmd,
+                bg="#e0e8f0", fg="#333",
+                font=("Segoe UI", 9), relief="flat",
+                padx=12, pady=4, cursor="hand2",
+            ).pack(side="left", padx=(0, 6))
+
+        # Output folder row
+        uz_out_frame = tk.Frame(parent, bg=APP_BG)
+        uz_out_frame.pack(fill="x", padx=18, pady=(2, 2))
+
+        tk.Label(
+            uz_out_frame, text="Output folder:",
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+        ).pack(side="left")
+
+        self._uz_out_var = tk.StringVar(value="Choose an output folder")
+        self._uz_out_label = tk.Label(
+            uz_out_frame, textvariable=self._uz_out_var,
+            bg=APP_BG, fg="#c0392b", font=("Segoe UI", 9, "italic"),
+        )
+        self._uz_out_label.pack(side="left", padx=4)
+
+        tk.Button(
+            uz_out_frame, text="Choose…", command=self._uz_choose_output,
+            bg="#e0e8f0", fg="#333",
+            font=("Segoe UI", 9), relief="flat",
+            padx=8, pady=2, cursor="hand2",
+        ).pack(side="left", padx=4)
+
+        # Organization options
+        uz_org_frame = tk.Frame(parent, bg=APP_BG)
+        uz_org_frame.pack(fill="x", padx=18, pady=(6, 2))
+
+        tk.Label(
+            uz_org_frame, text="Output organization:",
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+        ).pack(side="left", padx=(0, 10))
+
+        self._uz_separate = tk.BooleanVar(value=True)
+        for text, val in [
+            ("Each zip into its own folder", True),
+            ("All into one folder",          False),
+        ]:
+            tk.Radiobutton(
+                uz_org_frame, text=text, variable=self._uz_separate, value=val,
+                bg=APP_BG, fg="#333", activebackground=APP_BG,
+                font=("Segoe UI", 9),
+            ).pack(side="left", padx=(0, 14))
+
+        # Auto-PDF checkbox
+        uz_autopdf_frame = tk.Frame(parent, bg=APP_BG)
+        uz_autopdf_frame.pack(fill="x", padx=18, pady=(6, 2))
+
+        self._uz_auto_pdf = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            uz_autopdf_frame,
+            text="Auto-convert files to PDF after unzipping  (originals deleted on success)",
+            variable=self._uz_auto_pdf,
+            bg=APP_BG, fg="#333", activebackground=APP_BG,
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).pack(side="left")
+
+        # Progress bar
+        self._uz_progress = ttk.Progressbar(parent, mode="determinate")
+        self._uz_progress.pack(fill="x", padx=18, pady=(6, 2))
+
+        # Status label
+        self._uz_status_var = tk.StringVar(value="Ready — add .zip files to get started.")
+        tk.Label(
+            parent, textvariable=self._uz_status_var,
+            bg=APP_BG, fg="#555", font=("Segoe UI", 8),
+            anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 4))
+
+        # Unzip button (disabled until output folder is chosen)
+        self._uz_btn = tk.Button(
+            parent, text="Unzip Files",
+            command=self._start_unzip,
+            bg=ACCENT, fg=BTN_FG,
+            font=("Segoe UI", 12, "bold"),
+            relief="flat", padx=30, pady=8,
+            cursor="hand2",
+            activebackground="#005a9e",
+            activeforeground=BTN_FG,
+            state="disabled",
+        )
+        self._uz_btn.pack(pady=(4, 14))
+
+    def _uz_add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Select ZIP files",
+            filetypes=[("ZIP archives", "*.zip"), ("All files", "*.*")],
+        )
+        for p in paths:
+            self._uz_add_path(p)
+
+    def _uz_on_drop(self, event):
+        for p in self.root.tk.splitlist(event.data):
+            self._uz_add_path(p)
+
+    def _uz_add_path(self, p):
+        path = Path(p)
+        if path.suffix.lower() != ".zip":
+            return
+        if path not in self._zip_files:
+            self._zip_files.append(path)
+            self._uz_file_list.insert("end", path.name)
+        self._uz_update_drop_label()
+
+    def _uz_remove_selected(self):
+        for i in sorted(self._uz_file_list.curselection(), reverse=True):
+            self._uz_file_list.delete(i)
+            del self._zip_files[i]
+        self._uz_update_drop_label()
+
+    def _uz_clear_files(self):
+        self._zip_files.clear()
+        self._uz_file_list.delete(0, "end")
+        self._uz_update_drop_label()
+
+    def _uz_update_drop_label(self):
+        if self._zip_files:
+            self._uz_drop_label.config(text=f"{len(self._zip_files)} zip file(s) queued")
+        else:
+            self._uz_drop_label.config(text="Drop .zip files here\nor click 'Add Zip Files'")
+
+    def _uz_choose_output(self):
+        d = filedialog.askdirectory(title="Select output folder")
+        if d:
+            self._unzip_out_dir = Path(d)
+            self._uz_out_var.set(str(self._unzip_out_dir))
+            self._uz_out_label.config(fg=ACCENT)
+            self._uz_btn.config(state="normal")
+        elif self._unzip_out_dir is None:
+            self._uz_out_var.set("Choose an output folder")
+            self._uz_out_label.config(fg="#c0392b")
+
+    def _start_unzip(self):
+        if not self._zip_files:
+            messagebox.showwarning("No Files", "Please add ZIP files first.")
+            return
+        if self._unzip_out_dir is None:
+            messagebox.showwarning("No Output Folder", "Please choose an output folder first.")
+            return
+        self._uz_btn.config(state="disabled")
+        self._uz_progress["value"] = 0
+        self._uz_progress["maximum"] = len(self._zip_files)
+        separate  = self._uz_separate.get()
+        auto_pdf  = self._uz_auto_pdf.get()
+        threading.Thread(
+            target=_unzip_worker,
+            args=(
+                list(self._zip_files),
+                self._unzip_out_dir,
+                separate,
+                auto_pdf,
+                lambda msg: self.root.after(0, lambda m=msg: self._uz_status_var.set(m)),
+                lambda: self.root.after(0, lambda: self._uz_progress.step(1)),
+                lambda s, f, pf: self.root.after(0, lambda: self._uz_finish(s, f, pf)),
+            ),
+            daemon=True,
+        ).start()
+
+    def _uz_finish(self, success, failed, pdf_failed=None):
+        self._uz_btn.config(state="normal")
+        if not failed:
+            self._uz_status_var.set(f"Done! {success} archive(s) extracted successfully.")
+            messagebox.showinfo(
+                "Unzip Complete",
+                f"{success} archive(s) extracted successfully.",
+            )
+        else:
+            err_lines = "\n".join(f"• {n}: {e}" for n, e in failed)
+            self._uz_status_var.set(f"{success} extracted, {len(failed)} failed.")
+            messagebox.showerror(
+                "Unzip Errors",
+                f"{success} succeeded, {len(failed)} failed:\n\n{err_lines}",
+            )
+
+        if pdf_failed:
+            file_list = "\n".join(f"• {name}" for name in pdf_failed)
+            messagebox.showwarning(
+                "PDF Conversion Errors",
+                f"The following files could not be converted to PDF:\n\n{file_list}",
+            )
+
     def _allowed_extensions(self):
         m = self._mode.get()
         if m.startswith("HTML"):
-            return (".html", ".htm")
+            return (".html", ".htm", ".mht", ".mhtml")
         if m.startswith("Visio"):
             return (".vsd", ".vsdx")
         if m.startswith("Excel"):
-            return (".xls", ".xlsx", ".xlsm", ".xlsb")
+            return (".xls", ".xlsx", ".xlsm", ".xlsb", ".csv")
         if m.startswith("Word"):
-            return (".doc", ".docx")
+            return (".doc", ".docx", ".txt", ".rtf", ".xml")
         if m.startswith("PowerPoint"):
             return (".ppt", ".pptx", ".pps", ".ppsx")
+        if m.startswith("Image"):
+            return (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif")
         return (".eml", ".msg")
 
     def _on_mode_change(self, event=None):
@@ -1049,20 +1656,23 @@ class ConverterApp:
     def _add_files(self):
         m = self._mode.get()
         if m.startswith("HTML"):
-            filetypes = [("HTML files", "*.html *.htm"), ("All files", "*.*")]
-            title = "Select HTML files"
+            filetypes = [("HTML / MHT files", "*.html *.htm *.mht *.mhtml"), ("All files", "*.*")]
+            title = "Select HTML / MHT files"
         elif m.startswith("Visio"):
             filetypes = [("Visio files", "*.vsd *.vsdx"), ("All files", "*.*")]
             title = "Select Visio files"
         elif m.startswith("Excel"):
-            filetypes = [("Excel files", "*.xls *.xlsx *.xlsm *.xlsb"), ("All files", "*.*")]
-            title = "Select Excel files"
+            filetypes = [("Excel / CSV files", "*.xls *.xlsx *.xlsm *.xlsb *.csv"), ("All files", "*.*")]
+            title = "Select Excel / CSV files"
         elif m.startswith("Word"):
-            filetypes = [("Word files", "*.doc *.docx"), ("All files", "*.*")]
-            title = "Select Word files"
+            filetypes = [("Word / Text files", "*.doc *.docx *.txt *.rtf *.xml"), ("All files", "*.*")]
+            title = "Select Word / Text files"
         elif m.startswith("PowerPoint"):
             filetypes = [("PowerPoint files", "*.ppt *.pptx *.pps *.ppsx"), ("All files", "*.*")]
             title = "Select PowerPoint files"
+        elif m.startswith("Image"):
+            filetypes = [("Image files", "*.jpg *.jpeg *.png *.bmp *.gif *.tiff *.tif"), ("All files", "*.*")]
+            title = "Select image files"
         else:
             filetypes = [("Email files", "*.eml *.msg"), ("All files", "*.*")]
             title = "Select email files"
@@ -1098,15 +1708,17 @@ class ConverterApp:
         if self.files:
             self.drop_label.config(text=f"{len(self.files)} file(s) queued")
         elif self._mode.get().startswith("HTML"):
-            self.drop_label.config(text="Drop .html / .htm files here\nor click 'Add Files'")
+            self.drop_label.config(text="Drop .html / .htm / .mht files here\nor click 'Add Files'")
         elif self._mode.get().startswith("Visio"):
             self.drop_label.config(text="Drop .vsd / .vsdx files here\nor click 'Add Files'")
         elif self._mode.get().startswith("Excel"):
-            self.drop_label.config(text="Drop .xls / .xlsx files here\nor click 'Add Files'")
+            self.drop_label.config(text="Drop .xls / .xlsx / .csv files here\nor click 'Add Files'")
         elif self._mode.get().startswith("Word"):
-            self.drop_label.config(text="Drop .doc / .docx files here\nor click 'Add Files'")
+            self.drop_label.config(text="Drop .doc / .docx / .txt / .rtf files here\nor click 'Add Files'")
         elif self._mode.get().startswith("PowerPoint"):
             self.drop_label.config(text="Drop .ppt / .pptx files here\nor click 'Add Files'")
+        elif self._mode.get().startswith("Image"):
+            self.drop_label.config(text="Drop image files here\nor click 'Add Files'")
         else:
             self.drop_label.config(text="Drop .eml / .msg files here\nor click 'Add Files'")
 
@@ -1123,11 +1735,12 @@ class ConverterApp:
     def _start_convert(self):
         if not self.files:
             m = self._mode.get()
-            if m.startswith("HTML"):         label = "HTML"
+            if m.startswith("HTML"):         label = "HTML / MHT"
             elif m.startswith("Visio"):      label = "Visio"
-            elif m.startswith("Excel"):      label = "Excel"
-            elif m.startswith("Word"):       label = "Word"
+            elif m.startswith("Excel"):      label = "Excel / CSV"
+            elif m.startswith("Word"):       label = "Word / text"
             elif m.startswith("PowerPoint"): label = "PowerPoint"
+            elif m.startswith("Image"):      label = "image"
             else:                            label = "email"
             messagebox.showwarning("No Files", f"Please add {label} files first.")
             return
@@ -1143,7 +1756,8 @@ class ConverterApp:
         excel_mode  = m.startswith("Excel")
         word_mode   = m.startswith("Word")
         ppt_mode    = m.startswith("PowerPoint")
-        email_mode  = not any([html_mode, visio_mode, excel_mode, word_mode, ppt_mode])
+        image_mode  = m.startswith("Image")
+        email_mode  = not any([html_mode, visio_mode, excel_mode, word_mode, ppt_mode, image_mode])
 
         pythoncom.CoInitialize()
 
@@ -1160,12 +1774,14 @@ class ConverterApp:
                 pythoncom.CoUninitialize()
                 return
 
-        # Word — email, HTML, Word doc modes
+        # Word — email, HTML, Word doc, and image modes
         word = None
-        if email_mode or html_mode or word_mode:
+        if email_mode or html_mode or word_mode or image_mode:
             word = _ensure_word()
-            if word is None and (html_mode or word_mode):
-                label = "HTML" if html_mode else "Word document"
+            if word is None and (html_mode or word_mode or image_mode):
+                if html_mode:   label = "HTML / MHT"
+                elif image_mode: label = "Image"
+                else:            label = "Word document"
                 self.root.after(0, lambda: (
                     self.convert_btn.config(state="normal"),
                     messagebox.showerror(
@@ -1232,6 +1848,7 @@ class ConverterApp:
         elif excel_mode:    mode_key = "excel"
         elif word_mode:     mode_key = "word_doc"
         elif ppt_mode:      mode_key = "powerpoint"
+        elif image_mode:    mode_key = "image"
         else:               mode_key = "email"
 
         for i, src in enumerate(self.files):
