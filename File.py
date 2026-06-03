@@ -14,13 +14,6 @@ from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 import tempfile
 import shutil
-import subprocess
-import socket
-import struct
-import base64
-import json
-import time
-import urllib.request
 import html as htmllib
 import re
 import zipfile
@@ -193,29 +186,18 @@ def _save_msg_attachments(mail, out_path: Path) -> int:
 # Make rendered email content fit the PDF page
 # ─────────────────────────────────────────────
 
-# Injected into the <head> of every email HTML document before rendering.
+# Injected into the <head> of every email HTML document before Word renders it.
 # Constrains content to the printable width and forces long content to wrap so
-# nothing spills off the right edge of the page. Browsers (the preferred
-# renderer) honor max-width on tables/images — which is what actually overrides
-# the fixed pixel widths that make email content overflow.
+# nothing spills off the right edge of the page.
 _PRINT_CSS = (
     "<style>"
-    "@page { size: Letter; margin: 0.4in; }"
-    "html, body { margin: 0; padding: 0; width: auto !important; }"
-    # Cap every element at the printable width and let long content wrap, so
-    # nothing (text or tables) can extend past the page edge.
-    "* { box-sizing: border-box; max-width: 100% !important;"
-    " overflow-wrap: anywhere; word-break: break-word;"
-    " -webkit-print-color-adjust: exact; print-color-adjust: exact; }"
-    "img { height: auto !important; }"
+    "@page { size: auto; margin: 0.5in; }"
+    "html, body { margin: 0; padding: 0; }"
+    "img { max-width: 100% !important; height: auto !important; }"
     "table { max-width: 100% !important; }"
-    # Force content tables to honor the page width regardless of any fixed pixel
-    # width in the email; equal columns reflow onto extra pages as needed.
-    # Our own From/To/CC header table (.apfp-header) keeps its natural width.
-    "table:not(.apfp-header) { width: 100% !important; table-layout: fixed !important; }"
-    "td, th { white-space: normal !important;"
-    " overflow-wrap: anywhere; word-break: break-word; }"
+    "td, th { word-wrap: break-word; overflow-wrap: break-word; }"
     "pre { white-space: pre-wrap !important; word-wrap: break-word !important; }"
+    "* { overflow-wrap: break-word; }"
     "</style>"
 )
 
@@ -282,10 +264,9 @@ def _fit_word_doc_to_page(doc, word):
                     tbl.AutoFitBehavior(wdAutoFitWindow)
             except Exception:
                 pass
-            # Recurse into nested tables (common in email layouts).
-            # A Table exposes nested tables via its Range, not directly.
+            # Recurse into nested tables (common in email layouts)
             try:
-                fit_tables(tbl.Range.Tables)
+                fit_tables(tbl.Tables)
             except Exception:
                 pass
 
@@ -307,398 +288,6 @@ def _fit_word_doc_to_page(doc, word):
                     pass
         except Exception:
             pass
-
-
-def _find_browser():
-    """Locate a Chromium-based browser (Edge or Chrome) for headless PDF printing.
-
-    Microsoft Edge ships with Windows 10/11, so this is almost always available.
-    Returns the executable path, or None if none is found.
-    """
-    candidates = [
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    for name in ("msedge", "chrome"):
-        found = shutil.which(name)
-        if found:
-            return found
-    return None
-
-
-class _MiniWS:
-    """Tiny WebSocket client (RFC 6455) over a raw socket — just enough to talk
-    to the browser's DevTools endpoint without any third-party dependency."""
-
-    def __init__(self, url: str, timeout: float = 60.0):
-        assert url.startswith("ws://")
-        hostport, _, path = url[5:].partition("/")
-        host, _, port = hostport.partition(":")
-        self.sock = socket.create_connection((host, int(port)), timeout=timeout)
-        self.sock.settimeout(timeout)
-        key = base64.b64encode(os.urandom(16)).decode()
-        req = (f"GET /{path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
-               f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
-               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
-        self.sock.sendall(req.encode())
-        self._buf = b""
-        while b"\r\n\r\n" not in self._buf:
-            self._buf += self.sock.recv(4096)
-        self._buf = self._buf.split(b"\r\n\r\n", 1)[1]
-
-    def send(self, text: str):
-        p = text.encode()
-        h = bytearray([0x81])          # FIN + text frame
-        n = len(p)
-        m = os.urandom(4)              # client frames must be masked
-        if n < 126:
-            h.append(0x80 | n)
-        elif n < 65536:
-            h.append(0x80 | 126); h += struct.pack(">H", n)
-        else:
-            h.append(0x80 | 127); h += struct.pack(">Q", n)
-        h += m
-        self.sock.sendall(bytes(h) + bytes(b ^ m[i % 4] for i, b in enumerate(p)))
-
-    def _exact(self, n: int) -> bytes:
-        while len(self._buf) < n:
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                raise ConnectionError("websocket closed")
-            self._buf += chunk
-        out, self._buf = self._buf[:n], self._buf[n:]
-        return out
-
-    def recv(self) -> str:
-        data = b""
-        while True:
-            b0, b1 = self._exact(2)
-            fin, opcode, ln = b0 & 0x80, b0 & 0x0f, b1 & 0x7f
-            if ln == 126:
-                ln = struct.unpack(">H", self._exact(2))[0]
-            elif ln == 127:
-                ln = struct.unpack(">Q", self._exact(8))[0]
-            payload = self._exact(ln) if ln else b""
-            if opcode == 0x8:
-                raise ConnectionError("websocket close frame")
-            if opcode == 0x9:          # ping — ignore (server tolerates no pong here)
-                continue
-            data += payload
-            if fin:
-                return data.decode("utf-8", "replace")
-
-    def settimeout(self, t):
-        self.sock.settimeout(t)
-
-    def close(self):
-        try:
-            self.sock.close()
-        except Exception:
-            pass
-
-
-def _read_devtools_port(portfile: Path, proc, deadline: float = 20) -> int:
-    """Wait for and read the DevTools port the browser writes to its profile dir.
-
-    The file is read with retries because on Windows it can briefly raise
-    PermissionError while the browser is still writing it.
-    """
-    end = time.time() + deadline
-    while time.time() < end:
-        try:
-            if portfile.exists():
-                text = portfile.read_text().strip()
-                if text:
-                    return int(text.splitlines()[0])
-        except (PermissionError, OSError, ValueError):
-            pass
-        if proc.poll() is not None:
-            raise RuntimeError("browser exited before becoming ready")
-        time.sleep(0.05)
-    raise RuntimeError("browser did not report a DevTools port")
-
-
-class _BrowserSession:
-    """A single headless Edge/Chrome instance reused for an entire batch.
-
-    Launching a browser process per file costs ~2.5s each; reusing one instance
-    over the DevTools protocol drops that to ~0.2s per file. Falls back cleanly:
-    if anything goes wrong the session marks itself dead and callers render the
-    remaining files the one-shot way (and ultimately via Word).
-    """
-
-    def __init__(self, proc, ws, sess, work_dir, user_data):
-        self._proc = proc
-        self._ws = ws
-        self._cdp_id = 0
-        self._sess = sess
-        self._work = work_dir
-        self._user_data = user_data
-        self._n = 0
-        self.alive = True
-
-    @classmethod
-    def try_start(cls):
-        """Launch and connect a session, or return None if unavailable."""
-        browser = _find_browser()
-        if not browser:
-            return None
-        user_data = Path(tempfile.mkdtemp())
-        work_dir = Path(tempfile.mkdtemp())
-        proc = None
-        try:
-            proc = subprocess.Popen(
-                [browser, "--headless=new", "--disable-gpu", "--no-sandbox",
-                 "--no-first-run", "--no-default-browser-check",
-                 "--disable-logging", "--log-level=3",
-                 "--disable-background-networking", "--disable-sync",
-                 "--disable-extensions", "--disable-component-update", "--mute-audio",
-                 # Block all remote fetches so emails with remote images/tracking
-                 # pixels render instantly instead of stalling on the network.
-                 # (Outlook blocks remote images by default too.) data:/file:
-                 # resources — including .eml inline images — are unaffected.
-                 "--host-resolver-rules=MAP * ~NOTFOUND",
-                 f"--user-data-dir={user_data}", "--remote-debugging-port=0"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            port = _read_devtools_port(user_data / "DevToolsActivePort", proc, deadline=20)
-            ver = json.loads(urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/json/version", timeout=10).read())
-            ws = _MiniWS(ver["webSocketDebuggerUrl"])
-            session = cls(proc, ws, None, work_dir, user_data)
-            target = session._cmd("Target.createTarget", {"url": "about:blank"})["targetId"]
-            session._sess = session._cmd(
-                "Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
-            session._cmd("Page.enable", session_scoped=True)
-            return session
-        except Exception:
-            try:
-                if proc is not None:
-                    proc.terminate()
-            except Exception:
-                pass
-            shutil.rmtree(user_data, ignore_errors=True)
-            shutil.rmtree(work_dir, ignore_errors=True)
-            return None
-
-    def _cmd(self, method, params=None, session_scoped=False):
-        self._cdp_id += 1
-        mid = self._cdp_id
-        msg = {"id": mid, "method": method, "params": params or {}}
-        if session_scoped or method in ("Page.navigate", "Page.printToPDF", "Page.enable"):
-            if self._sess:
-                msg["sessionId"] = self._sess
-        self._ws.send(json.dumps(msg))
-        while True:
-            m = json.loads(self._ws.recv())
-            if m.get("id") == mid:
-                if "error" in m:
-                    raise RuntimeError(f"{method}: {m['error']}")
-                return m.get("result", {})
-            # otherwise it's an event — keep reading
-
-    def _wait_load(self, timeout=8):
-        self._ws.settimeout(timeout)
-        end = time.time() + timeout
-        try:
-            while time.time() < end:
-                m = json.loads(self._ws.recv())
-                if m.get("method") == "Page.loadEventFired":
-                    return
-        except (socket.timeout, OSError):
-            return       # proceed to print anyway
-        finally:
-            self._ws.settimeout(60)
-
-    def render(self, html_doc: str, out_path: Path) -> bool:
-        if not self.alive:
-            return False
-        try:
-            self._n += 1
-            tmp_html = self._work / f"email_{self._n}.html"
-            tmp_html.write_text(html_doc, encoding="utf-8")
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            self._cmd("Page.navigate", {"url": tmp_html.resolve().as_uri()})
-            self._wait_load()
-            result = self._cmd("Page.printToPDF",
-                               {"printBackground": True, "preferCSSPageSize": True})
-            out_path.write_bytes(base64.b64decode(result["data"]))
-            return out_path.exists() and out_path.stat().st_size > 0
-        except Exception:
-            self.alive = False     # session is suspect; remaining files fall back
-            return False
-
-    def close(self):
-        self.alive = False
-        try:
-            self._cmd("Browser.close")
-        except Exception:
-            pass
-        try:
-            self._ws.close()
-        except Exception:
-            pass
-        try:
-            self._proc.terminate()
-        except Exception:
-            pass
-        shutil.rmtree(self._work, ignore_errors=True)
-        shutil.rmtree(self._user_data, ignore_errors=True)
-
-
-# Active shared browser session for the current conversion batch.
-_ACTIVE_BROWSER = None
-
-
-def _start_browser_batch():
-    """Start one shared browser for a batch so every email reuses it instead of
-    launching a new process per file. Safe to call even if a browser is missing
-    (the session is simply None and callers fall back to one-shot/Word)."""
-    global _ACTIVE_BROWSER
-    _ACTIVE_BROWSER = _BrowserSession.try_start()
-
-
-def _end_browser_batch():
-    """Shut down the shared browser session, if any. Idempotent."""
-    global _ACTIVE_BROWSER
-    if _ACTIVE_BROWSER is not None:
-        _ACTIVE_BROWSER.close()
-        _ACTIVE_BROWSER = None
-
-
-def _html_to_pdf_via_browser(html_doc: str, out_path: Path) -> bool:
-    """Render an HTML document to PDF using headless Edge/Chrome.
-
-    Browsers honor the CSS that actually constrains layout — max-width on tables
-    and images overrides the fixed pixel widths that make email content run off
-    the page — so the result matches how the email looked and fits the page.
-    Reuses the batch's shared browser session when one is active; otherwise spins
-    up a one-shot process. Returns False (caller falls back to Word) on failure.
-    """
-    session = _ACTIVE_BROWSER
-    if session is not None and session.alive:
-        if session.render(html_doc, out_path):
-            return True
-        # session render failed — fall through to a fresh one-shot attempt
-    return _html_to_pdf_via_browser_oneshot(html_doc, out_path)
-
-
-def _html_to_pdf_via_browser_oneshot(html_doc: str, out_path: Path) -> bool:
-    """Render to PDF by launching a single short-lived headless browser process.
-    Used for one-off conversions or when the shared session is unavailable."""
-    browser = _find_browser()
-    if not browser:
-        return False
-
-    tmp_dir = Path(tempfile.mkdtemp())
-    user_data = Path(tempfile.mkdtemp())   # isolated profile so a running Edge doesn't interfere
-    try:
-        tmp_html = tmp_dir / "email.html"
-        tmp_html.write_text(html_doc, encoding="utf-8")
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        cmd = [
-            browser,
-            "--headless=new",
-            "--disable-gpu",
-            "--no-sandbox",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-logging", "--log-level=3",
-            # Quiet background activity so startup is fast and deterministic.
-            "--disable-background-networking",
-            "--disable-sync",
-            "--disable-extensions",
-            "--disable-component-update",
-            "--mute-audio",
-            # Block remote fetches so emails with remote images don't stall.
-            "--host-resolver-rules=MAP * ~NOTFOUND",
-            f"--user-data-dir={user_data}",
-            "--no-pdf-header-footer",                      # current flag
-            "--print-to-pdf-no-header",                    # older flag (ignored if unknown)
-            # NOTE: do NOT add --run-all-compositor-stages-before-draw or
-            # --virtual-time-budget here. With headless=new they intermittently
-            # hang the render for the full timeout. Plain --print-to-pdf waits
-            # for the load event and returns in ~1s.
-            f"--print-to-pdf={out_path.resolve()}",
-            tmp_html.resolve().as_uri(),
-        ]
-
-        # Suppress any console window the child might spawn.
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        # Short timeout: a normal render takes ~1s, so if it hasn't finished in
-        # 45s something is wrong (e.g. a stalled remote image) — bail and let the
-        # caller fall back to Word rather than hanging the whole batch.
-        subprocess.run(
-            cmd, timeout=45,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-        )
-        return out_path.exists() and out_path.stat().st_size > 0
-    except Exception:
-        return False
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        shutil.rmtree(user_data, ignore_errors=True)
-
-
-def _html_string_to_pdf_via_word(html_doc: str, out_path: Path, word):
-    """Render an HTML string to PDF via Word COM (fallback when no browser exists)."""
-    tmp_dir = Path(tempfile.mkdtemp())
-    doc = None
-    try:
-        tmp_html = tmp_dir / "email.html"
-        tmp_html.write_text(html_doc, encoding="utf-8")
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        doc = word.Documents.Open(
-            str(tmp_html.resolve()),
-            ConfirmConversions=False,
-            ReadOnly=True,
-            AddToRecentFiles=False,
-        )
-        _fit_word_doc_to_page(doc, word)
-        doc.ExportAsFixedFormat(
-            OutputFileName=str(out_path.resolve()),
-            ExportFormat=17,        # wdExportFormatPDF
-            OpenAfterExport=False,
-            OptimizeFor=0,
-            Range=0,
-            Item=0,
-            IncludeDocProps=True,
-            KeepIRM=True,
-            CreateBookmarks=0,
-            DocStructureTags=True,
-            BitmapMissingFonts=True,
-            UseISO19005_1=False,
-        )
-    finally:
-        if doc is not None:
-            try:
-                doc.Close(SaveChanges=False)
-            except Exception:
-                pass
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-def _render_email_html(html_doc: str, out_path: Path, word):
-    """Render email HTML to PDF: headless browser first (best fidelity, fits the
-    page), Microsoft Word as a fallback. Raises if neither is available."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if _html_to_pdf_via_browser(html_doc, out_path):
-        return
-    if word is None:
-        raise RuntimeError(
-            "Could not render the email to PDF: neither Microsoft Edge/Chrome "
-            "nor Microsoft Word is available."
-        )
-    _html_string_to_pdf_via_word(html_doc, out_path, word)
 
 
 def _msg_to_pdf(src_path: Path, out_path: Path, outlook, word):
@@ -791,7 +380,7 @@ def _parse_eml_to_html(src_path: Path) -> str:
 
     header_html = (
         '<div style="border-bottom:2px solid #0078d4;padding-bottom:10px;margin-bottom:16px;">'
-        '<table class="apfp-header" style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:10pt">'
+        '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:10pt">'
         + hrow("From", from_)
         + hrow("To", to_)
         + hrow("CC", cc_)
@@ -834,11 +423,51 @@ def _parse_eml_to_html(src_path: Path) -> str:
 def _eml_to_pdf(src_path: Path, out_path: Path, outlook, word):
     """
     Convert a .eml file to PDF and extract attachments.
-    Parses the .eml directly in Python (no Outlook involvement), then renders
-    via a headless browser (preferred) or Word.
+    Parses the .eml directly in Python (no Outlook involvement) then
+    exports via Word — avoids the 'Invalid path or URL' COM error entirely.
     """
+    if word is None:
+        raise RuntimeError(
+            "Microsoft Word is required to convert .eml files on this version of Outlook.\n"
+            "Please ensure Word is installed."
+        )
+
     html_doc = _parse_eml_to_html(src_path)
-    _render_email_html(html_doc, out_path, word)
+    tmp_dir = Path(tempfile.mkdtemp())
+    doc = None
+    try:
+        tmp_html = tmp_dir / "email.html"
+        tmp_html.write_text(html_doc, encoding="utf-8")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        doc = word.Documents.Open(
+            str(tmp_html.resolve()),
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+        )
+        _fit_word_doc_to_page(doc, word)
+        doc.ExportAsFixedFormat(
+            OutputFileName=str(out_path.resolve()),
+            ExportFormat=17,        # wdExportFormatPDF
+            OpenAfterExport=False,
+            OptimizeFor=0,
+            Range=0,
+            Item=0,
+            IncludeDocProps=True,
+            KeepIRM=True,
+            CreateBookmarks=0,
+            DocStructureTags=True,
+            BitmapMissingFonts=True,
+            UseISO19005_1=False,
+        )
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=False)
+            except Exception:
+                pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # Extract attachments into a subfolder alongside the PDF
     _save_eml_attachments(src_path, out_path)
@@ -869,89 +498,131 @@ def _mail_to_pdf_via_outlook(mail, out_path: Path) -> bool:
         raise   # real error — surface it
 
 
-def _mail_to_pdf_via_html(mail, out_path: Path, word) -> bool:
+def _mail_to_pdf_via_word(mail, out_path: Path, word) -> bool:
     """
-    Method 2: Pull the HTML body from the Outlook COM item, build a self-contained
-    HTML document, and render it to PDF via a headless browser (preferred) or Word.
+    Method 2: Pull HTML body from the Outlook COM item, write a temp HTML file,
+    open it in the provided Word instance, export as PDF.
     Works on Office 2007+ without any printer or admin access.
-    `word` is a shared Word.Application COM object (may be None — the browser
-    renderer does not need it). Raises on failure so the caller can fall back.
+    `word` is a shared Word.Application COM object (may be None if Word unavailable).
+    Raises on failure so the caller can surface the real error message.
     """
-    # ── Pull content from the COM mail item ───────────────────────────
-    html_body = None
-    plain_body = None
+    if word is None:
+        raise RuntimeError(
+            "Microsoft Word is not installed or could not be launched.\n"
+            "Word is required as a fallback PDF renderer on this version of Outlook."
+        )
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    doc = None
     try:
-        html_body = mail.HTMLBody
-    except Exception:
-        pass
-    if not html_body:
+        # ── Pull content from the COM mail item ───────────────────────────
+        html_body = None
+        plain_body = None
         try:
-            plain_body = mail.Body
+            html_body = mail.HTMLBody
         except Exception:
             pass
+        if not html_body:
+            try:
+                plain_body = mail.Body
+            except Exception:
+                pass
 
-    def safe_get(attr):
+        def safe_get(attr):
+            try:
+                return str(getattr(mail, attr) or "").strip()
+            except Exception:
+                return ""
+
+        subject  = safe_get("Subject") or "(No Subject)"
+        from_    = safe_get("SenderName") or safe_get("SenderEmailAddress")
+        to_      = safe_get("To")
+        cc_      = safe_get("CC")
         try:
-            return str(getattr(mail, attr) or "").strip()
+            received = str(mail.ReceivedTime)
         except Exception:
-            return ""
+            received = ""
 
-    subject  = safe_get("Subject") or "(No Subject)"
-    from_    = safe_get("SenderName") or safe_get("SenderEmailAddress")
-    to_      = safe_get("To")
-    cc_      = safe_get("CC")
-    try:
-        received = str(mail.ReceivedTime)
-    except Exception:
-        received = ""
+        # ── Build header block ────────────────────────────────────────────
+        def hrow(label, value):
+            if not value:
+                return ""
+            return (
+                f'<tr>'
+                f'<td style="font-weight:bold;color:#444;white-space:nowrap;padding:2px 8px 2px 0;vertical-align:top">{label}:</td>'
+                f'<td style="color:#111">{htmllib.escape(value)}</td>'
+                f'</tr>'
+            )
 
-    # ── Build header block ────────────────────────────────────────────
-    def hrow(label, value):
-        if not value:
-            return ""
-        return (
-            f'<tr>'
-            f'<td style="font-weight:bold;color:#444;white-space:nowrap;padding:2px 8px 2px 0;vertical-align:top">{label}:</td>'
-            f'<td style="color:#111">{htmllib.escape(value)}</td>'
-            f'</tr>'
+        header_html = (
+            '<div style="border-bottom:2px solid #0078d4;padding-bottom:10px;margin-bottom:16px;">'
+            '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:10pt">'
+            + hrow("From", from_)
+            + hrow("To", to_)
+            + hrow("CC", cc_)
+            + hrow("Date", received)
+            + f'<tr><td style="font-weight:bold;color:#444;padding:2px 8px 2px 0;vertical-align:top">Subject:</td>'
+              f'<td style="font-size:13pt;font-weight:bold;color:#0078d4">{htmllib.escape(subject)}</td></tr>'
+            + '</table></div>'
         )
 
-    header_html = (
-        '<div style="border-bottom:2px solid #0078d4;padding-bottom:10px;margin-bottom:16px;">'
-        '<table class="apfp-header" style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:10pt">'
-        + hrow("From", from_)
-        + hrow("To", to_)
-        + hrow("CC", cc_)
-        + hrow("Date", received)
-        + f'<tr><td style="font-weight:bold;color:#444;padding:2px 8px 2px 0;vertical-align:top">Subject:</td>'
-          f'<td style="font-size:13pt;font-weight:bold;color:#0078d4">{htmllib.escape(subject)}</td></tr>'
-        + '</table></div>'
-    )
-
-    if html_body:
-        if re.search(r"<body[^>]*>", html_body, re.IGNORECASE):
-            full_html = re.sub(
-                r"(<body[^>]*>)",
-                r"\1" + header_html,
-                html_body, count=1, flags=re.IGNORECASE,
-            )
+        if html_body:
+            if re.search(r"<body[^>]*>", html_body, re.IGNORECASE):
+                full_html = re.sub(
+                    r"(<body[^>]*>)",
+                    r"\1" + header_html,
+                    html_body, count=1, flags=re.IGNORECASE,
+                )
+            else:
+                full_html = (
+                    "<html><head><meta charset='utf-8'></head><body>"
+                    + header_html + html_body + "</body></html>"
+                )
         else:
+            body_escaped = htmllib.escape(plain_body or "(No message body)")
             full_html = (
                 "<html><head><meta charset='utf-8'></head><body>"
-                + header_html + html_body + "</body></html>"
+                + header_html
+                + f"<pre style='font-family:Arial,sans-serif;white-space:pre-wrap'>{body_escaped}</pre>"
+                + "</body></html>"
             )
-    else:
-        body_escaped = htmllib.escape(plain_body or "(No message body)")
-        full_html = (
-            "<html><head><meta charset='utf-8'></head><body>"
-            + header_html
-            + f"<pre style='font-family:Arial,sans-serif;white-space:pre-wrap'>{body_escaped}</pre>"
-            + "</body></html>"
+
+        # ── Write temp HTML and open in Word ──────────────────────────────
+        full_html = _inject_print_css(full_html)
+        tmp_html = tmp_dir / "email.html"
+        tmp_html.write_text(full_html, encoding="utf-8")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        doc = word.Documents.Open(
+            str(tmp_html.resolve()),
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
         )
 
-    full_html = _inject_print_css(full_html)
-    _render_email_html(full_html, out_path, word)
-    return True
+        doc.ExportAsFixedFormat(
+            OutputFileName=str(out_path.resolve()),
+            ExportFormat=17,        # wdExportFormatPDF
+            OpenAfterExport=False,
+            OptimizeFor=0,          # wdExportOptimizeForPrint
+            Range=0,                # wdExportAllDocument
+            Item=0,                 # wdExportDocumentContent
+            IncludeDocProps=True,
+            KeepIRM=True,
+            CreateBookmarks=0,
+            DocStructureTags=True,
+            BitmapMissingFonts=True,
+            UseISO19005_1=False,
+        )
+        return True
+
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=False)
+            except Exception:
+                pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _ensure_word():
@@ -977,28 +648,31 @@ def _print_mail_to_pdf(mail, out_path: Path, word):
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Method 1 — HTML rendering (preferred): a headless browser fits wide
-    # tables/images to the page, with Word as an internal fallback. This is the
-    # only path that reliably keeps content from running off the page edge.
-    html_err = None
-    try:
-        _mail_to_pdf_via_html(mail, out_path, word)
-        return
-    except Exception as e:
-        html_err = e   # fall back to Outlook native below
+    # Method 1 — Word HTML rendering (preferred).
+    # Outlook renders HTML mail with the Word engine internally, so fidelity is
+    # equivalent to its native export, but going through Word ourselves lets us
+    # fit wide tables/images to the page so content doesn't run off the edge.
+    word_err = None
+    if word is not None:
+        try:
+            _mail_to_pdf_via_word(mail, out_path, word)
+            return
+        except Exception as e:
+            word_err = e   # fall back to Outlook native below
 
-    # Method 2 — Outlook native export (2010+); fallback when the HTML path failed.
+    # Method 2 — Outlook native export (2010+); fallback when Word is
+    # unavailable or the Word path failed.
     try:
         if _mail_to_pdf_via_outlook(mail, out_path):
             return
     except Exception as e:
         raise RuntimeError(f"Outlook PDF export failed: {e}")
 
-    if html_err is not None:
-        raise RuntimeError(f"PDF export failed: {html_err}")
+    if word_err is not None:
+        raise RuntimeError(f"Word PDF export failed: {word_err}")
     raise RuntimeError(
         "No available method to export this message to PDF "
-        "(Outlook native export is unsupported on this version)."
+        "(Outlook native export is unsupported on this version and Word is unavailable)."
     )
 
 
@@ -1457,10 +1131,6 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb):
             total = len(files)
             converted = 0
 
-            # Reuse one browser instance for all emails in this batch (big speedup).
-            if any(f.suffix.lower() in (".eml", ".msg") for f in files):
-                _start_browser_batch()
-
             for i, src in enumerate(files):
                 if not src.exists():
                     continue
@@ -1529,7 +1199,6 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb):
             status_cb(f"Auto-PDF done: {converted}/{total} file(s) converted.")
 
     finally:
-        _end_browser_batch()
         for app in (word, excel, visio, powerpoint):
             if app is not None:
                 try:
@@ -2339,21 +2008,15 @@ class ConverterApp:
         elif image_mode:    mode_key = "image"
         else:               mode_key = "email"
 
-        # Reuse one browser instance across the whole email batch (big speedup).
-        if mode_key == "email":
-            _start_browser_batch()
-        try:
-            for i, src in enumerate(self.files):
-                self._set_status(f"Converting: {src.name}  ({i + 1}/{total})")
-                try:
-                    out_dir = self._out_dir if self._out_dir else src.parent
-                    convert_file(src, out_dir, outlook, word, visio, excel, powerpoint, mode_key)
-                    success += 1
-                except Exception as exc:
-                    failed.append((src.name, str(exc)))
-                self.root.after(0, lambda: self.progress.step(1))
-        finally:
-            _end_browser_batch()
+        for i, src in enumerate(self.files):
+            self._set_status(f"Converting: {src.name}  ({i + 1}/{total})")
+            try:
+                out_dir = self._out_dir if self._out_dir else src.parent
+                convert_file(src, out_dir, outlook, word, visio, excel, powerpoint, mode_key)
+                success += 1
+            except Exception as exc:
+                failed.append((src.name, str(exc)))
+            self.root.after(0, lambda: self.progress.step(1))
 
         for app in (word, visio, excel, powerpoint):
             if app is not None:
