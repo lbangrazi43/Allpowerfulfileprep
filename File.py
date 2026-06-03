@@ -182,6 +182,114 @@ def _save_msg_attachments(mail, out_path: Path) -> int:
     return saved
 
 
+# ─────────────────────────────────────────────
+# Make rendered email content fit the PDF page
+# ─────────────────────────────────────────────
+
+# Injected into the <head> of every email HTML document before Word renders it.
+# Constrains content to the printable width and forces long content to wrap so
+# nothing spills off the right edge of the page.
+_PRINT_CSS = (
+    "<style>"
+    "@page { size: auto; margin: 0.5in; }"
+    "html, body { margin: 0; padding: 0; }"
+    "img { max-width: 100% !important; height: auto !important; }"
+    "table { max-width: 100% !important; }"
+    "td, th { word-wrap: break-word; overflow-wrap: break-word; }"
+    "pre { white-space: pre-wrap !important; word-wrap: break-word !important; }"
+    "* { overflow-wrap: break-word; }"
+    "</style>"
+)
+
+
+def _inject_print_css(html: str) -> str:
+    """Insert the print stylesheet into the document's <head> (creating one if needed)."""
+    if re.search(r"<head[^>]*>", html, re.IGNORECASE):
+        return re.sub(r"(<head[^>]*>)", r"\1" + _PRINT_CSS, html,
+                      count=1, flags=re.IGNORECASE)
+    if re.search(r"<html[^>]*>", html, re.IGNORECASE):
+        return re.sub(r"(<html[^>]*>)", r"\1<head>" + _PRINT_CSS + "</head>", html,
+                      count=1, flags=re.IGNORECASE)
+    return "<html><head>" + _PRINT_CSS + "</head>" + html + "</html>"
+
+
+def _fit_word_doc_to_page(doc, word):
+    """
+    Resize an opened Word document so nothing runs off the right edge of the page.
+
+    HTML emails frequently use fixed-width (pixel) layout tables and oversized
+    images that Word imports at their literal width; without this they spill past
+    the printable area and get clipped in the exported PDF. We narrow the margins,
+    shrink any table wider than the text column to fit the page, and scale down
+    oversized inline images.
+    """
+    wdAutoFitWindow         = 2   # WdAutoFitBehavior: fit table to text column
+    wdPreferredWidthPercent = 2   # WdPreferredWidthType
+
+    # Narrow, uniform margins give content more room.
+    try:
+        for section in doc.Sections:
+            ps = section.PageSetup
+            ps.LeftMargin   = word.InchesToPoints(0.5)
+            ps.RightMargin  = word.InchesToPoints(0.5)
+            ps.TopMargin    = word.InchesToPoints(0.5)
+            ps.BottomMargin = word.InchesToPoints(0.5)
+    except Exception:
+        pass
+
+    # Printable width (points) of the first section, used to detect overflow.
+    try:
+        ps = doc.Sections(1).PageSetup
+        printable = ps.PageWidth - ps.LeftMargin - ps.RightMargin
+    except Exception:
+        printable = None
+
+    def fit_tables(tables):
+        for tbl in tables:
+            try:
+                too_wide = True
+                if printable is not None:
+                    try:
+                        total = 0.0
+                        for col in tbl.Columns:
+                            total += col.Width
+                        # +1pt tolerance to avoid distorting tables that already fit
+                        too_wide = total > printable + 1
+                    except Exception:
+                        # Merged/mixed-width cells can't be measured — fit anyway
+                        too_wide = True
+                if too_wide:
+                    tbl.PreferredWidthType = wdPreferredWidthPercent
+                    tbl.PreferredWidth = 100
+                    tbl.AutoFitBehavior(wdAutoFitWindow)
+            except Exception:
+                pass
+            # Recurse into nested tables (common in email layouts)
+            try:
+                fit_tables(tbl.Tables)
+            except Exception:
+                pass
+
+    try:
+        fit_tables(doc.Tables)
+    except Exception:
+        pass
+
+    # Scale down images wider than the printable area, preserving aspect ratio.
+    if printable:
+        try:
+            for shape in doc.InlineShapes:
+                try:
+                    if shape.Width > printable:
+                        ratio = printable / float(shape.Width)
+                        shape.Height = shape.Height * ratio
+                        shape.Width = printable
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
 def _msg_to_pdf(src_path: Path, out_path: Path, outlook, word):
     """Convert a .msg file to PDF and extract attachments via Outlook COM."""
     mail = outlook.Session.OpenSharedItem(str(src_path.resolve()))
@@ -309,7 +417,7 @@ def _parse_eml_to_html(src_path: Path) -> str:
             + "</body></html>"
         )
 
-    return full_html
+    return _inject_print_css(full_html)
 
 
 def _eml_to_pdf(src_path: Path, out_path: Path, outlook, word):
@@ -338,6 +446,7 @@ def _eml_to_pdf(src_path: Path, out_path: Path, outlook, word):
             ReadOnly=True,
             AddToRecentFiles=False,
         )
+        _fit_word_doc_to_page(doc, word)
         doc.ExportAsFixedFormat(
             OutputFileName=str(out_path.resolve()),
             ExportFormat=17,        # wdExportFormatPDF
@@ -479,6 +588,7 @@ def _mail_to_pdf_via_word(mail, out_path: Path, word) -> bool:
             )
 
         # ── Write temp HTML and open in Word ──────────────────────────────
+        full_html = _inject_print_css(full_html)
         tmp_html = tmp_dir / "email.html"
         tmp_html.write_text(full_html, encoding="utf-8")
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -538,18 +648,32 @@ def _print_mail_to_pdf(mail, out_path: Path, word):
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Method 1 — Outlook native (2010+)
+    # Method 1 — Word HTML rendering (preferred).
+    # Outlook renders HTML mail with the Word engine internally, so fidelity is
+    # equivalent to its native export, but going through Word ourselves lets us
+    # fit wide tables/images to the page so content doesn't run off the edge.
+    word_err = None
+    if word is not None:
+        try:
+            _mail_to_pdf_via_word(mail, out_path, word)
+            return
+        except Exception as e:
+            word_err = e   # fall back to Outlook native below
+
+    # Method 2 — Outlook native export (2010+); fallback when Word is
+    # unavailable or the Word path failed.
     try:
         if _mail_to_pdf_via_outlook(mail, out_path):
             return
     except Exception as e:
         raise RuntimeError(f"Outlook PDF export failed: {e}")
 
-    # Method 2 — Word fallback
-    try:
-        _mail_to_pdf_via_word(mail, out_path, word)
-    except Exception as e:
-        raise RuntimeError(f"Word PDF export failed: {e}")
+    if word_err is not None:
+        raise RuntimeError(f"Word PDF export failed: {word_err}")
+    raise RuntimeError(
+        "No available method to export this message to PDF "
+        "(Outlook native export is unsupported on this version and Word is unavailable)."
+    )
 
 
 def _ensure_visio():
@@ -671,6 +795,7 @@ def _word_to_pdf(src_path: Path, out_path: Path, word):
             ReadOnly=True,
             AddToRecentFiles=False,
         )
+        _fit_word_doc_to_page(doc, word)
         doc.ExportAsFixedFormat(
             OutputFileName=str(out_path.resolve()),
             ExportFormat=17,        # wdExportFormatPDF
@@ -758,14 +883,28 @@ def _ppt_to_pdf(src_path: Path, out_path: Path, powerpoint):
                 pass
 
 
+def _unique_pdf_path(directory: Path, stem: str) -> Path:
+    """Return a PDF path in directory that does not collide with an existing file.
+
+    Tries '<stem>.pdf' first, then '<stem>_2.pdf', '<stem>_3.pdf', … so an
+    existing PDF is never overwritten.
+    """
+    candidate = directory / f"{stem}.pdf"
+    counter = 2
+    while candidate.exists():
+        candidate = directory / f"{stem}_{counter}.pdf"
+        counter += 1
+    return candidate
+
+
 def convert_file(src_path: Path, out_dir: Path, outlook, word, visio, excel, powerpoint, mode: str) -> Path:
     """
     Convert a single file to PDF.
     mode: 'email', 'html', 'visio', 'excel', 'word_doc', 'powerpoint', 'image'
-    Returns the path of the created PDF.
+    Returns the path of the created PDF. Never overwrites an existing PDF.
     """
     ext = src_path.suffix.lower()
-    out_path = out_dir / (src_path.stem + ".pdf")
+    out_path = _unique_pdf_path(out_dir, src_path.stem)
 
     if mode == "email":
         if ext == ".msg":
@@ -812,6 +951,7 @@ def _html_to_pdf(src_path: Path, out_path: Path, word):
             ReadOnly=True,
             AddToRecentFiles=False,
         )
+        _fit_word_doc_to_page(doc, word)
         doc.ExportAsFixedFormat(
             OutputFileName=str(out_path.resolve()),
             ExportFormat=17,        # wdExportFormatPDF
@@ -902,8 +1042,13 @@ def _collect_and_flatten(src_dir: Path, dest_dir: Path):
     """Copy every file found anywhere inside src_dir into dest_dir as a flat list.
 
     Folder structure is not preserved. Name collisions get a numeric suffix:
-    report.docx, report_2.docx, report_3.docx, etc.
+    report.docx, report_2.docx, report_3.docx, etc. Pre-existing files in
+    dest_dir are never overwritten — they get the suffixed name instead.
+
+    Returns the list of file paths actually created in dest_dir, so callers can
+    act on exactly the extracted files without touching unrelated siblings.
     """
+    created = []
     for item in src_dir.rglob("*"):
         if item.is_file():
             target = dest_dir / item.name
@@ -914,6 +1059,8 @@ def _collect_and_flatten(src_dir: Path, dest_dir: Path):
                     target = dest_dir / f"{stem}_{counter}{suffix}"
                     counter += 1
             shutil.copy2(str(item), str(target))
+            created.append(target)
+    return created
 
 
 def _image_to_pdf(src: Path, out_path: Path, word):
@@ -950,8 +1097,12 @@ AUTO_PDF_EXTS = {
 }
 
 
-def _auto_pdf_scan_and_convert(output_dir: Path, status_cb):
-    """Scan output_dir recursively for non-PDF files and convert each to PDF.
+def _auto_pdf_scan_and_convert(candidate_files, status_cb):
+    """Convert each file in candidate_files to PDF.
+
+    candidate_files is the explicit list of files that were extracted from the
+    zip(s). Only these are ever touched — unrelated files that happen to share
+    the output folder are never scanned, converted, or deleted.
 
     Files with no extension are treated as plain text and converted via Word.
     Existing .pdf files are always skipped and never deleted.
@@ -969,7 +1120,7 @@ def _auto_pdf_scan_and_convert(output_dir: Path, status_cb):
 
     try:
         files = [
-            f for f in output_dir.rglob("*")
+            f for f in candidate_files
             if f.is_file()
             and f.suffix.lower() != ".pdf"          # never touch existing PDFs
             and (f.suffix == "" or f.suffix.lower() in AUTO_PDF_EXTS)
@@ -990,7 +1141,7 @@ def _auto_pdf_scan_and_convert(output_dir: Path, status_cb):
                     # Word opens it without a format-detection dialog.
                     status_cb(f"Auto-PDF ({i + 1}/{total}): {src.name}  (no extension, treating as text)")
                     tmp_txt = src.parent / (src.name + ".txt")
-                    out_path = src.parent / (src.name + ".pdf")
+                    out_path = _unique_pdf_path(src.parent, src.name)
                     try:
                         if word is None:
                             word = _ensure_word()
@@ -1016,7 +1167,7 @@ def _auto_pdf_scan_and_convert(output_dir: Path, status_cb):
                     if mode == "image":
                         if word is None:
                             word = _ensure_word()
-                        out_path = src.parent / (src.stem + ".pdf")
+                        out_path = _unique_pdf_path(src.parent, src.stem)
                         _image_to_pdf(src, out_path, word)
                     else:
                         if mode in ("word_doc", "html") and word is None:
@@ -1067,6 +1218,7 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
     """Thread worker: extract zips, handle flat vs structured output, then
     optionally auto-convert all non-PDF files to PDF."""
     success, failed = 0, []
+    extracted_files = []   # explicit list of files extracted from the zip(s)
     total = len(zip_paths)
 
     for i, zip_path in enumerate(zip_paths):
@@ -1092,6 +1244,9 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
                         shutil.copy2(str(item), str(target))
                 status_cb(f"Expanding nested zips in {zip_path.stem}…")
                 _recursive_unzip_in_place(dest)
+                # Only files under this zip's own destination folder are eligible
+                # for auto-PDF — never siblings already in the output folder.
+                extracted_files.extend(p for p in dest.rglob("*") if p.is_file())
             else:
                 # Flat mode: expand ALL nested zips inside the temp dir first,
                 # then copy every file at any depth into a single master folder.
@@ -1100,7 +1255,9 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
                 dest = output_dir
                 dest.mkdir(parents=True, exist_ok=True)
                 status_cb(f"Flattening files from {zip_path.stem} into master folder…")
-                _collect_and_flatten(tmp, dest)
+                # _collect_and_flatten returns exactly the files it created, so
+                # pre-existing siblings in the output folder are never touched.
+                extracted_files.extend(_collect_and_flatten(tmp, dest))
 
             success += 1
         except zipfile.BadZipFile:
@@ -1115,8 +1272,8 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
 
     pdf_failed = []
     if auto_pdf and success > 0:
-        status_cb("Auto-PDF: scanning output folder for convertible files…")
-        pdf_failed = _auto_pdf_scan_and_convert(output_dir, status_cb)
+        status_cb("Auto-PDF: converting extracted files…")
+        pdf_failed = _auto_pdf_scan_and_convert(extracted_files, status_cb)
 
     finish_cb(success, failed, pdf_failed)
 
