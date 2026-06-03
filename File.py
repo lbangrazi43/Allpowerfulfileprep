@@ -194,13 +194,21 @@ def _save_msg_attachments(mail, out_path: Path) -> int:
 # the fixed pixel widths that make email content overflow.
 _PRINT_CSS = (
     "<style>"
-    "@page { size: Letter; margin: 0.5in; }"
-    "html, body { margin: 0; padding: 0; }"
-    "* { box-sizing: border-box; overflow-wrap: break-word;"
+    "@page { size: Letter; margin: 0.4in; }"
+    "html, body { margin: 0; padding: 0; width: auto !important; }"
+    # Cap every element at the printable width and let long content wrap, so
+    # nothing (text or tables) can extend past the page edge.
+    "* { box-sizing: border-box; max-width: 100% !important;"
+    " overflow-wrap: anywhere; word-break: break-word;"
     " -webkit-print-color-adjust: exact; print-color-adjust: exact; }"
-    "img { max-width: 100% !important; height: auto !important; }"
+    "img { height: auto !important; }"
     "table { max-width: 100% !important; }"
-    "td, th { word-wrap: break-word; overflow-wrap: break-word; }"
+    # Force content tables to honor the page width regardless of any fixed pixel
+    # width in the email; equal columns reflow onto extra pages as needed.
+    # Our own From/To/CC header table (.apfp-header) keeps its natural width.
+    "table:not(.apfp-header) { width: 100% !important; table-layout: fixed !important; }"
+    "td, th { white-space: normal !important;"
+    " overflow-wrap: anywhere; word-break: break-word; }"
     "pre { white-space: pre-wrap !important; word-wrap: break-word !important; }"
     "</style>"
 )
@@ -512,7 +520,7 @@ def _parse_eml_to_html(src_path: Path) -> str:
 
     header_html = (
         '<div style="border-bottom:2px solid #0078d4;padding-bottom:10px;margin-bottom:16px;">'
-        '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:10pt">'
+        '<table class="apfp-header" style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:10pt">'
         + hrow("From", from_)
         + hrow("To", to_)
         + hrow("CC", cc_)
@@ -639,7 +647,7 @@ def _mail_to_pdf_via_html(mail, out_path: Path, word) -> bool:
 
     header_html = (
         '<div style="border-bottom:2px solid #0078d4;padding-bottom:10px;margin-bottom:16px;">'
-        '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:10pt">'
+        '<table class="apfp-header" style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:10pt">'
         + hrow("From", from_)
         + hrow("To", to_)
         + hrow("CC", cc_)
