@@ -353,19 +353,30 @@ def _html_to_pdf_via_browser(html_doc: str, out_path: Path) -> bool:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-logging", "--log-level=3",
+            # Quiet background activity so startup is fast and deterministic.
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-extensions",
+            "--disable-component-update",
+            "--mute-audio",
             f"--user-data-dir={user_data}",
             "--no-pdf-header-footer",                      # current flag
             "--print-to-pdf-no-header",                    # older flag (ignored if unknown)
-            "--run-all-compositor-stages-before-draw",
-            "--virtual-time-budget=10000",                 # give images/layout time to settle
+            # NOTE: do NOT add --run-all-compositor-stages-before-draw or
+            # --virtual-time-budget here. With headless=new they intermittently
+            # hang the render for the full timeout. Plain --print-to-pdf waits
+            # for the load event and returns in ~1s.
             f"--print-to-pdf={out_path.resolve()}",
             tmp_html.resolve().as_uri(),
         ]
 
         # Suppress any console window the child might spawn.
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # Short timeout: a normal render takes ~1s, so if it hasn't finished in
+        # 45s something is wrong (e.g. a stalled remote image) — bail and let the
+        # caller fall back to Word rather than hanging the whole batch.
         subprocess.run(
-            cmd, timeout=120,
+            cmd, timeout=45,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             creationflags=creationflags,
         )
