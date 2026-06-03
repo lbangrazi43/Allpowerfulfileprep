@@ -402,6 +402,27 @@ class _MiniWS:
             pass
 
 
+def _read_devtools_port(portfile: Path, proc, deadline: float = 20) -> int:
+    """Wait for and read the DevTools port the browser writes to its profile dir.
+
+    The file is read with retries because on Windows it can briefly raise
+    PermissionError while the browser is still writing it.
+    """
+    end = time.time() + deadline
+    while time.time() < end:
+        try:
+            if portfile.exists():
+                text = portfile.read_text().strip()
+                if text:
+                    return int(text.splitlines()[0])
+        except (PermissionError, OSError, ValueError):
+            pass
+        if proc.poll() is not None:
+            raise RuntimeError("browser exited before becoming ready")
+        time.sleep(0.05)
+    raise RuntimeError("browser did not report a DevTools port")
+
+
 class _BrowserSession:
     """A single headless Edge/Chrome instance reused for an entire batch.
 
@@ -437,22 +458,16 @@ class _BrowserSession:
                  "--disable-logging", "--log-level=3",
                  "--disable-background-networking", "--disable-sync",
                  "--disable-extensions", "--disable-component-update", "--mute-audio",
+                 # Block all remote fetches so emails with remote images/tracking
+                 # pixels render instantly instead of stalling on the network.
+                 # (Outlook blocks remote images by default too.) data:/file:
+                 # resources — including .eml inline images — are unaffected.
+                 "--host-resolver-rules=MAP * ~NOTFOUND",
                  f"--user-data-dir={user_data}", "--remote-debugging-port=0"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            portfile = user_data / "DevToolsActivePort"
-            deadline = time.time() + 20
-            while time.time() < deadline:
-                if portfile.exists() and portfile.read_text().strip():
-                    break
-                if proc.poll() is not None:
-                    raise RuntimeError("browser exited before becoming ready")
-                time.sleep(0.05)
-            else:
-                raise RuntimeError("browser did not report a DevTools port")
-
-            port = int(portfile.read_text().splitlines()[0])
+            port = _read_devtools_port(user_data / "DevToolsActivePort", proc, deadline=20)
             ver = json.loads(urllib.request.urlopen(
                 f"http://127.0.0.1:{port}/json/version", timeout=10).read())
             ws = _MiniWS(ver["webSocketDebuggerUrl"])
@@ -488,7 +503,7 @@ class _BrowserSession:
                 return m.get("result", {})
             # otherwise it's an event — keep reading
 
-    def _wait_load(self, timeout=10):
+    def _wait_load(self, timeout=8):
         self._ws.settimeout(timeout)
         end = time.time() + timeout
         try:
@@ -602,6 +617,8 @@ def _html_to_pdf_via_browser_oneshot(html_doc: str, out_path: Path) -> bool:
             "--disable-extensions",
             "--disable-component-update",
             "--mute-audio",
+            # Block remote fetches so emails with remote images don't stall.
+            "--host-resolver-rules=MAP * ~NOTFOUND",
             f"--user-data-dir={user_data}",
             "--no-pdf-header-footer",                      # current flag
             "--print-to-pdf-no-header",                    # older flag (ignored if unknown)
