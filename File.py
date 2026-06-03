@@ -14,6 +14,7 @@ from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 import tempfile
 import shutil
+import subprocess
 import html as htmllib
 import re
 import zipfile
@@ -186,18 +187,21 @@ def _save_msg_attachments(mail, out_path: Path) -> int:
 # Make rendered email content fit the PDF page
 # ─────────────────────────────────────────────
 
-# Injected into the <head> of every email HTML document before Word renders it.
+# Injected into the <head> of every email HTML document before rendering.
 # Constrains content to the printable width and forces long content to wrap so
-# nothing spills off the right edge of the page.
+# nothing spills off the right edge of the page. Browsers (the preferred
+# renderer) honor max-width on tables/images — which is what actually overrides
+# the fixed pixel widths that make email content overflow.
 _PRINT_CSS = (
     "<style>"
-    "@page { size: auto; margin: 0.5in; }"
+    "@page { size: Letter; margin: 0.5in; }"
     "html, body { margin: 0; padding: 0; }"
+    "* { box-sizing: border-box; overflow-wrap: break-word;"
+    " -webkit-print-color-adjust: exact; print-color-adjust: exact; }"
     "img { max-width: 100% !important; height: auto !important; }"
     "table { max-width: 100% !important; }"
     "td, th { word-wrap: break-word; overflow-wrap: break-word; }"
     "pre { white-space: pre-wrap !important; word-wrap: break-word !important; }"
-    "* { overflow-wrap: break-word; }"
     "</style>"
 )
 
@@ -264,9 +268,10 @@ def _fit_word_doc_to_page(doc, word):
                     tbl.AutoFitBehavior(wdAutoFitWindow)
             except Exception:
                 pass
-            # Recurse into nested tables (common in email layouts)
+            # Recurse into nested tables (common in email layouts).
+            # A Table exposes nested tables via its Range, not directly.
             try:
-                fit_tables(tbl.Tables)
+                fit_tables(tbl.Range.Tables)
             except Exception:
                 pass
 
@@ -288,6 +293,133 @@ def _fit_word_doc_to_page(doc, word):
                     pass
         except Exception:
             pass
+
+
+def _find_browser():
+    """Locate a Chromium-based browser (Edge or Chrome) for headless PDF printing.
+
+    Microsoft Edge ships with Windows 10/11, so this is almost always available.
+    Returns the executable path, or None if none is found.
+    """
+    candidates = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    for name in ("msedge", "chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def _html_to_pdf_via_browser(html_doc: str, out_path: Path) -> bool:
+    """Render an HTML document to PDF using headless Edge/Chrome.
+
+    Browsers honor the CSS that actually constrains layout — max-width on tables
+    and images overrides the fixed pixel widths that make email content run off
+    the page — so the result matches how the email looked and fits the page.
+    Returns True on success, False if no browser is available or no PDF was
+    produced (so the caller can fall back to Word).
+    """
+    browser = _find_browser()
+    if not browser:
+        return False
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    user_data = Path(tempfile.mkdtemp())   # isolated profile so a running Edge doesn't interfere
+    try:
+        tmp_html = tmp_dir / "email.html"
+        tmp_html.write_text(html_doc, encoding="utf-8")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            browser,
+            "--headless=new",
+            "--disable-gpu",
+            "--no-sandbox",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-logging", "--log-level=3",
+            f"--user-data-dir={user_data}",
+            "--no-pdf-header-footer",                      # current flag
+            "--print-to-pdf-no-header",                    # older flag (ignored if unknown)
+            "--run-all-compositor-stages-before-draw",
+            "--virtual-time-budget=10000",                 # give images/layout time to settle
+            f"--print-to-pdf={out_path.resolve()}",
+            tmp_html.resolve().as_uri(),
+        ]
+
+        # Suppress any console window the child might spawn.
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.run(
+            cmd, timeout=120,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        return out_path.exists() and out_path.stat().st_size > 0
+    except Exception:
+        return False
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(user_data, ignore_errors=True)
+
+
+def _html_string_to_pdf_via_word(html_doc: str, out_path: Path, word):
+    """Render an HTML string to PDF via Word COM (fallback when no browser exists)."""
+    tmp_dir = Path(tempfile.mkdtemp())
+    doc = None
+    try:
+        tmp_html = tmp_dir / "email.html"
+        tmp_html.write_text(html_doc, encoding="utf-8")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        doc = word.Documents.Open(
+            str(tmp_html.resolve()),
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+        )
+        _fit_word_doc_to_page(doc, word)
+        doc.ExportAsFixedFormat(
+            OutputFileName=str(out_path.resolve()),
+            ExportFormat=17,        # wdExportFormatPDF
+            OpenAfterExport=False,
+            OptimizeFor=0,
+            Range=0,
+            Item=0,
+            IncludeDocProps=True,
+            KeepIRM=True,
+            CreateBookmarks=0,
+            DocStructureTags=True,
+            BitmapMissingFonts=True,
+            UseISO19005_1=False,
+        )
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=False)
+            except Exception:
+                pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _render_email_html(html_doc: str, out_path: Path, word):
+    """Render email HTML to PDF: headless browser first (best fidelity, fits the
+    page), Microsoft Word as a fallback. Raises if neither is available."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if _html_to_pdf_via_browser(html_doc, out_path):
+        return
+    if word is None:
+        raise RuntimeError(
+            "Could not render the email to PDF: neither Microsoft Edge/Chrome "
+            "nor Microsoft Word is available."
+        )
+    _html_string_to_pdf_via_word(html_doc, out_path, word)
 
 
 def _msg_to_pdf(src_path: Path, out_path: Path, outlook, word):
@@ -423,51 +555,11 @@ def _parse_eml_to_html(src_path: Path) -> str:
 def _eml_to_pdf(src_path: Path, out_path: Path, outlook, word):
     """
     Convert a .eml file to PDF and extract attachments.
-    Parses the .eml directly in Python (no Outlook involvement) then
-    exports via Word — avoids the 'Invalid path or URL' COM error entirely.
+    Parses the .eml directly in Python (no Outlook involvement), then renders
+    via a headless browser (preferred) or Word.
     """
-    if word is None:
-        raise RuntimeError(
-            "Microsoft Word is required to convert .eml files on this version of Outlook.\n"
-            "Please ensure Word is installed."
-        )
-
     html_doc = _parse_eml_to_html(src_path)
-    tmp_dir = Path(tempfile.mkdtemp())
-    doc = None
-    try:
-        tmp_html = tmp_dir / "email.html"
-        tmp_html.write_text(html_doc, encoding="utf-8")
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        doc = word.Documents.Open(
-            str(tmp_html.resolve()),
-            ConfirmConversions=False,
-            ReadOnly=True,
-            AddToRecentFiles=False,
-        )
-        _fit_word_doc_to_page(doc, word)
-        doc.ExportAsFixedFormat(
-            OutputFileName=str(out_path.resolve()),
-            ExportFormat=17,        # wdExportFormatPDF
-            OpenAfterExport=False,
-            OptimizeFor=0,
-            Range=0,
-            Item=0,
-            IncludeDocProps=True,
-            KeepIRM=True,
-            CreateBookmarks=0,
-            DocStructureTags=True,
-            BitmapMissingFonts=True,
-            UseISO19005_1=False,
-        )
-    finally:
-        if doc is not None:
-            try:
-                doc.Close(SaveChanges=False)
-            except Exception:
-                pass
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    _render_email_html(html_doc, out_path, word)
 
     # Extract attachments into a subfolder alongside the PDF
     _save_eml_attachments(src_path, out_path)
@@ -498,131 +590,89 @@ def _mail_to_pdf_via_outlook(mail, out_path: Path) -> bool:
         raise   # real error — surface it
 
 
-def _mail_to_pdf_via_word(mail, out_path: Path, word) -> bool:
+def _mail_to_pdf_via_html(mail, out_path: Path, word) -> bool:
     """
-    Method 2: Pull HTML body from the Outlook COM item, write a temp HTML file,
-    open it in the provided Word instance, export as PDF.
+    Method 2: Pull the HTML body from the Outlook COM item, build a self-contained
+    HTML document, and render it to PDF via a headless browser (preferred) or Word.
     Works on Office 2007+ without any printer or admin access.
-    `word` is a shared Word.Application COM object (may be None if Word unavailable).
-    Raises on failure so the caller can surface the real error message.
+    `word` is a shared Word.Application COM object (may be None — the browser
+    renderer does not need it). Raises on failure so the caller can fall back.
     """
-    if word is None:
-        raise RuntimeError(
-            "Microsoft Word is not installed or could not be launched.\n"
-            "Word is required as a fallback PDF renderer on this version of Outlook."
-        )
-
-    tmp_dir = Path(tempfile.mkdtemp())
-    doc = None
+    # ── Pull content from the COM mail item ───────────────────────────
+    html_body = None
+    plain_body = None
     try:
-        # ── Pull content from the COM mail item ───────────────────────────
-        html_body = None
-        plain_body = None
+        html_body = mail.HTMLBody
+    except Exception:
+        pass
+    if not html_body:
         try:
-            html_body = mail.HTMLBody
+            plain_body = mail.Body
         except Exception:
             pass
-        if not html_body:
-            try:
-                plain_body = mail.Body
-            except Exception:
-                pass
 
-        def safe_get(attr):
-            try:
-                return str(getattr(mail, attr) or "").strip()
-            except Exception:
-                return ""
-
-        subject  = safe_get("Subject") or "(No Subject)"
-        from_    = safe_get("SenderName") or safe_get("SenderEmailAddress")
-        to_      = safe_get("To")
-        cc_      = safe_get("CC")
+    def safe_get(attr):
         try:
-            received = str(mail.ReceivedTime)
+            return str(getattr(mail, attr) or "").strip()
         except Exception:
-            received = ""
+            return ""
 
-        # ── Build header block ────────────────────────────────────────────
-        def hrow(label, value):
-            if not value:
-                return ""
-            return (
-                f'<tr>'
-                f'<td style="font-weight:bold;color:#444;white-space:nowrap;padding:2px 8px 2px 0;vertical-align:top">{label}:</td>'
-                f'<td style="color:#111">{htmllib.escape(value)}</td>'
-                f'</tr>'
-            )
+    subject  = safe_get("Subject") or "(No Subject)"
+    from_    = safe_get("SenderName") or safe_get("SenderEmailAddress")
+    to_      = safe_get("To")
+    cc_      = safe_get("CC")
+    try:
+        received = str(mail.ReceivedTime)
+    except Exception:
+        received = ""
 
-        header_html = (
-            '<div style="border-bottom:2px solid #0078d4;padding-bottom:10px;margin-bottom:16px;">'
-            '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:10pt">'
-            + hrow("From", from_)
-            + hrow("To", to_)
-            + hrow("CC", cc_)
-            + hrow("Date", received)
-            + f'<tr><td style="font-weight:bold;color:#444;padding:2px 8px 2px 0;vertical-align:top">Subject:</td>'
-              f'<td style="font-size:13pt;font-weight:bold;color:#0078d4">{htmllib.escape(subject)}</td></tr>'
-            + '</table></div>'
+    # ── Build header block ────────────────────────────────────────────
+    def hrow(label, value):
+        if not value:
+            return ""
+        return (
+            f'<tr>'
+            f'<td style="font-weight:bold;color:#444;white-space:nowrap;padding:2px 8px 2px 0;vertical-align:top">{label}:</td>'
+            f'<td style="color:#111">{htmllib.escape(value)}</td>'
+            f'</tr>'
         )
 
-        if html_body:
-            if re.search(r"<body[^>]*>", html_body, re.IGNORECASE):
-                full_html = re.sub(
-                    r"(<body[^>]*>)",
-                    r"\1" + header_html,
-                    html_body, count=1, flags=re.IGNORECASE,
-                )
-            else:
-                full_html = (
-                    "<html><head><meta charset='utf-8'></head><body>"
-                    + header_html + html_body + "</body></html>"
-                )
+    header_html = (
+        '<div style="border-bottom:2px solid #0078d4;padding-bottom:10px;margin-bottom:16px;">'
+        '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:10pt">'
+        + hrow("From", from_)
+        + hrow("To", to_)
+        + hrow("CC", cc_)
+        + hrow("Date", received)
+        + f'<tr><td style="font-weight:bold;color:#444;padding:2px 8px 2px 0;vertical-align:top">Subject:</td>'
+          f'<td style="font-size:13pt;font-weight:bold;color:#0078d4">{htmllib.escape(subject)}</td></tr>'
+        + '</table></div>'
+    )
+
+    if html_body:
+        if re.search(r"<body[^>]*>", html_body, re.IGNORECASE):
+            full_html = re.sub(
+                r"(<body[^>]*>)",
+                r"\1" + header_html,
+                html_body, count=1, flags=re.IGNORECASE,
+            )
         else:
-            body_escaped = htmllib.escape(plain_body or "(No message body)")
             full_html = (
                 "<html><head><meta charset='utf-8'></head><body>"
-                + header_html
-                + f"<pre style='font-family:Arial,sans-serif;white-space:pre-wrap'>{body_escaped}</pre>"
-                + "</body></html>"
+                + header_html + html_body + "</body></html>"
             )
-
-        # ── Write temp HTML and open in Word ──────────────────────────────
-        full_html = _inject_print_css(full_html)
-        tmp_html = tmp_dir / "email.html"
-        tmp_html.write_text(full_html, encoding="utf-8")
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        doc = word.Documents.Open(
-            str(tmp_html.resolve()),
-            ConfirmConversions=False,
-            ReadOnly=True,
-            AddToRecentFiles=False,
+    else:
+        body_escaped = htmllib.escape(plain_body or "(No message body)")
+        full_html = (
+            "<html><head><meta charset='utf-8'></head><body>"
+            + header_html
+            + f"<pre style='font-family:Arial,sans-serif;white-space:pre-wrap'>{body_escaped}</pre>"
+            + "</body></html>"
         )
 
-        doc.ExportAsFixedFormat(
-            OutputFileName=str(out_path.resolve()),
-            ExportFormat=17,        # wdExportFormatPDF
-            OpenAfterExport=False,
-            OptimizeFor=0,          # wdExportOptimizeForPrint
-            Range=0,                # wdExportAllDocument
-            Item=0,                 # wdExportDocumentContent
-            IncludeDocProps=True,
-            KeepIRM=True,
-            CreateBookmarks=0,
-            DocStructureTags=True,
-            BitmapMissingFonts=True,
-            UseISO19005_1=False,
-        )
-        return True
-
-    finally:
-        if doc is not None:
-            try:
-                doc.Close(SaveChanges=False)
-            except Exception:
-                pass
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    full_html = _inject_print_css(full_html)
+    _render_email_html(full_html, out_path, word)
+    return True
 
 
 def _ensure_word():
@@ -648,31 +698,28 @@ def _print_mail_to_pdf(mail, out_path: Path, word):
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Method 1 — Word HTML rendering (preferred).
-    # Outlook renders HTML mail with the Word engine internally, so fidelity is
-    # equivalent to its native export, but going through Word ourselves lets us
-    # fit wide tables/images to the page so content doesn't run off the edge.
-    word_err = None
-    if word is not None:
-        try:
-            _mail_to_pdf_via_word(mail, out_path, word)
-            return
-        except Exception as e:
-            word_err = e   # fall back to Outlook native below
+    # Method 1 — HTML rendering (preferred): a headless browser fits wide
+    # tables/images to the page, with Word as an internal fallback. This is the
+    # only path that reliably keeps content from running off the page edge.
+    html_err = None
+    try:
+        _mail_to_pdf_via_html(mail, out_path, word)
+        return
+    except Exception as e:
+        html_err = e   # fall back to Outlook native below
 
-    # Method 2 — Outlook native export (2010+); fallback when Word is
-    # unavailable or the Word path failed.
+    # Method 2 — Outlook native export (2010+); fallback when the HTML path failed.
     try:
         if _mail_to_pdf_via_outlook(mail, out_path):
             return
     except Exception as e:
         raise RuntimeError(f"Outlook PDF export failed: {e}")
 
-    if word_err is not None:
-        raise RuntimeError(f"Word PDF export failed: {word_err}")
+    if html_err is not None:
+        raise RuntimeError(f"PDF export failed: {html_err}")
     raise RuntimeError(
         "No available method to export this message to PDF "
-        "(Outlook native export is unsupported on this version and Word is unavailable)."
+        "(Outlook native export is unsupported on this version)."
     )
 
 
