@@ -15,6 +15,12 @@ from pathlib import Path
 import tempfile
 import shutil
 import subprocess
+import socket
+import struct
+import base64
+import json
+import time
+import urllib.request
 import html as htmllib
 import re
 import zipfile
@@ -325,15 +331,252 @@ def _find_browser():
     return None
 
 
+class _MiniWS:
+    """Tiny WebSocket client (RFC 6455) over a raw socket — just enough to talk
+    to the browser's DevTools endpoint without any third-party dependency."""
+
+    def __init__(self, url: str, timeout: float = 60.0):
+        assert url.startswith("ws://")
+        hostport, _, path = url[5:].partition("/")
+        host, _, port = hostport.partition(":")
+        self.sock = socket.create_connection((host, int(port)), timeout=timeout)
+        self.sock.settimeout(timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        req = (f"GET /{path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+               f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        self.sock.sendall(req.encode())
+        self._buf = b""
+        while b"\r\n\r\n" not in self._buf:
+            self._buf += self.sock.recv(4096)
+        self._buf = self._buf.split(b"\r\n\r\n", 1)[1]
+
+    def send(self, text: str):
+        p = text.encode()
+        h = bytearray([0x81])          # FIN + text frame
+        n = len(p)
+        m = os.urandom(4)              # client frames must be masked
+        if n < 126:
+            h.append(0x80 | n)
+        elif n < 65536:
+            h.append(0x80 | 126); h += struct.pack(">H", n)
+        else:
+            h.append(0x80 | 127); h += struct.pack(">Q", n)
+        h += m
+        self.sock.sendall(bytes(h) + bytes(b ^ m[i % 4] for i, b in enumerate(p)))
+
+    def _exact(self, n: int) -> bytes:
+        while len(self._buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("websocket closed")
+            self._buf += chunk
+        out, self._buf = self._buf[:n], self._buf[n:]
+        return out
+
+    def recv(self) -> str:
+        data = b""
+        while True:
+            b0, b1 = self._exact(2)
+            fin, opcode, ln = b0 & 0x80, b0 & 0x0f, b1 & 0x7f
+            if ln == 126:
+                ln = struct.unpack(">H", self._exact(2))[0]
+            elif ln == 127:
+                ln = struct.unpack(">Q", self._exact(8))[0]
+            payload = self._exact(ln) if ln else b""
+            if opcode == 0x8:
+                raise ConnectionError("websocket close frame")
+            if opcode == 0x9:          # ping — ignore (server tolerates no pong here)
+                continue
+            data += payload
+            if fin:
+                return data.decode("utf-8", "replace")
+
+    def settimeout(self, t):
+        self.sock.settimeout(t)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+class _BrowserSession:
+    """A single headless Edge/Chrome instance reused for an entire batch.
+
+    Launching a browser process per file costs ~2.5s each; reusing one instance
+    over the DevTools protocol drops that to ~0.2s per file. Falls back cleanly:
+    if anything goes wrong the session marks itself dead and callers render the
+    remaining files the one-shot way (and ultimately via Word).
+    """
+
+    def __init__(self, proc, ws, sess, work_dir, user_data):
+        self._proc = proc
+        self._ws = ws
+        self._cdp_id = 0
+        self._sess = sess
+        self._work = work_dir
+        self._user_data = user_data
+        self._n = 0
+        self.alive = True
+
+    @classmethod
+    def try_start(cls):
+        """Launch and connect a session, or return None if unavailable."""
+        browser = _find_browser()
+        if not browser:
+            return None
+        user_data = Path(tempfile.mkdtemp())
+        work_dir = Path(tempfile.mkdtemp())
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                [browser, "--headless=new", "--disable-gpu", "--no-sandbox",
+                 "--no-first-run", "--no-default-browser-check",
+                 "--disable-logging", "--log-level=3",
+                 "--disable-background-networking", "--disable-sync",
+                 "--disable-extensions", "--disable-component-update", "--mute-audio",
+                 f"--user-data-dir={user_data}", "--remote-debugging-port=0"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            portfile = user_data / "DevToolsActivePort"
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if portfile.exists() and portfile.read_text().strip():
+                    break
+                if proc.poll() is not None:
+                    raise RuntimeError("browser exited before becoming ready")
+                time.sleep(0.05)
+            else:
+                raise RuntimeError("browser did not report a DevTools port")
+
+            port = int(portfile.read_text().splitlines()[0])
+            ver = json.loads(urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/version", timeout=10).read())
+            ws = _MiniWS(ver["webSocketDebuggerUrl"])
+            session = cls(proc, ws, None, work_dir, user_data)
+            target = session._cmd("Target.createTarget", {"url": "about:blank"})["targetId"]
+            session._sess = session._cmd(
+                "Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
+            session._cmd("Page.enable", session_scoped=True)
+            return session
+        except Exception:
+            try:
+                if proc is not None:
+                    proc.terminate()
+            except Exception:
+                pass
+            shutil.rmtree(user_data, ignore_errors=True)
+            shutil.rmtree(work_dir, ignore_errors=True)
+            return None
+
+    def _cmd(self, method, params=None, session_scoped=False):
+        self._cdp_id += 1
+        mid = self._cdp_id
+        msg = {"id": mid, "method": method, "params": params or {}}
+        if session_scoped or method in ("Page.navigate", "Page.printToPDF", "Page.enable"):
+            if self._sess:
+                msg["sessionId"] = self._sess
+        self._ws.send(json.dumps(msg))
+        while True:
+            m = json.loads(self._ws.recv())
+            if m.get("id") == mid:
+                if "error" in m:
+                    raise RuntimeError(f"{method}: {m['error']}")
+                return m.get("result", {})
+            # otherwise it's an event — keep reading
+
+    def _wait_load(self, timeout=10):
+        self._ws.settimeout(timeout)
+        end = time.time() + timeout
+        try:
+            while time.time() < end:
+                m = json.loads(self._ws.recv())
+                if m.get("method") == "Page.loadEventFired":
+                    return
+        except (socket.timeout, OSError):
+            return       # proceed to print anyway
+        finally:
+            self._ws.settimeout(60)
+
+    def render(self, html_doc: str, out_path: Path) -> bool:
+        if not self.alive:
+            return False
+        try:
+            self._n += 1
+            tmp_html = self._work / f"email_{self._n}.html"
+            tmp_html.write_text(html_doc, encoding="utf-8")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            self._cmd("Page.navigate", {"url": tmp_html.resolve().as_uri()})
+            self._wait_load()
+            result = self._cmd("Page.printToPDF",
+                               {"printBackground": True, "preferCSSPageSize": True})
+            out_path.write_bytes(base64.b64decode(result["data"]))
+            return out_path.exists() and out_path.stat().st_size > 0
+        except Exception:
+            self.alive = False     # session is suspect; remaining files fall back
+            return False
+
+    def close(self):
+        self.alive = False
+        try:
+            self._cmd("Browser.close")
+        except Exception:
+            pass
+        try:
+            self._ws.close()
+        except Exception:
+            pass
+        try:
+            self._proc.terminate()
+        except Exception:
+            pass
+        shutil.rmtree(self._work, ignore_errors=True)
+        shutil.rmtree(self._user_data, ignore_errors=True)
+
+
+# Active shared browser session for the current conversion batch.
+_ACTIVE_BROWSER = None
+
+
+def _start_browser_batch():
+    """Start one shared browser for a batch so every email reuses it instead of
+    launching a new process per file. Safe to call even if a browser is missing
+    (the session is simply None and callers fall back to one-shot/Word)."""
+    global _ACTIVE_BROWSER
+    _ACTIVE_BROWSER = _BrowserSession.try_start()
+
+
+def _end_browser_batch():
+    """Shut down the shared browser session, if any. Idempotent."""
+    global _ACTIVE_BROWSER
+    if _ACTIVE_BROWSER is not None:
+        _ACTIVE_BROWSER.close()
+        _ACTIVE_BROWSER = None
+
+
 def _html_to_pdf_via_browser(html_doc: str, out_path: Path) -> bool:
     """Render an HTML document to PDF using headless Edge/Chrome.
 
     Browsers honor the CSS that actually constrains layout — max-width on tables
     and images overrides the fixed pixel widths that make email content run off
     the page — so the result matches how the email looked and fits the page.
-    Returns True on success, False if no browser is available or no PDF was
-    produced (so the caller can fall back to Word).
+    Reuses the batch's shared browser session when one is active; otherwise spins
+    up a one-shot process. Returns False (caller falls back to Word) on failure.
     """
+    session = _ACTIVE_BROWSER
+    if session is not None and session.alive:
+        if session.render(html_doc, out_path):
+            return True
+        # session render failed — fall through to a fresh one-shot attempt
+    return _html_to_pdf_via_browser_oneshot(html_doc, out_path)
+
+
+def _html_to_pdf_via_browser_oneshot(html_doc: str, out_path: Path) -> bool:
+    """Render to PDF by launching a single short-lived headless browser process.
+    Used for one-off conversions or when the shared session is unavailable."""
     browser = _find_browser()
     if not browser:
         return False
@@ -1197,6 +1440,10 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb):
             total = len(files)
             converted = 0
 
+            # Reuse one browser instance for all emails in this batch (big speedup).
+            if any(f.suffix.lower() in (".eml", ".msg") for f in files):
+                _start_browser_batch()
+
             for i, src in enumerate(files):
                 if not src.exists():
                     continue
@@ -1265,6 +1512,7 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb):
             status_cb(f"Auto-PDF done: {converted}/{total} file(s) converted.")
 
     finally:
+        _end_browser_batch()
         for app in (word, excel, visio, powerpoint):
             if app is not None:
                 try:
@@ -2074,15 +2322,21 @@ class ConverterApp:
         elif image_mode:    mode_key = "image"
         else:               mode_key = "email"
 
-        for i, src in enumerate(self.files):
-            self._set_status(f"Converting: {src.name}  ({i + 1}/{total})")
-            try:
-                out_dir = self._out_dir if self._out_dir else src.parent
-                convert_file(src, out_dir, outlook, word, visio, excel, powerpoint, mode_key)
-                success += 1
-            except Exception as exc:
-                failed.append((src.name, str(exc)))
-            self.root.after(0, lambda: self.progress.step(1))
+        # Reuse one browser instance across the whole email batch (big speedup).
+        if mode_key == "email":
+            _start_browser_batch()
+        try:
+            for i, src in enumerate(self.files):
+                self._set_status(f"Converting: {src.name}  ({i + 1}/{total})")
+                try:
+                    out_dir = self._out_dir if self._out_dir else src.parent
+                    convert_file(src, out_dir, outlook, word, visio, excel, powerpoint, mode_key)
+                    success += 1
+                except Exception as exc:
+                    failed.append((src.name, str(exc)))
+                self.root.after(0, lambda: self.progress.step(1))
+        finally:
+            _end_browser_batch()
 
         for app in (word, visio, excel, powerpoint):
             if app is not None:
