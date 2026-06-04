@@ -1,17 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 datas = [('C:\\Users\\5999\\Downloads\\files\\icon.ico', '.')]
 binaries = []
 hiddenimports = ['win32timezone']
-tmp_ret = collect_all('win32com')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('win32api')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('pywintypes')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('PIL')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+# Bundle pywin32 + Pillow, and the AI Preparation stack (markitdown and the
+# pieces PyInstaller can't auto-detect: magika models, onnxruntime, extract_msg,
+# pdfminer data). markitdown is imported lazily, so these must be collected
+# explicitly or "Convert to Markdown" would fail only at runtime.
+for _pkg in ('win32com', 'win32api', 'pywintypes', 'PIL',
+             'markitdown', 'magika', 'onnxruntime', 'extract_msg', 'pdfminer'):
+    tmp_ret = collect_all(_pkg)
+    datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+# markitdown reads its own metadata at import time.
+datas += copy_metadata('markitdown')
 
 
 a = Analysis(
