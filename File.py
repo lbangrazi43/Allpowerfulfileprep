@@ -1769,9 +1769,23 @@ class ConverterApp:
             self._uz_drop_label.config(text="Drop .zip files here\nor click 'Add Zip Files'")
 
     def _uz_choose_output(self):
-        d = filedialog.askdirectory(title="Select output folder")
+        d = filedialog.askdirectory(title="Select an empty output folder")
         if d:
-            self._unzip_out_dir = Path(d)
+            path = Path(d)
+            try:
+                non_empty = any(path.iterdir())
+            except Exception:
+                non_empty = False
+            if non_empty:
+                messagebox.showerror(
+                    "Folder Not Empty",
+                    "The selected destination must be empty.\n\n"
+                    f"\"{path}\" already contains files or folders.\n\n"
+                    "Please choose an empty folder, or use the dialog's "
+                    "\"New folder\" option to create one for the unzipped output.",
+                )
+                return   # keep the previous (valid) selection, if any
+            self._unzip_out_dir = path
             self._uz_out_var.set(str(self._unzip_out_dir))
             self._uz_out_label.config(fg=ACCENT)
             self._uz_btn.config(state="normal")
@@ -1785,6 +1799,22 @@ class ConverterApp:
             return
         if self._unzip_out_dir is None:
             messagebox.showwarning("No Output Folder", "Please choose an output folder first.")
+            return
+        try:
+            not_empty = any(self._unzip_out_dir.iterdir())
+        except Exception:
+            not_empty = False
+        if not_empty:
+            messagebox.showerror(
+                "Folder Not Empty",
+                "The output folder is no longer empty.\n\n"
+                f"\"{self._unzip_out_dir}\" now contains files or folders.\n\n"
+                "Please choose an empty folder for the unzipped output.",
+            )
+            self._unzip_out_dir = None
+            self._uz_out_var.set("Choose an output folder")
+            self._uz_out_label.config(fg="#c0392b")
+            self._uz_btn.config(state="disabled")
             return
         self._cancel_unzip.clear()
         self._uz_btn.config(state="disabled")
