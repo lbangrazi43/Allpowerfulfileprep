@@ -948,6 +948,135 @@ def _to_markdown(src_path: Path, out_dir: Path) -> Path:
     return out_path
 
 
+# Image attachment types are skipped during AI Preparation (not useful as text).
+_AI_IMAGE_EXTS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif",
+    ".webp", ".svg", ".ico", ".heic", ".heif",
+}
+
+
+def _unique_dir(parent: Path, name: str) -> Path:
+    """Return a folder path under parent that doesn't already exist (name, name_2, …)."""
+    candidate = parent / name
+    counter = 2
+    while candidate.exists():
+        candidate = parent / f"{name}_{counter}"
+        counter += 1
+    return candidate
+
+
+def _extract_eml_attachments(src_path: Path, dest_dir: Path) -> list:
+    """Save non-image attachments from a .eml into dest_dir (created lazily).
+    Returns the list of saved file paths. No Outlook/COM needed."""
+    import email as emaillib
+    import email.policy
+    from email.header import decode_header, make_header
+
+    def decode_str(value):
+        if not value:
+            return ""
+        try:
+            return str(make_header(decode_header(value)))
+        except Exception:
+            return str(value)
+
+    with open(src_path, "rb") as f:
+        msg = emaillib.message_from_binary_file(f, policy=emaillib.policy.compat32)
+
+    saved = []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        ct  = part.get_content_type()
+        cd  = str(part.get("Content-Disposition") or "")
+        cid = part.get("Content-ID", "").strip("<>")
+
+        is_inline_image = ct.startswith("image/") and cid and "attachment" not in cd
+        is_body = ct in ("text/html", "text/plain") and "attachment" not in cd
+        if is_inline_image or is_body:
+            continue
+
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+
+        fname = decode_str(part.get_filename() or "")
+        if not fname:
+            ext = ct.split("/")[-1].split(";")[0].strip() or "bin"
+            fname = f"attachment_{len(saved) + 1}.{ext}"
+
+        # Skip image attachments
+        if ct.startswith("image/") or Path(fname).suffix.lower() in _AI_IMAGE_EXTS:
+            continue
+
+        safe = _safe_filename(fname)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = _unique_output_path(dest_dir, Path(safe).stem, Path(safe).suffix)
+        dest.write_bytes(payload)
+        saved.append(dest)
+
+    return saved
+
+
+def _extract_msg_attachments(src_path: Path, dest_dir: Path) -> list:
+    """Save non-image attachments from a .msg into dest_dir (created lazily),
+    using the pure-Python extract_msg library (no Outlook/COM).
+    Returns the list of saved file paths."""
+    try:
+        import extract_msg
+    except ImportError:
+        return []   # attachment extraction unavailable; body still converts
+
+    saved = []
+    msg = extract_msg.Message(str(src_path.resolve()))
+    try:
+        for att in msg.attachments:
+            try:
+                name = att.getFilename() or "attachment"
+                data = att.data
+                if not isinstance(data, (bytes, bytearray)):
+                    continue   # embedded message / unsupported attachment type
+                if Path(name).suffix.lower() in _AI_IMAGE_EXTS:
+                    continue
+                safe = _safe_filename(name)
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest = _unique_output_path(dest_dir, Path(safe).stem, Path(safe).suffix)
+                dest.write_bytes(bytes(data))
+                saved.append(dest)
+            except Exception:
+                continue
+    finally:
+        try:
+            msg.close()
+        except Exception:
+            pass
+    return saved
+
+
+def _email_attachments_to_markdown(src_path: Path, md_out_path: Path) -> int:
+    """For an email (.eml/.msg), save its non-image attachments into a folder
+    next to the converted Markdown file, and convert each attachment to Markdown
+    too. Returns the number of attachments saved."""
+    ext = src_path.suffix.lower()
+    dest_dir = _unique_dir(md_out_path.parent, md_out_path.stem + "_attachments")
+
+    if ext == ".eml":
+        saved = _extract_eml_attachments(src_path, dest_dir)
+    elif ext == ".msg":
+        saved = _extract_msg_attachments(src_path, dest_dir)
+    else:
+        saved = []
+
+    # Convert each saved attachment to Markdown alongside the original.
+    for att_path in saved:
+        try:
+            _to_markdown(att_path, dest_dir)
+        except Exception:
+            pass   # keep the original attachment even if it can't be converted
+
+    return len(saved)
+
+
 def convert_file(src_path: Path, out_dir: Path, outlook, word, visio, excel, powerpoint, mode: str) -> Path:
     """
     Convert a single file to PDF.
@@ -2142,6 +2271,16 @@ class ConverterApp:
                 out = _to_markdown(src, out_dir)
                 if out.exists() and out.stat().st_size > 0:
                     converted += 1
+                    # For emails, save non-image attachments next to the .md and
+                    # convert each of those to Markdown too.
+                    if src.suffix.lower() in (".eml", ".msg"):
+                        try:
+                            n_att = _email_attachments_to_markdown(src, out)
+                            if n_att:
+                                self.root.after(0, lambda s=src, n=n_att: self._ai_status_var.set(
+                                    f"{s.name}: saved {n} attachment(s) to a folder beside the .md"))
+                        except Exception:
+                            pass   # attachment handling is best-effort
                     if delete_orig:
                         try:
                             src.unlink()
