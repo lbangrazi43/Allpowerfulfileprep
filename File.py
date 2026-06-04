@@ -1097,7 +1097,7 @@ AUTO_PDF_EXTS = {
 }
 
 
-def _auto_pdf_scan_and_convert(candidate_files, status_cb):
+def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
     """Convert each file in candidate_files to PDF.
 
     candidate_files is the explicit list of files that were extracted from the
@@ -1132,6 +1132,8 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb):
             converted = 0
 
             for i, src in enumerate(files):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 if not src.exists():
                     continue
                 ext = src.suffix.lower()
@@ -1214,14 +1216,22 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb):
 
 
 def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
-                  status_cb, progress_cb, finish_cb):
+                  status_cb, progress_cb, finish_cb, cancel_event=None):
     """Thread worker: extract zips, handle flat vs structured output, then
-    optionally auto-convert all non-PDF files to PDF."""
+    optionally auto-convert all non-PDF files to PDF.
+
+    cancel_event: optional threading.Event; when set, stop before the next item.
+    """
+    def cancelled():
+        return cancel_event is not None and cancel_event.is_set()
+
     success, failed = 0, []
     extracted_files = []   # explicit list of files extracted from the zip(s)
     total = len(zip_paths)
 
     for i, zip_path in enumerate(zip_paths):
+        if cancelled():
+            break
         status_cb(f"Extracting: {zip_path.name}  ({i + 1}/{total})")
         tmp = Path(tempfile.mkdtemp())
         try:
@@ -1271,9 +1281,9 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
             progress_cb()
 
     pdf_failed = []
-    if auto_pdf and success > 0:
+    if auto_pdf and success > 0 and not cancelled():
         status_cb("Auto-PDF: converting extracted files…")
-        pdf_failed = _auto_pdf_scan_and_convert(extracted_files, status_cb)
+        pdf_failed = _auto_pdf_scan_and_convert(extracted_files, status_cb, cancel_event)
 
     finish_cb(success, failed, pdf_failed)
 
@@ -1287,6 +1297,10 @@ ACCENT      = "#0078d4"
 BTN_FG      = "#ffffff"
 DROP_BG     = "#e8f0fe"
 DROP_BD     = "#aac4e8"
+CANCEL_BG          = "#c0392b"   # red: active Cancel button
+CANCEL_BG_ACTIVE   = "#a93226"   # red: pressed
+CANCEL_OFF_BG      = "#cccccc"   # grey: disabled Cancel button
+CANCEL_OFF_FG      = "#888888"
 SIDEBAR_BG  = "#1e2d3d"
 SIDEBAR_FG  = "#c9d8e8"
 SIDEBAR_SEL = "#0078d4"
@@ -1311,10 +1325,12 @@ class ConverterApp:
         self.files    = []
         self._out_dir = None
         self._mode    = tk.StringVar(value="Email (.eml, .msg)")
+        self._cancel_convert = threading.Event()
 
         # Unzip page state
         self._zip_files     = []
         self._unzip_out_dir = None
+        self._cancel_unzip  = threading.Event()
 
         # Navigation state
         self._active_page = None
@@ -1527,9 +1543,11 @@ class ConverterApp:
             anchor="w",
         ).pack(fill="x", padx=20, pady=(0, 4))
 
-        # Convert button
+        # Convert button (+ smaller Cancel button beside it)
+        btn_row = tk.Frame(parent, bg=APP_BG)
+        btn_row.pack(pady=(4, 14))
         self.convert_btn = tk.Button(
-            parent, text="Convert",
+            btn_row, text="Convert",
             command=self._start_convert,
             bg=ACCENT, fg=BTN_FG,
             font=("Segoe UI", 12, "bold"),
@@ -1538,7 +1556,17 @@ class ConverterApp:
             activebackground="#005a9e",
             activeforeground=BTN_FG,
         )
-        self.convert_btn.pack(pady=(4, 14))
+        self.convert_btn.pack(side="left")
+        self.cancel_btn = tk.Button(
+            btn_row, text="Cancel",
+            command=self._cancel_conversion,
+            font=("Segoe UI", 10, "bold"),
+            relief="flat", padx=16, pady=6,
+            activebackground=CANCEL_BG_ACTIVE,
+            activeforeground=BTN_FG,
+        )
+        self.cancel_btn.pack(side="left", padx=(10, 0))
+        self._set_cancel_state(self.cancel_btn, False)
 
     # ── unzip page ───────────────────────────
     def _build_unzip_page(self, parent):
@@ -1676,9 +1704,11 @@ class ConverterApp:
             anchor="w",
         ).pack(fill="x", padx=20, pady=(0, 4))
 
-        # Unzip button (disabled until output folder is chosen)
+        # Unzip button (disabled until output folder is chosen) + Cancel beside it
+        uz_btn_row = tk.Frame(parent, bg=APP_BG)
+        uz_btn_row.pack(pady=(4, 14))
         self._uz_btn = tk.Button(
-            parent, text="Unzip Files",
+            uz_btn_row, text="Unzip Files",
             command=self._start_unzip,
             bg=ACCENT, fg=BTN_FG,
             font=("Segoe UI", 12, "bold"),
@@ -1688,7 +1718,17 @@ class ConverterApp:
             activeforeground=BTN_FG,
             state="disabled",
         )
-        self._uz_btn.pack(pady=(4, 14))
+        self._uz_btn.pack(side="left")
+        self._uz_cancel_btn = tk.Button(
+            uz_btn_row, text="Cancel",
+            command=self._cancel_unzip_op,
+            font=("Segoe UI", 10, "bold"),
+            relief="flat", padx=16, pady=6,
+            activebackground=CANCEL_BG_ACTIVE,
+            activeforeground=BTN_FG,
+        )
+        self._uz_cancel_btn.pack(side="left", padx=(10, 0))
+        self._set_cancel_state(self._uz_cancel_btn, False)
 
     def _uz_add_files(self):
         paths = filedialog.askopenfilenames(
@@ -1746,7 +1786,9 @@ class ConverterApp:
         if self._unzip_out_dir is None:
             messagebox.showwarning("No Output Folder", "Please choose an output folder first.")
             return
+        self._cancel_unzip.clear()
         self._uz_btn.config(state="disabled")
+        self._set_cancel_state(self._uz_cancel_btn, True)
         self._uz_progress["value"] = 0
         self._uz_progress["maximum"] = len(self._zip_files)
         separate  = self._uz_separate.get()
@@ -1761,12 +1803,27 @@ class ConverterApp:
                 lambda msg: self.root.after(0, lambda m=msg: self._uz_status_var.set(m)),
                 lambda: self.root.after(0, lambda: self._uz_progress.step(1)),
                 lambda s, f, pf: self.root.after(0, lambda: self._uz_finish(s, f, pf)),
+                self._cancel_unzip,
             ),
             daemon=True,
         ).start()
 
+    def _cancel_unzip_op(self):
+        """Request that the running unzip/auto-convert stop as soon as possible."""
+        self._cancel_unzip.set()
+        self._set_cancel_state(self._uz_cancel_btn, False)
+        self._uz_status_var.set("Cancelling… finishing the current item, then stopping.")
+
     def _uz_finish(self, success, failed, pdf_failed=None):
         self._uz_btn.config(state="normal")
+        self._set_cancel_state(self._uz_cancel_btn, False)
+        if self._cancel_unzip.is_set():
+            self._uz_status_var.set(f"⏹  Cancelled. {success} archive(s) extracted before stopping.")
+            messagebox.showinfo(
+                "Unzip Cancelled",
+                f"Operation was cancelled.\n{success} archive(s) extracted before stopping.",
+            )
+            return
         if not failed:
             self._uz_status_var.set(f"Done! {success} archive(s) extracted successfully.")
             messagebox.showinfo(
@@ -1889,6 +1946,19 @@ class ConverterApp:
             self.out_var.set("Same as source file")
 
     # ── conversion ───────────────────────────
+    def _set_cancel_state(self, btn, enabled):
+        """Grey + disabled, or red + clickable."""
+        if enabled:
+            btn.config(state="normal", bg=CANCEL_BG, fg=BTN_FG, cursor="hand2")
+        else:
+            btn.config(state="disabled", bg=CANCEL_OFF_BG, fg=CANCEL_OFF_FG, cursor="arrow")
+
+    def _cancel_conversion(self):
+        """Request that the running conversion stop as soon as possible."""
+        self._cancel_convert.set()
+        self._set_cancel_state(self.cancel_btn, False)
+        self.status_var.set("Cancelling… finishing the current file, then stopping.")
+
     def _start_convert(self):
         if not self.files:
             m = self._mode.get()
@@ -1901,7 +1971,9 @@ class ConverterApp:
             else:                            label = "email"
             messagebox.showwarning("No Files", f"Please add {label} files first.")
             return
+        self._cancel_convert.clear()
         self.convert_btn.config(state="disabled")
+        self._set_cancel_state(self.cancel_btn, True)
         self.progress["value"] = 0
         self.progress["maximum"] = len(self.files)
         threading.Thread(target=self._convert_worker, daemon=True).start()
@@ -2009,6 +2081,8 @@ class ConverterApp:
         else:               mode_key = "email"
 
         for i, src in enumerate(self.files):
+            if self._cancel_convert.is_set():
+                break
             self._set_status(f"Converting: {src.name}  ({i + 1}/{total})")
             try:
                 out_dir = self._out_dir if self._out_dir else src.parent
@@ -2037,7 +2111,14 @@ class ConverterApp:
 
     def _finish(self, success, failed):
         self.convert_btn.config(state="normal")
-        if not failed:
+        self._set_cancel_state(self.cancel_btn, False)
+        if self._cancel_convert.is_set():
+            self.status_var.set(f"⏹  Cancelled. {success} file(s) converted before stopping.")
+            messagebox.showinfo(
+                "Conversion Cancelled",
+                f"Conversion was cancelled.\n{success} file(s) converted before stopping.",
+            )
+        elif not failed:
             self.status_var.set(f"✅  Done! {success} file(s) converted successfully.")
             messagebox.showinfo(
                 "Conversion Complete",
