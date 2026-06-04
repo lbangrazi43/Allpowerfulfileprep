@@ -1992,17 +1992,27 @@ class ConverterApp:
                 relief="flat", padx=12, pady=4, cursor="hand2",
             ).pack(side="left", padx=(0, 6))
 
-        # Output folder
+        # Output folder row
         out_frame = tk.Frame(parent, bg=APP_BG)
         out_frame.pack(fill="x", padx=18, pady=(2, 2))
-        tk.Label(out_frame, text="Output folder:", bg=APP_BG, fg="#555",
-                 font=("Segoe UI", 9)).pack(side="left")
+
+        tk.Label(
+            out_frame, text="Output folder:",
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+        ).pack(side="left")
+
         self._ai_out_var = tk.StringVar(value="Same as source file")
-        tk.Label(out_frame, textvariable=self._ai_out_var, bg=APP_BG, fg="#333",
-                 font=("Segoe UI", 9)).pack(side="left", padx=6)
-        tk.Button(out_frame, text="Choose…", command=self._ai_choose_output,
-                  bg="#e0e8f0", fg="#333", font=("Segoe UI", 9), relief="flat",
-                  padx=10, pady=3, cursor="hand2").pack(side="left", padx=6)
+        tk.Label(
+            out_frame, textvariable=self._ai_out_var,
+            bg=APP_BG, fg=ACCENT, font=("Segoe UI", 9, "italic"),
+        ).pack(side="left", padx=4)
+
+        tk.Button(
+            out_frame, text="Choose…", command=self._ai_choose_output,
+            bg="#e0e8f0", fg="#333",
+            font=("Segoe UI", 9), relief="flat",
+            padx=8, pady=2, cursor="hand2",
+        ).pack(side="left", padx=4)
 
         # Delete-originals option
         opt_frame = tk.Frame(parent, bg=APP_BG)
