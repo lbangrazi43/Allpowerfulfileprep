@@ -1640,6 +1640,15 @@ class ConverterApp:
         except Exception:
             splash = None
 
+        # Close PyInstaller's built-in bootloader splash (shown during the
+        # one-file unpack) now that our own splash is on screen. Only exists in
+        # the frozen build, so failures here are expected and ignored.
+        try:
+            import pyi_splash
+            pyi_splash.close()
+        except Exception:
+            pass
+
         # PDF page state
         self.files    = []
         self._out_dir = None
@@ -1664,16 +1673,30 @@ class ConverterApp:
         self._build_shell()
         self._show_page("pdf")
 
-        # Run the splash animation, then reveal the centered main window.
+        # Run the splash animation, then reveal the main window.
         if splash is not None:
             try:
                 splash.run(min_ms=1500)
             except Exception:
                 pass
-            splash.close()
+
+        # Reveal the main window fully painted *before* removing the splash, so
+        # no blank/white frame shows in between: position it, map it invisible
+        # (alpha 0), force a full paint, make it opaque, then drop the splash.
         self._center_window(1000, 680)
+        try:
+            self.root.attributes("-alpha", 0.0)
+        except Exception:
+            pass
         self.root.deiconify()
+        self.root.update()
+        try:
+            self.root.attributes("-alpha", 1.0)
+        except Exception:
+            pass
         self.root.lift()
+        if splash is not None:
+            splash.close()
 
     def _set_icon(self):
         """Load icon.ico and set both the title bar and taskbar icon at a legible size."""

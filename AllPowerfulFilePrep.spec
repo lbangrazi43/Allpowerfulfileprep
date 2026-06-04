@@ -48,9 +48,21 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# Built-in bootloader splash: shown by the loader *during* the one-file unpack,
+# before any Python runs — so the user sees the brand immediately instead of a
+# delay. The app closes it (pyi_splash.close()) once its own splash is on screen.
+splash = Splash(
+    'splash_static.png',
+    binaries=a.binaries,
+    datas=a.datas,
+    text_pos=None,
+)
+
 exe = EXE(
     pyz,
     a.scripts,
+    splash,
+    splash.binaries,
     a.binaries,
     a.datas,
     [],
