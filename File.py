@@ -1493,6 +1493,15 @@ SIDEBAR_W   = 190
 
 class ConverterApp:
     def __init__(self):
+        # Give the process its own AppUserModelID *before* the window exists so
+        # Windows ties the taskbar button to our icon, not python/Tk's default.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "AllPowerfulFilePrep.App")
+        except Exception:
+            pass
+
         if HAS_DND:
             self.root = TkinterDnD.Tk()
         else:
@@ -1540,22 +1549,13 @@ class ConverterApp:
         ico = base / "icon.ico"
         if not ico.exists():
             return
-        # Give the process its own AppUserModelID so Windows uses our window
-        # icon for the taskbar button instead of grouping under python/Tk.
-        try:
-            import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "AllPowerfulFilePrep.App")
-        except Exception:
-            pass
         try:
             # iconbitmap — sets the title bar icon (Windows native)
             self.root.iconbitmap(str(ico))
         except Exception:
             pass
         try:
-            # iconphoto — sets the taskbar / Alt+Tab icon. Provide several sizes
-            # so Windows picks a crisp one for each context (title bar vs taskbar).
+            # iconphoto — sets the Alt+Tab icon and the default for new toplevels.
             from PIL import Image, ImageTk
             src = Image.open(str(ico)).convert("RGBA")
             self._icon_photos = [
@@ -1563,6 +1563,29 @@ class ConverterApp:
                 for n in (16, 32, 48, 64, 128, 256)
             ]  # keep references alive
             self.root.iconphoto(True, *self._icon_photos)
+        except Exception:
+            pass
+        # The Windows taskbar button uses the window's ICON_BIG, and Tk's
+        # iconphoto doesn't reliably set it — so push both icons to the native
+        # top-level window via WM_SETICON. This is what makes the owl (not Tk's
+        # default feather) show on the taskbar while the app is running.
+        try:
+            import ctypes
+            self.root.update_idletasks()  # ensure the native HWND exists
+            user32 = ctypes.windll.user32
+            user32.LoadImageW.restype = ctypes.c_void_p
+            user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                            ctypes.c_void_p, ctypes.c_void_p]
+            hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            IMAGE_ICON, LR_LOADFROMFILE = 1, 0x00000010
+            WM_SETICON, ICON_SMALL, ICON_BIG = 0x0080, 0, 1
+            self._hicons = []
+            for size, which in ((32, ICON_BIG), (16, ICON_SMALL)):
+                hicon = user32.LoadImageW(None, str(ico), IMAGE_ICON,
+                                          size, size, LR_LOADFROMFILE)
+                if hicon:
+                    self._hicons.append(hicon)  # keep handles alive
+                    user32.SendMessageW(hwnd, WM_SETICON, which, hicon)
         except Exception:
             pass
 
