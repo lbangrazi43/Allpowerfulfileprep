@@ -940,6 +940,10 @@ def _to_markdown(src_path: Path, out_dir: Path) -> Path:
     md = _get_markitdown()
     result = md.convert(str(src_path.resolve()))
     text = (result.text_content or "").strip()
+    # Strip NUL and other C0 control characters (keep tab/newline/carriage-return)
+    # so the .md is always valid text — some sources can emit stray control bytes,
+    # which otherwise make editors treat the file as binary.
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
     out_path = _unique_output_path(out_dir, src_path.stem, ".md")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # A short source note helps the downstream LLM know where the text came from.
