@@ -7,3 +7,9 @@ dist/
 __pycache__/
 *.pyc
 *.pyo
+
+# Virtual environment
+.venv/
+
+# Temporary probe artifacts
+_md_probe.py
