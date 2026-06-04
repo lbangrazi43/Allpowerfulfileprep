@@ -1532,26 +1532,37 @@ class ConverterApp:
     def _set_icon(self):
         """Load icon.ico and set both the title bar and taskbar icon at a legible size."""
         if getattr(sys, "frozen", False):
-            base = Path(sys.executable).parent
+            # One-file PyInstaller build extracts bundled data to sys._MEIPASS,
+            # not next to the .exe — fall back to the exe dir for one-dir builds.
+            base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
         else:
             base = Path(__file__).parent
         ico = base / "icon.ico"
         if not ico.exists():
             return
+        # Give the process its own AppUserModelID so Windows uses our window
+        # icon for the taskbar button instead of grouping under python/Tk.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "AllPowerfulFilePrep.App")
+        except Exception:
+            pass
         try:
             # iconbitmap — sets the title bar icon (Windows native)
             self.root.iconbitmap(str(ico))
         except Exception:
             pass
         try:
-            # iconphoto — sets the taskbar / Alt+Tab icon at full size
-            # Using Pillow to load the largest frame from the .ico
+            # iconphoto — sets the taskbar / Alt+Tab icon. Provide several sizes
+            # so Windows picks a crisp one for each context (title bar vs taskbar).
             from PIL import Image, ImageTk
-            img = Image.open(str(ico))
-            # Pick the largest available size in the .ico (up to 64px for title bar)
-            img = img.resize((64, 64), Image.LANCZOS).convert("RGBA")
-            self._icon_photo = ImageTk.PhotoImage(img)  # keep reference
-            self.root.iconphoto(True, self._icon_photo)
+            src = Image.open(str(ico)).convert("RGBA")
+            self._icon_photos = [
+                ImageTk.PhotoImage(src.resize((n, n), Image.LANCZOS))
+                for n in (16, 32, 48, 64, 128, 256)
+            ]  # keep references alive
+            self.root.iconphoto(True, *self._icon_photos)
         except Exception:
             pass
 
