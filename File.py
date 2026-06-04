@@ -897,6 +897,57 @@ def _unique_pdf_path(directory: Path, stem: str) -> Path:
     return candidate
 
 
+def _unique_output_path(directory: Path, stem: str, ext: str) -> Path:
+    """Return a '<stem><ext>' path in directory that doesn't collide with an
+    existing file (suffixing _2, _3, … as needed). ext includes the dot."""
+    candidate = directory / f"{stem}{ext}"
+    counter = 2
+    while candidate.exists():
+        candidate = directory / f"{stem}_{counter}{ext}"
+        counter += 1
+    return candidate
+
+
+# ─────────────────────────────────────────────
+# AI Preparation — convert any file type to LLM-friendly Markdown
+# via Microsoft's markitdown.
+# ─────────────────────────────────────────────
+
+_MARKITDOWN = None
+
+
+def _get_markitdown():
+    """Return a shared MarkItDown instance, importing it lazily so the rest of
+    the app works even if markitdown isn't installed. Raises a clear error if
+    the package is missing."""
+    global _MARKITDOWN
+    if _MARKITDOWN is None:
+        try:
+            from markitdown import MarkItDown
+        except ImportError as e:
+            raise RuntimeError(
+                "The 'markitdown' package is required for AI Preparation.\n"
+                "Install it with:  pip install \"markitdown[all]\""
+            ) from e
+        _MARKITDOWN = MarkItDown()
+    return _MARKITDOWN
+
+
+def _to_markdown(src_path: Path, out_dir: Path) -> Path:
+    """Convert any supported file to a Markdown (.md) file in out_dir and return
+    its path. Output is plain Markdown — easy for an LLM to read. Never
+    overwrites an existing file."""
+    md = _get_markitdown()
+    result = md.convert(str(src_path.resolve()))
+    text = (result.text_content or "").strip()
+    out_path = _unique_output_path(out_dir, src_path.stem, ".md")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # A short source note helps the downstream LLM know where the text came from.
+    header = f"<!-- Source file: {src_path.name} -->\n\n"
+    out_path.write_text(header + text + "\n", encoding="utf-8")
+    return out_path
+
+
 def convert_file(src_path: Path, out_dir: Path, outlook, word, visio, excel, powerpoint, mode: str) -> Path:
     """
     Convert a single file to PDF.
@@ -1332,6 +1383,11 @@ class ConverterApp:
         self._unzip_out_dir = None
         self._cancel_unzip  = threading.Event()
 
+        # AI Preparation page state
+        self._ai_files     = []
+        self._ai_out_dir   = None
+        self._cancel_ai    = threading.Event()
+
         # Navigation state
         self._active_page = None
         self._page_frames = {}
@@ -1386,7 +1442,9 @@ class ConverterApp:
 
         tk.Frame(self._sidebar, bg="#3a5068", height=1).pack(fill="x", padx=12, pady=(0, 8))
 
-        for page_key, label in [("pdf", "  PDF Conversion"), ("unzip", "  Folder Unzipping")]:
+        for page_key, label in [("pdf", "  PDF Conversion"),
+                                ("unzip", "  Folder Unzipping"),
+                                ("aiprep", "  AI Preparation")]:
             btn = tk.Button(
                 self._sidebar,
                 text=label,
@@ -1420,6 +1478,8 @@ class ConverterApp:
                 self._build_pdf_page(frame)
             elif key == "unzip":
                 self._build_unzip_page(frame)
+            elif key == "aiprep":
+                self._build_aiprep_page(frame)
 
         self._page_frames[key].pack(fill="both", expand=True)
 
@@ -1873,6 +1933,240 @@ class ConverterApp:
             messagebox.showwarning(
                 "PDF Conversion Errors",
                 f"The following files could not be converted to PDF:\n\n{file_list}",
+            )
+
+    # ── AI Preparation page ──────────────────
+    def _build_aiprep_page(self, parent):
+        tk.Label(
+            parent, text="AI Preparation",
+            bg=APP_BG, fg="#1a1a1a", font=("Segoe UI", 14, "bold"),
+            anchor="w", padx=18,
+        ).pack(fill="x", pady=(14, 4))
+
+        tk.Label(
+            parent,
+            text="Convert any files into clean Markdown (.md) text — ideal for feeding into another AI.",
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+            anchor="w", padx=18, justify="left",
+        ).pack(fill="x", pady=(0, 6))
+
+        # Drop zone
+        self._ai_drop_frame = tk.Frame(
+            parent, bg=DROP_BG, highlightbackground=DROP_BD,
+            highlightthickness=2, relief="flat",
+        )
+        self._ai_drop_frame.pack(fill="both", expand=True, padx=18, pady=(10, 6))
+        self._ai_drop_label = tk.Label(
+            self._ai_drop_frame,
+            text="Drop any files here\nor click 'Add Files'",
+            bg=DROP_BG, fg="#4a6fa5", font=("Segoe UI", 11), justify="center",
+        )
+        self._ai_drop_label.pack(expand=True, pady=20)
+        list_frame = tk.Frame(self._ai_drop_frame, bg=DROP_BG)
+        list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical")
+        self._ai_file_list = tk.Listbox(
+            list_frame, yscrollcommand=scrollbar.set, selectmode="extended",
+            bg="#ffffff", fg="#1a1a1a", font=("Segoe UI", 9),
+            relief="flat", bd=1, activestyle="none", highlightthickness=0,
+        )
+        scrollbar.config(command=self._ai_file_list.yview)
+        scrollbar.pack(side="right", fill="y")
+        self._ai_file_list.pack(fill="both", expand=True)
+        if HAS_DND:
+            for widget in (self._ai_drop_frame, self._ai_drop_label, list_frame, self._ai_file_list):
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._ai_on_drop)
+
+        # Add / Remove / Clear
+        btn_frame = tk.Frame(parent, bg=APP_BG)
+        btn_frame.pack(fill="x", padx=18, pady=(4, 4))
+        for label, cmd in [
+            ("Add Files",       self._ai_add_files),
+            ("Remove Selected", self._ai_remove_selected),
+            ("Clear All",       self._ai_clear_files),
+        ]:
+            tk.Button(
+                btn_frame, text=label, command=cmd,
+                bg="#e0e8f0", fg="#333", font=("Segoe UI", 9),
+                relief="flat", padx=12, pady=4, cursor="hand2",
+            ).pack(side="left", padx=(0, 6))
+
+        # Output folder
+        out_frame = tk.Frame(parent, bg=APP_BG)
+        out_frame.pack(fill="x", padx=18, pady=(2, 2))
+        tk.Label(out_frame, text="Output folder:", bg=APP_BG, fg="#555",
+                 font=("Segoe UI", 9)).pack(side="left")
+        self._ai_out_var = tk.StringVar(value="Same as source file")
+        tk.Label(out_frame, textvariable=self._ai_out_var, bg=APP_BG, fg="#333",
+                 font=("Segoe UI", 9)).pack(side="left", padx=6)
+        tk.Button(out_frame, text="Choose…", command=self._ai_choose_output,
+                  bg="#e0e8f0", fg="#333", font=("Segoe UI", 9), relief="flat",
+                  padx=10, pady=3, cursor="hand2").pack(side="left", padx=6)
+
+        # Delete-originals option
+        opt_frame = tk.Frame(parent, bg=APP_BG)
+        opt_frame.pack(fill="x", padx=18, pady=(2, 2))
+        self._ai_delete_orig = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            opt_frame, text="Delete original files after successful conversion",
+            variable=self._ai_delete_orig, bg=APP_BG, fg="#333",
+            activebackground=APP_BG, font=("Segoe UI", 9), anchor="w",
+        ).pack(side="left")
+
+        # Progress + status
+        self._ai_progress = ttk.Progressbar(parent, mode="determinate")
+        self._ai_progress.pack(fill="x", padx=18, pady=(6, 2))
+        self._ai_status_var = tk.StringVar(value="Ready — add files to convert to Markdown.")
+        tk.Label(parent, textvariable=self._ai_status_var, bg=APP_BG, fg="#555",
+                 font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=20, pady=(0, 4))
+
+        # Convert + Cancel
+        ai_btn_row = tk.Frame(parent, bg=APP_BG)
+        ai_btn_row.pack(pady=(4, 14))
+        self._ai_btn = tk.Button(
+            ai_btn_row, text="Convert to Markdown", command=self._start_aiprep,
+            bg=ACCENT, fg=BTN_FG, font=("Segoe UI", 12, "bold"),
+            relief="flat", padx=30, pady=8, cursor="hand2",
+            activebackground="#005a9e", activeforeground=BTN_FG,
+        )
+        self._ai_btn.pack(side="left")
+        self._ai_cancel_btn = tk.Button(
+            ai_btn_row, text="Cancel", command=self._cancel_aiprep_op,
+            font=("Segoe UI", 10, "bold"), relief="flat", padx=16, pady=6,
+            activebackground=CANCEL_BG_ACTIVE, activeforeground=BTN_FG,
+        )
+        self._ai_cancel_btn.pack(side="left", padx=(10, 0))
+        self._set_cancel_state(self._ai_cancel_btn, False)
+
+    def _ai_add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Select files to convert to Markdown",
+            filetypes=[("All files", "*.*")],
+        )
+        for p in paths:
+            self._ai_add_path(p)
+
+    def _ai_on_drop(self, event):
+        for p in self.root.tk.splitlist(event.data):
+            self._ai_add_path(p)
+
+    def _ai_add_path(self, p):
+        path = Path(p)
+        if not path.is_file():
+            return   # AI Prep accepts any file type, but only files
+        if path not in self._ai_files:
+            self._ai_files.append(path)
+            self._ai_file_list.insert("end", path.name)
+        self._ai_update_drop_label()
+
+    def _ai_remove_selected(self):
+        for i in sorted(self._ai_file_list.curselection(), reverse=True):
+            self._ai_file_list.delete(i)
+            del self._ai_files[i]
+        self._ai_update_drop_label()
+
+    def _ai_clear_files(self):
+        self._ai_files.clear()
+        self._ai_file_list.delete(0, "end")
+        self._ai_update_drop_label()
+
+    def _ai_update_drop_label(self):
+        if self._ai_files:
+            self._ai_drop_label.config(text=f"{len(self._ai_files)} file(s) queued")
+        else:
+            self._ai_drop_label.config(text="Drop any files here\nor click 'Add Files'")
+
+    def _ai_choose_output(self):
+        d = filedialog.askdirectory(title="Select output folder")
+        if d:
+            self._ai_out_dir = Path(d)
+            self._ai_out_var.set(str(self._ai_out_dir))
+        else:
+            self._ai_out_dir = None
+            self._ai_out_var.set("Same as source file")
+
+    def _cancel_aiprep_op(self):
+        self._cancel_ai.set()
+        self._set_cancel_state(self._ai_cancel_btn, False)
+        self._ai_status_var.set("Cancelling… finishing the current file, then stopping.")
+
+    def _start_aiprep(self):
+        if not self._ai_files:
+            messagebox.showwarning("No Files", "Please add files to convert first.")
+            return
+        self._cancel_ai.clear()
+        self._ai_btn.config(state="disabled")
+        self._set_cancel_state(self._ai_cancel_btn, True)
+        self._ai_progress["value"] = 0
+        self._ai_progress["maximum"] = len(self._ai_files)
+        threading.Thread(target=self._aiprep_worker, daemon=True).start()
+
+    def _aiprep_worker(self):
+        files = list(self._ai_files)
+        delete_orig = self._ai_delete_orig.get()
+        total = len(files)
+        converted = 0
+        failed = []
+
+        # Ensure markitdown is available before looping; surface a clear error if not.
+        try:
+            _get_markitdown()
+        except Exception as exc:
+            msg = str(exc)
+            self.root.after(0, lambda: (
+                self._ai_btn.config(state="normal"),
+                self._set_cancel_state(self._ai_cancel_btn, False),
+                self._ai_status_var.set("markitdown is not installed."),
+                messagebox.showerror("markitdown Not Available", msg),
+            ))
+            return
+
+        for i, src in enumerate(files):
+            if self._cancel_ai.is_set():
+                break
+            self.root.after(0, lambda s=src, n=i: self._ai_status_var.set(
+                f"Converting: {s.name}  ({n + 1}/{total})"))
+            try:
+                out_dir = self._ai_out_dir if self._ai_out_dir else src.parent
+                out = _to_markdown(src, out_dir)
+                if out.exists() and out.stat().st_size > 0:
+                    converted += 1
+                    if delete_orig:
+                        try:
+                            src.unlink()
+                        except Exception:
+                            pass
+                else:
+                    failed.append(src.name)
+            except Exception as exc:
+                failed.append(f"{src.name}: {exc}")
+            self.root.after(0, lambda: self._ai_progress.step(1))
+
+        self.root.after(0, lambda: self._ai_finish(converted, failed))
+
+    def _ai_finish(self, converted, failed):
+        self._ai_btn.config(state="normal")
+        self._set_cancel_state(self._ai_cancel_btn, False)
+        if self._cancel_ai.is_set():
+            self._ai_status_var.set(f"⏹  Cancelled. {converted} file(s) converted before stopping.")
+            messagebox.showinfo(
+                "AI Preparation Cancelled",
+                f"Conversion cancelled.\n{converted} file(s) converted before stopping.",
+            )
+            return
+        if not failed:
+            self._ai_status_var.set(f"✅  Done! {converted} file(s) converted to Markdown.")
+            messagebox.showinfo(
+                "AI Preparation Complete",
+                f"{converted} file(s) converted to Markdown (.md).",
+            )
+        else:
+            err_lines = "\n".join(f"• {n}" for n in failed)
+            self._ai_status_var.set(f"⚠️  {converted} converted, {len(failed)} failed.")
+            messagebox.showerror(
+                "AI Preparation — Some Files Failed",
+                f"{converted} converted, {len(failed)} failed:\n\n{err_lines}",
             )
 
     def _allowed_extensions(self):
