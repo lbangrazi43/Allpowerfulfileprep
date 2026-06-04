@@ -8,6 +8,7 @@ Requires: Microsoft Office installed on the machine.
 
 import os
 import sys
+import math
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -1491,6 +1492,121 @@ SIDEBAR_SEL = "#0078d4"
 SIDEBAR_W   = 190
 
 
+def _resource_base():
+    """Directory where bundled assets live (next to the script, or sys._MEIPASS
+    inside a one-file PyInstaller build)."""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).parent
+
+
+def _asset_path(name):
+    return _resource_base() / name
+
+
+class _SplashScreen:
+    """Small borderless splash shown while the app initializes.
+
+    The 'b' logo runs to the left while the owl chases it from behind; the
+    progress bar fills the opposite way (left→right) and 'Loading… X%' counts up.
+    """
+    W, H = 470, 230
+    NAVY, GREEN, BG = "#073b5e", "#9aca3c", "#ffffff"
+
+    def __init__(self, root):
+        from PIL import Image, ImageTk
+        self.root = root
+        self.win = tk.Toplevel(root)
+        self.win.overrideredirect(True)          # no title bar / borders
+        self.win.configure(bg=self.BG)
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        self.win.geometry("%dx%d+%d+%d" % (
+            self.W, self.H, (sw - self.W) // 2, (sh - self.H) // 2))
+        try:
+            self.win.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        self.cv = tk.Canvas(self.win, width=self.W, height=self.H, bg=self.BG,
+                            highlightthickness=2, highlightbackground=self.NAVY)
+        self.cv.pack(fill="both", expand=True)
+
+        # sprites: navy owl silhouette + the colour logo
+        self._imgs = {}
+        self.ground_y = 92
+        owl = ImageTk.PhotoImage(self._owl_sprite(70))
+        logo = ImageTk.PhotoImage(self._logo_sprite(60))
+        self._imgs["owl"], self._imgs["logo"] = owl, logo
+        self.owl_w, self.logo_w = owl.width(), logo.width()
+        self.logo_id = self.cv.create_image(-200, self.ground_y, image=logo)
+        self.owl_id = self.cv.create_image(-200, self.ground_y, image=owl)
+
+        # loading text below the sprites
+        self.pct_id = self.cv.create_text(self.W // 2, 170,
+                                          text="Loading… 0%", fill=self.NAVY,
+                                          font=("Segoe UI", 11))
+        self._render(0, 0)          # place sprites on-screen before first paint
+        self.win.update()
+
+    def _owl_sprite(self, h):
+        from PIL import Image, ImageOps
+        g = Image.open(_asset_path("owl_source.png")).convert("L")
+        g = g.crop(ImageOps.invert(g).getbbox())   # trim white space
+        alpha = ImageOps.invert(g)                  # dark owl -> opaque
+        owl = Image.new("RGBA", g.size, self.NAVY)
+        owl.putalpha(alpha)
+        w = max(1, int(owl.width * h / owl.height))
+        return owl.resize((w, h), Image.LANCZOS)
+
+    def _logo_sprite(self, h):
+        from PIL import Image
+        logo = Image.open(_asset_path("logo_b.png")).convert("RGBA")
+        w = max(1, int(logo.width * h / logo.height))
+        return logo.resize((w, h), Image.LANCZOS)
+
+    def _render(self, pct, frame):
+        self.cv.itemconfigure(self.pct_id, text="Loading… %d%%" % int(pct))
+        # One clean pass right -> left tied to the load %, so it runs through
+        # exactly once (no looping) and finishes just as the app appears. At 0%
+        # the logo is just barely peeking in at the right edge; the owl chases
+        # ~140px behind (entering from off-screen right). Both exit off the left
+        # edge by 100%.
+        p = pct / 100.0
+        gap = 100
+        logo_start = self.W + self.logo_w / 2 - 12   # ~12px sliver at right edge
+        owl_end = -self.owl_w / 2 - 10               # owl just off the left at 100%
+        logo_end = owl_end - gap                      # so the trailing owl clears too
+        logo_x = logo_start + (logo_end - logo_start) * p
+        owl_x = logo_x + gap
+        # slight hop as they run; owl bobs slightly out of phase with the logo
+        A = 8
+        logo_y = self.ground_y - A * abs(math.sin(frame * 0.30))
+        owl_y = self.ground_y - A * abs(math.sin(frame * 0.30 + 0.9))
+        self.cv.coords(self.logo_id, logo_x, logo_y)
+        self.cv.coords(self.owl_id, owl_x, owl_y)
+
+    def run(self, min_ms=1500):
+        import time
+        start = time.time()
+        frame = 0
+        while True:
+            elapsed = (time.time() - start) * 1000.0
+            self._render(min(100.0, elapsed / min_ms * 100.0), frame)
+            self.root.update()
+            if elapsed >= min_ms:
+                break
+            time.sleep(0.016)
+            frame += 1
+        self._render(100.0, frame)
+        self.root.update()
+
+    def close(self):
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
 class ConverterApp:
     def __init__(self):
         # Give the process its own AppUserModelID *before* the window exists so
@@ -1507,12 +1623,22 @@ class ConverterApp:
         else:
             self.root = tk.Tk()
 
-        self.root.title("All Powerful File Prep")
+        # Hide the window *immediately* — before any geometry/icon work forces a
+        # paint — so the blank Tk window never flashes on screen at launch.
+        self.root.withdraw()
+
+        self.root.title("File Preparation Toolkit")
         self.root.resizable(True, True)
         self.root.minsize(860, 600)
         self.root.configure(bg=APP_BG)
-        self._center_window(1000, 680)
         self._set_icon()
+
+        # Show an animated splash while we build the UI.
+        splash = None
+        try:
+            splash = _SplashScreen(self.root)
+        except Exception:
+            splash = None
 
         # PDF page state
         self.files    = []
@@ -1537,6 +1663,17 @@ class ConverterApp:
 
         self._build_shell()
         self._show_page("pdf")
+
+        # Run the splash animation, then reveal the centered main window.
+        if splash is not None:
+            try:
+                splash.run(min_ms=1500)
+            except Exception:
+                pass
+            splash.close()
+        self._center_window(1000, 680)
+        self.root.deiconify()
+        self.root.lift()
 
     def _set_icon(self):
         """Load icon.ico and set both the title bar and taskbar icon at a legible size."""
@@ -1601,7 +1738,7 @@ class ConverterApp:
 
         tk.Label(
             self._sidebar,
-            text="🦉\nAll Powerful\nFile Prep",
+            text="All Powerful\nFile Prep",
             bg=SIDEBAR_BG, fg="#ffffff",
             font=("Segoe UI", 11, "bold"),
             justify="center", pady=20,

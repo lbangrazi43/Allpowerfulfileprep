@@ -1,7 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all, copy_metadata
 
-datas = [('C:\\Users\\5999\\Downloads\\files\\icon.ico', '.')]
+datas = [
+    ('C:\\Users\\5999\\Downloads\\files\\icon.ico', '.'),
+    ('owl_source.png', '.'),   # splash: owl sprite
+    ('logo_b.png', '.'),       # splash: 'b' logo sprite
+]
 binaries = []
 hiddenimports = ['win32timezone']
 
@@ -17,6 +21,17 @@ for _pkg in ('win32com', 'win32api', 'pywintypes', 'PIL',
 # markitdown reads its own metadata at import time.
 datas += copy_metadata('markitdown')
 
+# Heavy scientific / ML / GUI-toolkit packages get dragged in transitively
+# (e.g. torch hard-depends on sympy) but a file-conversion app never uses them.
+# Excluding them shrinks the one-file archive by well over 100 MB, which is the
+# main thing that has to be unpacked to temp on every launch — so the app opens
+# noticeably faster. (numpy/pandas are kept: markitdown needs them for Excel/CSV.)
+EXCLUDES = [
+    'torch', 'torchvision', 'torchaudio', 'sympy', 'pygame',
+    'matplotlib', 'scipy', 'IPython', 'notebook', 'jupyter',
+    'PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'tkinter.test', 'test',
+]
+
 
 a = Analysis(
     ['File.py'],
@@ -27,7 +42,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=EXCLUDES,
     noarchive=False,
     optimize=0,
 )
@@ -43,7 +58,9 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX compresses the bundled DLLs, but they must be decompressed on launch —
+    # that adds startup time. Off = slightly larger file, faster to open.
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
