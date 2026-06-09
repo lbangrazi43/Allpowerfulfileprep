@@ -9,6 +9,7 @@ Requires: Microsoft Office installed on the machine.
 import os
 import sys
 import math
+import time
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -910,6 +911,211 @@ def _unique_output_path(directory: Path, stem: str, ext: str) -> Path:
 
 
 # ─────────────────────────────────────────────
+# Legacy Office → modern Office (one-to-one, by family)
+#
+# Each legacy (97-2003 / earlier) extension is keyed to exactly one Office
+# application, its modern OpenXML extension, and the SaveAs file-format code.
+# Keying by family is what guarantees a .doc can only ever become a Word file,
+# a .xls only an Excel file, etc. — the types can never be crossed.
+#   Word        wdFormatXMLDocument=12, wdFormatXMLTemplate=14
+#   Excel       xlOpenXMLWorkbook=51,   xlOpenXMLTemplate=54
+#   PowerPoint  ppSaveAsOpenXMLPresentation=24, ppSaveAsOpenXMLShow=28,
+#               ppSaveAsOpenXMLTemplate=26
+LEGACY_OFFICE = {
+    # Word family  → .docx / .dotx
+    ".doc": ("word", ".docx", 12),
+    ".dot": ("word", ".dotx", 14),
+    # Excel family → .xlsx / .xltx
+    ".xls": ("excel", ".xlsx", 51),
+    ".xlt": ("excel", ".xltx", 54),
+    # PowerPoint family → .pptx / .ppsx / .potx
+    ".ppt": ("powerpoint", ".pptx", 24),
+    ".pps": ("powerpoint", ".ppsx", 28),
+    ".pot": ("powerpoint", ".potx", 26),
+}
+
+
+# Executable name + COM ProgID for each Office family.
+OFFICE_INFO = {
+    "word":       ("winword.exe", "Word.Application"),
+    "excel":      ("excel.exe",   "Excel.Application"),
+    "powerpoint": ("powerpnt.exe", "PowerPoint.Application"),
+    "visio":      ("visio.exe",   "Visio.Application"),
+}
+
+
+def _office_pids(exe_name: str) -> set:
+    """Return the set of PIDs of running processes whose exe base name matches
+    (case-insensitive). Used to identify the dedicated Office instance we launch
+    so we can later kill ONLY ours, never the user's open Office windows."""
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_size_t)),
+            ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    k32 = ctypes.windll.kernel32
+    pids = set()
+    target = exe_name.lower()
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == -1:
+        return pids
+    try:
+        entry = PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        ok = k32.Process32First(snap, ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.decode("ascii", "ignore").lower() == target:
+                pids.add(int(entry.th32ProcessID))
+            ok = k32.Process32Next(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    return pids
+
+
+def _terminate_pid(pid: int):
+    """Force-terminate a single process by PID (best effort, ignores errors)."""
+    try:
+        import ctypes
+        PROCESS_TERMINATE = 0x0001
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+        if h:
+            ctypes.windll.kernel32.TerminateProcess(h, 1)
+            ctypes.windll.kernel32.CloseHandle(h)
+    except Exception:
+        pass
+
+
+# Per-file conversion watchdog: if a single file hasn't finished within this
+# many seconds, its dedicated Office instance is assumed stuck (a hidden modal
+# dialog) and force-killed so the batch can skip it and continue. Set generously
+# — even very large/complex legacy files convert in well under a minute — so a
+# genuinely slow conversion is never aborted by mistake. (The manual Cancel
+# button still force-stops instantly.)
+OFFICE_FILE_TIMEOUT = 300   # 5 minutes
+
+
+def _launch_office_isolated(family: str):
+    """Launch a DEDICATED, isolated Office instance for `family` via DispatchEx
+    and return (app, pids). `pids` is the set of newly-created Office process
+    IDs — i.e. only the instance we just started — so a stuck conversion can be
+    force-killed later without ever touching the user's own Office windows.
+
+    If no new process appears (e.g. PowerPoint attached to the user's existing
+    instance), `pids` is empty and that instance is deliberately never killed.
+    """
+    exe, progid = OFFICE_INFO[family]
+    before = _office_pids(exe)
+    app = win32com.client.DispatchEx(progid)
+    try:
+        if family == "powerpoint":
+            app.WindowState = 2          # ppWindowMinimized (PP can't be fully hidden)
+        else:
+            app.Visible = False
+    except Exception:
+        pass
+    # Disable macros and suppress modal prompts (the usual cause of hangs).
+    try:
+        app.AutomationSecurity = 3       # msoAutomationSecurityForceDisable
+    except Exception:
+        pass
+    try:
+        app.DisplayAlerts = 1 if family == "powerpoint" else False
+    except Exception:
+        pass
+    # Never pop an "install this feature?" dialog — it blocks the hidden app.
+    try:
+        app.FeatureInstall = 0           # msoFeatureInstallNone (raise instead of prompt)
+    except Exception:
+        pass
+    # Word/Excel-specific dialogs that otherwise hang on larger/complex legacy
+    # files: update-links, older-format encoding/convert, and overwrite prompts.
+    if family == "word":
+        for opt, val in (("UpdateLinksAtOpen", False),
+                         ("ConfirmConversions", False),
+                         ("DoNotPromptForConvert", True),
+                         ("WarnBeforeSavingPrintingSendingMarkup", False),
+                         ("SaveNormalPrompt", False)):
+            try:
+                setattr(app.Options, opt, val)
+            except Exception:
+                pass
+    elif family == "excel":
+        for prop, val in (("AskToUpdateLinks", False),
+                          ("AlertBeforeOverwriting", False)):
+            try:
+                setattr(app, prop, val)
+            except Exception:
+                pass
+    pids = _office_pids(exe) - before
+    return app, pids
+
+
+def _modernize_office_file(src_path: Path, out_path: Path, family: str, fmt: int, app) -> None:
+    """Convert one legacy Office file to its modern OpenXML equivalent at
+    `out_path`, using the already-launched `app` for `family`. Routing is fixed
+    by the caller's family/format, so types can never be crossed. The original
+    is opened read-only and never modified.
+    """
+    if app is None:
+        need = {"word": "Word", "excel": "Excel", "powerpoint": "PowerPoint"}[family]
+        raise RuntimeError(f"Microsoft {need} is required for this file type.")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    src = str(src_path.resolve())
+    dst = str(out_path.resolve())
+
+    if family == "word":
+        doc = None
+        try:
+            doc = app.Documents.Open(
+                src, ConfirmConversions=False, ReadOnly=True, AddToRecentFiles=False)
+            doc.SaveAs2(dst, FileFormat=fmt)
+        finally:
+            if doc is not None:
+                try:
+                    doc.Close(SaveChanges=False)
+                except Exception:
+                    pass
+
+    elif family == "excel":
+        wb = None
+        try:
+            wb = app.Workbooks.Open(
+                src, UpdateLinks=False, ReadOnly=True, AddToMru=False)
+            wb.SaveAs(dst, FileFormat=fmt)
+        finally:
+            if wb is not None:
+                try:
+                    wb.Close(SaveChanges=False)
+                except Exception:
+                    pass
+
+    else:  # powerpoint
+        prs = None
+        try:
+            prs = app.Presentations.Open(
+                src, ReadOnly=True, Untitled=False, WithWindow=False)
+            prs.SaveAs(dst, fmt)
+        finally:
+            if prs is not None:
+                try:
+                    prs.Close()
+                except Exception:
+                    pass
+
+
+# ─────────────────────────────────────────────
 # AI Preparation — convert any file type to LLM-friendly Markdown
 # via Microsoft's markitdown.
 # ─────────────────────────────────────────────
@@ -1401,7 +1607,8 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
 
 
 def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
-                  status_cb, progress_cb, finish_cb, cancel_event=None):
+                  status_cb, progress_cb, finish_cb, cancel_event=None,
+                  item_cb=None):
     """Thread worker: extract zips, handle flat vs structured output, then
     optionally auto-convert all non-PDF files to PDF.
 
@@ -1418,6 +1625,8 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
         if cancelled():
             break
         status_cb(f"Extracting: {zip_path.name}  ({i + 1}/{total})")
+        if item_cb is not None:
+            item_cb(zip_path.name)
         tmp = Path(tempfile.mkdtemp())
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
@@ -1607,6 +1816,90 @@ class _SplashScreen:
             pass
 
 
+class _OpTimer:
+    """Live elapsed-time display for an operation: a 'Total Time Elapsed' timer
+    plus a per-file timer, shown as small stacked labels under a progress bar.
+
+    start()/stop() bracket the whole operation; set_file(name) is called as each
+    file begins. The display refreshes ~4×/second on the Tk main thread.
+    """
+    def __init__(self, root, total_var, file_var, total_lbl, file_lbl):
+        self.root = root
+        self.total_var = total_var
+        self.file_var = file_var
+        self.total_lbl = total_lbl
+        self.file_lbl = file_lbl
+        self._start = None
+        self._file_name = None
+        self._file_start = None
+        self._running = False
+        self._shown = False
+        self._final_secs = 0
+
+    @staticmethod
+    def _fmt(secs):
+        secs = max(0, int(secs))
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    def start(self):
+        # Reveal the labels only once an operation actually begins.
+        if not self._shown:
+            self.total_lbl.pack(fill="x", padx=20)
+            self.file_lbl.pack(fill="x", padx=20, pady=(0, 2))
+            self._shown = True
+        self._start = time.monotonic()
+        self._file_name = None
+        self._file_start = None
+        self._running = True
+        self.total_var.set("Total Time Elapsed:  00:00")
+        self.file_var.set("Current file:  —")
+        self._tick()
+
+    def set_file(self, name):
+        # Called from the worker thread — only assigns plain attributes.
+        self._file_name = name
+        self._file_start = time.monotonic()
+
+    def _tick(self):
+        if not self._running:
+            return
+        now = time.monotonic()
+        if self._start is not None:
+            self.total_var.set("Total Time Elapsed:  " + self._fmt(now - self._start))
+        if self._file_name is not None and self._file_start is not None:
+            self.file_var.set(
+                f"Current file ({self._file_name}):  " + self._fmt(now - self._file_start))
+        self.root.after(250, self._tick)
+
+    def stop(self):
+        if not self._running and self._start is None:
+            return
+        self._running = False
+        if self._start is not None:
+            self._final_secs = time.monotonic() - self._start
+            self.total_var.set("Total Time Elapsed:  " + self._fmt(self._final_secs))
+        self.file_var.set("")
+
+    def elapsed_str(self):
+        """Formatted total elapsed time of the last run (call after stop())."""
+        return self._fmt(self._final_secs)
+
+    def reset(self):
+        """Clear the timer and hide it from the window (ready for the next run)."""
+        self._running = False
+        self._start = None
+        self._file_name = None
+        self._file_start = None
+        self.total_var.set("")
+        self.file_var.set("")
+        if self._shown:
+            self.total_lbl.pack_forget()
+            self.file_lbl.pack_forget()
+            self._shown = False
+
+
 class ConverterApp:
     def __init__(self):
         # Give the process its own AppUserModelID *before* the window exists so
@@ -1641,11 +1934,12 @@ class ConverterApp:
             splash = None
 
         # Close PyInstaller's built-in bootloader splash (shown during the
-        # one-file unpack) now that our own splash is on screen. Only exists in
-        # the frozen build, so failures here are expected and ignored.
+        # one-file unpack) now that our own splash is on screen. The pyi_splash
+        # module only exists inside the frozen build, so it's imported
+        # dynamically (and any failure ignored) — it's absent in dev/editor.
         try:
-            import pyi_splash
-            pyi_splash.close()
+            import importlib
+            importlib.import_module("pyi_splash").close()
         except Exception:
             pass
 
@@ -1654,6 +1948,7 @@ class ConverterApp:
         self._out_dir = None
         self._mode    = tk.StringVar(value="Email (.eml, .msg)")
         self._cancel_convert = threading.Event()
+        self._pdf_app_pids   = []   # PIDs of dedicated Office instances (not Outlook)
 
         # Unzip page state
         self._zip_files     = []
@@ -1664,6 +1959,12 @@ class ConverterApp:
         self._ai_files     = []
         self._ai_out_dir   = None
         self._cancel_ai    = threading.Event()
+
+        # Office Modernizer page state
+        self._office_files    = []
+        self._office_out_dir  = None
+        self._cancel_office   = threading.Event()
+        self._office_app_pids = {}   # family -> set of PIDs of our dedicated instances
 
         # Navigation state
         self._active_page = None
@@ -1771,7 +2072,8 @@ class ConverterApp:
 
         for page_key, label in [("pdf", "  PDF Conversion"),
                                 ("unzip", "  Folder Unzipping"),
-                                ("aiprep", "  AI Preparation")]:
+                                ("aiprep", "  Markdown Conversion"),
+                                ("office", "  Office Modernizer")]:
             btn = tk.Button(
                 self._sidebar,
                 text=label,
@@ -1807,8 +2109,25 @@ class ConverterApp:
                 self._build_unzip_page(frame)
             elif key == "aiprep":
                 self._build_aiprep_page(frame)
+            elif key == "office":
+                self._build_office_page(frame)
 
         self._page_frames[key].pack(fill="both", expand=True)
+
+    def _build_timer(self, parent):
+        """Reserve a spot for the stacked 'Total Time Elapsed' + current-file
+        labels (small, left-aligned). The labels stay hidden until the operation
+        starts; the holder frame keeps their position without taking space when
+        empty. Returns the _OpTimer that reveals and drives them."""
+        holder = tk.Frame(parent, bg=APP_BG)
+        holder.pack(fill="x")
+        total_var = tk.StringVar(value="")
+        file_var = tk.StringVar(value="")
+        total_lbl = tk.Label(holder, textvariable=total_var, bg=APP_BG, fg="#666",
+                             font=("Segoe UI", 8, "bold"), anchor="w")
+        file_lbl = tk.Label(holder, textvariable=file_var, bg=APP_BG, fg="#888",
+                            font=("Segoe UI", 8), anchor="w")
+        return _OpTimer(self.root, total_var, file_var, total_lbl, file_lbl)
 
     # ── layout ──────────────────────────────
     def _build_pdf_page(self, parent):
@@ -1929,6 +2248,7 @@ class ConverterApp:
             bg=APP_BG, fg="#555", font=("Segoe UI", 8),
             anchor="w",
         ).pack(fill="x", padx=20, pady=(0, 4))
+        self._pdf_timer = self._build_timer(parent)
 
         # Convert button (+ smaller Cancel button beside it)
         btn_row = tk.Frame(parent, bg=APP_BG)
@@ -2090,6 +2410,7 @@ class ConverterApp:
             bg=APP_BG, fg="#555", font=("Segoe UI", 8),
             anchor="w",
         ).pack(fill="x", padx=20, pady=(0, 4))
+        self._uz_timer = self._build_timer(parent)
 
         # Unzip button (disabled until output folder is chosen) + Cancel beside it
         uz_btn_row = tk.Frame(parent, bg=APP_BG)
@@ -2210,6 +2531,7 @@ class ConverterApp:
         self._uz_progress["maximum"] = len(self._zip_files)
         separate  = self._uz_separate.get()
         auto_pdf  = self._uz_auto_pdf.get()
+        self._uz_timer.start()
         threading.Thread(
             target=_unzip_worker,
             args=(
@@ -2221,6 +2543,7 @@ class ConverterApp:
                 lambda: self.root.after(0, lambda: self._uz_progress.step(1)),
                 lambda s, f, pf: self.root.after(0, lambda: self._uz_finish(s, f, pf)),
                 self._cancel_unzip,
+                self._uz_timer.set_file,
             ),
             daemon=True,
         ).start()
@@ -2232,27 +2555,33 @@ class ConverterApp:
         self._uz_status_var.set("Cancelling… finishing the current item, then stopping.")
 
     def _uz_finish(self, success, failed, pdf_failed=None):
+        self._uz_timer.stop()
+        elapsed = self._uz_timer.elapsed_str()
+        self._uz_timer.reset()
         self._uz_btn.config(state="normal")
         self._set_cancel_state(self._uz_cancel_btn, False)
         if self._cancel_unzip.is_set():
             self._uz_status_var.set(f"⏹  Cancelled. {success} archive(s) extracted before stopping.")
             messagebox.showinfo(
                 "Unzip Cancelled",
-                f"Operation was cancelled.\n{success} archive(s) extracted before stopping.",
+                f"Operation was cancelled.\n{success} archive(s) extracted before stopping."
+                f"\n\nTotal time elapsed: {elapsed}",
             )
             return
         if not failed:
             self._uz_status_var.set(f"Done! {success} archive(s) extracted successfully.")
             messagebox.showinfo(
                 "Unzip Complete",
-                f"{success} archive(s) extracted successfully.",
+                f"{success} archive(s) extracted successfully."
+                f"\n\nTotal time elapsed: {elapsed}",
             )
         else:
             err_lines = "\n".join(f"• {n}: {e}" for n, e in failed)
             self._uz_status_var.set(f"{success} extracted, {len(failed)} failed.")
             messagebox.showerror(
                 "Unzip Errors",
-                f"{success} succeeded, {len(failed)} failed:\n\n{err_lines}",
+                f"{success} succeeded, {len(failed)} failed:\n\n{err_lines}"
+                f"\n\nTotal time elapsed: {elapsed}",
             )
 
         if pdf_failed:
@@ -2265,7 +2594,7 @@ class ConverterApp:
     # ── AI Preparation page ──────────────────
     def _build_aiprep_page(self, parent):
         tk.Label(
-            parent, text="AI Preparation",
+            parent, text="Markdown Conversion",
             bg=APP_BG, fg="#1a1a1a", font=("Segoe UI", 14, "bold"),
             anchor="w", padx=18,
         ).pack(fill="x", pady=(14, 4))
@@ -2357,6 +2686,7 @@ class ConverterApp:
         self._ai_status_var = tk.StringVar(value="Ready — add files to convert to Markdown.")
         tk.Label(parent, textvariable=self._ai_status_var, bg=APP_BG, fg="#555",
                  font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=20, pady=(0, 4))
+        self._ai_timer = self._build_timer(parent)
 
         # Convert + Cancel
         ai_btn_row = tk.Frame(parent, bg=APP_BG)
@@ -2437,6 +2767,7 @@ class ConverterApp:
         self._set_cancel_state(self._ai_cancel_btn, True)
         self._ai_progress["value"] = 0
         self._ai_progress["maximum"] = len(self._ai_files)
+        self._ai_timer.start()
         threading.Thread(target=self._aiprep_worker, daemon=True).start()
 
     def _aiprep_worker(self):
@@ -2454,6 +2785,7 @@ class ConverterApp:
             self.root.after(0, lambda: (
                 self._ai_btn.config(state="normal"),
                 self._set_cancel_state(self._ai_cancel_btn, False),
+                self._ai_timer.reset(),
                 self._ai_status_var.set("markitdown is not installed."),
                 messagebox.showerror("markitdown Not Available", msg),
             ))
@@ -2464,6 +2796,7 @@ class ConverterApp:
                 break
             self.root.after(0, lambda s=src, n=i: self._ai_status_var.set(
                 f"Converting: {s.name}  ({n + 1}/{total})"))
+            self._ai_timer.set_file(src.name)
             try:
                 out_dir = self._ai_out_dir if self._ai_out_dir else src.parent
                 out = _to_markdown(src, out_dir)
@@ -2493,27 +2826,366 @@ class ConverterApp:
         self.root.after(0, lambda: self._ai_finish(converted, failed))
 
     def _ai_finish(self, converted, failed):
+        self._ai_timer.stop()
+        elapsed = self._ai_timer.elapsed_str()
+        self._ai_timer.reset()
         self._ai_btn.config(state="normal")
         self._set_cancel_state(self._ai_cancel_btn, False)
         if self._cancel_ai.is_set():
             self._ai_status_var.set(f"⏹  Cancelled. {converted} file(s) converted before stopping.")
             messagebox.showinfo(
                 "AI Preparation Cancelled",
-                f"Conversion cancelled.\n{converted} file(s) converted before stopping.",
+                f"Conversion cancelled.\n{converted} file(s) converted before stopping."
+                f"\n\nTotal time elapsed: {elapsed}",
             )
             return
         if not failed:
             self._ai_status_var.set(f"✅  Done! {converted} file(s) converted to Markdown.")
             messagebox.showinfo(
                 "AI Preparation Complete",
-                f"{converted} file(s) converted to Markdown (.md).",
+                f"{converted} file(s) converted to Markdown (.md)."
+                f"\n\nTotal time elapsed: {elapsed}",
             )
         else:
             err_lines = "\n".join(f"• {n}" for n in failed)
             self._ai_status_var.set(f"⚠️  {converted} converted, {len(failed)} failed.")
             messagebox.showerror(
                 "AI Preparation — Some Files Failed",
-                f"{converted} converted, {len(failed)} failed:\n\n{err_lines}",
+                f"{converted} converted, {len(failed)} failed:\n\n{err_lines}"
+                f"\n\nTotal time elapsed: {elapsed}",
+            )
+
+    # ── Office Modernizer ────────────────────
+    def _build_office_page(self, parent):
+        tk.Label(
+            parent, text="Office Modernizer",
+            bg=APP_BG, fg="#1a1a1a", font=("Segoe UI", 14, "bold"),
+            anchor="w", padx=18,
+        ).pack(fill="x", pady=(14, 4))
+
+        tk.Label(
+            parent,
+            text=("Batch-convert old Office files to their newest formats. Drop a mix of "
+                  "types at once — each is converted one-to-one:\n"
+                  ".doc/.dot → .docx/.dotx    .xls/.xlt → .xlsx/.xltx    .ppt/.pps/.pot → .pptx/.ppsx/.potx"),
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+            anchor="w", padx=18, justify="left",
+        ).pack(fill="x", pady=(0, 6))
+
+        # Drop zone
+        self._office_drop_frame = tk.Frame(
+            parent, bg=DROP_BG, highlightbackground=DROP_BD,
+            highlightthickness=2, relief="flat",
+        )
+        self._office_drop_frame.pack(fill="both", expand=True, padx=18, pady=(10, 6))
+        self._office_drop_label = tk.Label(
+            self._office_drop_frame,
+            text="Drop legacy Office files here\nor click 'Add Files'",
+            bg=DROP_BG, fg="#4a6fa5", font=("Segoe UI", 11), justify="center",
+        )
+        self._office_drop_label.pack(expand=True, pady=20)
+        list_frame = tk.Frame(self._office_drop_frame, bg=DROP_BG)
+        list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical")
+        self._office_file_list = tk.Listbox(
+            list_frame, yscrollcommand=scrollbar.set, selectmode="extended",
+            bg="#ffffff", fg="#1a1a1a", font=("Segoe UI", 9),
+            relief="flat", bd=1, activestyle="none", highlightthickness=0,
+        )
+        scrollbar.config(command=self._office_file_list.yview)
+        scrollbar.pack(side="right", fill="y")
+        self._office_file_list.pack(fill="both", expand=True)
+        if HAS_DND:
+            for widget in (self._office_drop_frame, self._office_drop_label, list_frame, self._office_file_list):
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._office_on_drop)
+
+        # Add / Remove / Clear
+        btn_frame = tk.Frame(parent, bg=APP_BG)
+        btn_frame.pack(fill="x", padx=18, pady=(4, 4))
+        for label, cmd in [
+            ("Add Files",       self._office_add_files),
+            ("Remove Selected", self._office_remove_selected),
+            ("Clear All",       self._office_clear_files),
+        ]:
+            tk.Button(
+                btn_frame, text=label, command=cmd,
+                bg="#e0e8f0", fg="#333", font=("Segoe UI", 9),
+                relief="flat", padx=12, pady=4, cursor="hand2",
+            ).pack(side="left", padx=(0, 6))
+
+        # Output folder row
+        out_frame = tk.Frame(parent, bg=APP_BG)
+        out_frame.pack(fill="x", padx=18, pady=(2, 2))
+        tk.Label(
+            out_frame, text="Output folder:",
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+        ).pack(side="left")
+        self._office_out_var = tk.StringVar(value="Same as source file")
+        tk.Label(
+            out_frame, textvariable=self._office_out_var,
+            bg=APP_BG, fg=ACCENT, font=("Segoe UI", 9, "italic"),
+        ).pack(side="left", padx=4)
+        tk.Button(
+            out_frame, text="Choose…", command=self._office_choose_output,
+            bg="#e0e8f0", fg="#333", font=("Segoe UI", 9), relief="flat",
+            padx=8, pady=2, cursor="hand2",
+        ).pack(side="left", padx=4)
+
+        # Delete-originals option
+        opt_frame = tk.Frame(parent, bg=APP_BG)
+        opt_frame.pack(fill="x", padx=18, pady=(2, 2))
+        self._office_delete_orig = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            opt_frame, text="Delete original files after successful conversion",
+            variable=self._office_delete_orig, bg=APP_BG, fg="#333",
+            activebackground=APP_BG, font=("Segoe UI", 9), anchor="w",
+        ).pack(side="left")
+
+        # Progress + status
+        self._office_progress = ttk.Progressbar(parent, mode="determinate")
+        self._office_progress.pack(fill="x", padx=18, pady=(6, 2))
+        self._office_status_var = tk.StringVar(
+            value="Ready — add legacy Office files to modernize.")
+        tk.Label(parent, textvariable=self._office_status_var, bg=APP_BG, fg="#555",
+                 font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=20, pady=(0, 4))
+        self._office_timer = self._build_timer(parent)
+
+        # Convert + Cancel
+        office_btn_row = tk.Frame(parent, bg=APP_BG)
+        office_btn_row.pack(pady=(4, 14))
+        self._office_btn = tk.Button(
+            office_btn_row, text="Modernize Files", command=self._start_office,
+            bg=ACCENT, fg=BTN_FG, font=("Segoe UI", 12, "bold"),
+            relief="flat", padx=30, pady=8, cursor="hand2",
+            activebackground="#005a9e", activeforeground=BTN_FG,
+        )
+        self._office_btn.pack(side="left")
+        self._office_cancel_btn = tk.Button(
+            office_btn_row, text="Cancel", command=self._cancel_office_op,
+            font=("Segoe UI", 10, "bold"), relief="flat", padx=16, pady=6,
+            activebackground=CANCEL_BG_ACTIVE, activeforeground=BTN_FG,
+        )
+        self._office_cancel_btn.pack(side="left", padx=(10, 0))
+        self._set_cancel_state(self._office_cancel_btn, False)
+
+    def _office_add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Select legacy Office files",
+            filetypes=[("Legacy Office files", "*.doc *.dot *.xls *.xlt *.ppt *.pps *.pot"),
+                       ("All files", "*.*")],
+        )
+        for p in paths:
+            self._office_add_path(p)
+
+    def _office_on_drop(self, event):
+        for p in self.root.tk.splitlist(event.data):
+            self._office_add_path(p)
+
+    def _office_add_path(self, p):
+        path = Path(p)
+        if not path.is_file():
+            return
+        if path.suffix.lower() not in LEGACY_OFFICE:
+            return   # only accept legacy Office files; ignore anything else
+        if path not in self._office_files:
+            self._office_files.append(path)
+            self._office_file_list.insert("end", path.name)
+        self._office_update_drop_label()
+
+    def _office_remove_selected(self):
+        for i in sorted(self._office_file_list.curselection(), reverse=True):
+            self._office_file_list.delete(i)
+            del self._office_files[i]
+        self._office_update_drop_label()
+
+    def _office_clear_files(self):
+        self._office_files.clear()
+        self._office_file_list.delete(0, "end")
+        self._office_update_drop_label()
+
+    def _office_update_drop_label(self):
+        if self._office_files:
+            self._office_drop_label.config(text=f"{len(self._office_files)} file(s) queued")
+        else:
+            self._office_drop_label.config(
+                text="Drop legacy Office files here\nor click 'Add Files'")
+
+    def _office_choose_output(self):
+        d = filedialog.askdirectory(title="Select output folder")
+        if d:
+            self._office_out_dir = Path(d)
+            self._office_out_var.set(str(self._office_out_dir))
+        else:
+            self._office_out_dir = None
+            self._office_out_var.set("Same as source file")
+
+    def _cancel_office_op(self):
+        # True kill: force-close the dedicated Office instance(s) WE launched so
+        # a stuck/hung conversion is aborted immediately. Only our own tracked
+        # PIDs are terminated — the user's open Office windows are never touched.
+        self._cancel_office.set()
+        self._set_cancel_state(self._office_cancel_btn, False)
+        self._office_status_var.set("Stopping… force-closing the current conversion.")
+        for pids in list(getattr(self, "_office_app_pids", {}).values()):
+            for pid in list(pids):
+                _terminate_pid(pid)
+
+    def _start_office(self):
+        if not self._office_files:
+            messagebox.showwarning("No Files", "Please add legacy Office files first.")
+            return
+        self._cancel_office.clear()
+        self._office_btn.config(state="disabled")
+        self._set_cancel_state(self._office_cancel_btn, True)
+        self._office_progress["value"] = 0
+        self._office_progress["maximum"] = len(self._office_files)
+        self._office_timer.start()
+        threading.Thread(target=self._office_worker, daemon=True).start()
+
+    def _office_worker(self):
+        files = list(self._office_files)
+        delete_orig = self._office_delete_orig.get()
+        total = len(files)
+        converted = 0
+        failed = []
+
+        pythoncom.CoInitialize()
+        # Each family gets its own DEDICATED Office instance (launched lazily,
+        # only if a matching file is queued). We track the PIDs of just those
+        # instances so Cancel can force-kill a stuck conversion without ever
+        # harming the user's own open Office windows.
+        apps = {"word": None, "excel": None, "powerpoint": None}
+        ensured = {"word": False, "excel": False, "powerpoint": False}
+        self._office_app_pids = {}
+        try:
+            for i, src in enumerate(files):
+                if self._cancel_office.is_set():
+                    break
+                self._set_office_status(f"Converting: {src.name}  ({i + 1}/{total})")
+                self._office_timer.set_file(src.name)
+                info = LEGACY_OFFICE.get(src.suffix.lower())
+                if info is None:
+                    failed.append((src.name, "unsupported file type"))
+                    self.root.after(0, lambda: self._office_progress.step(1))
+                    continue
+                family, out_ext, fmt = info
+                if not ensured[family]:
+                    try:
+                        app_obj, pids = _launch_office_isolated(family)
+                    except Exception:
+                        app_obj, pids = None, set()
+                    apps[family] = app_obj
+                    self._office_app_pids[family] = set(pids)
+                    ensured[family] = True
+
+                out_dir = self._office_out_dir if self._office_out_dir else src.parent
+                out_path = _unique_output_path(out_dir, src.stem, out_ext)
+
+                # Watchdog: if this file isn't done within OFFICE_FILE_TIMEOUT,
+                # assume its dedicated instance is stuck on a hidden dialog and
+                # force-kill it so the batch can skip this file and continue.
+                pids = set(self._office_app_pids.get(family) or ())
+                timed_out = {"v": False}
+                done = threading.Event()
+
+                def _watchdog(pids=pids, timed_out=timed_out, done=done):
+                    if not pids:
+                        return   # nothing we can safely kill (e.g. shared PowerPoint)
+                    if not done.wait(OFFICE_FILE_TIMEOUT):
+                        timed_out["v"] = True
+                        for p in pids:
+                            _terminate_pid(p)
+
+                wd = threading.Thread(target=_watchdog, daemon=True)
+                wd.start()
+                try:
+                    _modernize_office_file(src, out_path, family, fmt, apps[family])
+                    converted += 1
+                    if delete_orig:
+                        try:
+                            src.unlink()
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    # Remove any partial/corrupt output left behind — e.g. when
+                    # the conversion was force-killed mid-save. The path is
+                    # uniquely named, so this only ever deletes our own output.
+                    try:
+                        if out_path.exists():
+                            out_path.unlink()
+                    except Exception:
+                        pass
+                    if self._cancel_office.is_set():
+                        pass                       # user cancelled — not a failure
+                    elif timed_out["v"]:
+                        failed.append((src.name, "timed out — appeared stuck, skipped"))
+                    else:
+                        failed.append((src.name, str(exc)))
+                finally:
+                    done.set()
+                    wd.join(timeout=2)
+
+                # If the watchdog killed the instance, drop it so the next file
+                # of this family gets a fresh, healthy one.
+                if timed_out["v"]:
+                    apps[family] = None
+                    ensured[family] = False
+                    self._office_app_pids.pop(family, None)
+
+                self.root.after(0, lambda: self._office_progress.step(1))
+        finally:
+            # Close our dedicated instances (already-killed ones error here —
+            # ignored), then make sure none of our launched processes linger.
+            for app in apps.values():
+                if app is not None:
+                    try:
+                        app.Quit()
+                    except Exception:
+                        pass
+            for pids in list(self._office_app_pids.values()):
+                for pid in pids:
+                    _terminate_pid(pid)
+            self._office_app_pids = {}
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+        self.root.after(0, lambda: self._office_finish(converted, failed))
+
+    def _set_office_status(self, msg):
+        self.root.after(0, lambda: self._office_status_var.set(msg))
+
+    def _office_finish(self, converted, failed):
+        self._office_timer.stop()
+        elapsed = self._office_timer.elapsed_str()
+        self._office_timer.reset()
+        self._office_btn.config(state="normal")
+        self._set_cancel_state(self._office_cancel_btn, False)
+        if self._cancel_office.is_set():
+            self._office_status_var.set(
+                f"⏹  Cancelled. {converted} file(s) modernized before stopping.")
+            messagebox.showinfo(
+                "Office Modernizer Cancelled",
+                f"Conversion cancelled.\n{converted} file(s) modernized before stopping."
+                f"\n\nTotal time elapsed: {elapsed}",
+            )
+            return
+        if not failed:
+            self._office_status_var.set(f"✅  Done! {converted} file(s) modernized.")
+            messagebox.showinfo(
+                "Office Modernizer Complete",
+                f"{converted} file(s) converted to their modern Office formats."
+                f"\n\nTotal time elapsed: {elapsed}",
+            )
+        else:
+            err_lines = "\n".join(f"• {n}: {e}" for n, e in failed)
+            self._office_status_var.set(f"⚠️  {converted} modernized, {len(failed)} failed.")
+            messagebox.showerror(
+                "Office Modernizer — Some Files Failed",
+                f"{converted} modernized, {len(failed)} failed:\n\n{err_lines}"
+                f"\n\nTotal time elapsed: {elapsed}",
             )
 
     def _allowed_extensions(self):
@@ -2625,10 +3297,15 @@ class ConverterApp:
             btn.config(state="disabled", bg=CANCEL_OFF_BG, fg=CANCEL_OFF_FG, cursor="arrow")
 
     def _cancel_conversion(self):
-        """Request that the running conversion stop as soon as possible."""
+        """Force-stop the running conversion. Kills the dedicated Office
+        instances we launched (Word/Excel/PowerPoint/Visio) so a stuck file is
+        aborted immediately. Outlook is the user's email client and is never
+        killed — in email mode this falls back to a graceful stop."""
         self._cancel_convert.set()
         self._set_cancel_state(self.cancel_btn, False)
-        self.status_var.set("Cancelling… finishing the current file, then stopping.")
+        self.status_var.set("Stopping… force-closing the current conversion.")
+        for pid in list(getattr(self, "_pdf_app_pids", [])):
+            _terminate_pid(pid)
 
     def _start_convert(self):
         if not self.files:
@@ -2647,6 +3324,7 @@ class ConverterApp:
         self._set_cancel_state(self.cancel_btn, True)
         self.progress["value"] = 0
         self.progress["maximum"] = len(self.files)
+        self._pdf_timer.start()
         threading.Thread(target=self._convert_worker, daemon=True).start()
 
     def _convert_worker(self):
@@ -2660,120 +3338,119 @@ class ConverterApp:
         email_mode  = not any([html_mode, visio_mode, excel_mode, word_mode, ppt_mode, image_mode])
 
         pythoncom.CoInitialize()
-
-        # Outlook — email only
-        outlook = None
-        if email_mode:
-            try:
-                outlook = _ensure_outlook()
-            except Exception as exc:
-                self.root.after(0, lambda: (
-                    self.convert_btn.config(state="normal"),
-                    messagebox.showerror("Outlook Error", str(exc)),
-                ))
-                pythoncom.CoUninitialize()
-                return
-
-        # Word — email, HTML, Word doc, and image modes
-        word = None
-        if email_mode or html_mode or word_mode or image_mode:
-            word = _ensure_word()
-            if word is None and (html_mode or word_mode or image_mode):
-                if html_mode:   label = "HTML / MHT"
-                elif image_mode: label = "Image"
-                else:            label = "Word document"
-                self.root.after(0, lambda: (
-                    self.convert_btn.config(state="normal"),
-                    messagebox.showerror(
-                        "Word Not Found",
-                        f"Microsoft Word is required for {label} conversion.\n"
-                        "Please ensure Word is installed."
-                    ),
-                ))
-                pythoncom.CoUninitialize()
-                return
-
-        # Visio — Visio only
-        visio = None
-        if visio_mode:
-            visio = _ensure_visio()
-            if visio is None:
-                self.root.after(0, lambda: (
-                    self.convert_btn.config(state="normal"),
-                    messagebox.showerror(
-                        "Visio Not Found",
-                        "Microsoft Visio is required for Visio conversion.\n"
-                        "Please ensure Visio is installed."
-                    ),
-                ))
-                pythoncom.CoUninitialize()
-                return
-
-        # Excel — Excel only
-        excel = None
-        if excel_mode:
-            excel = _ensure_excel()
-            if excel is None:
-                self.root.after(0, lambda: (
-                    self.convert_btn.config(state="normal"),
-                    messagebox.showerror(
-                        "Excel Not Found",
-                        "Microsoft Excel is required for Excel conversion.\n"
-                        "Please ensure Excel is installed."
-                    ),
-                ))
-                pythoncom.CoUninitialize()
-                return
-
-        # PowerPoint — PowerPoint only
-        powerpoint = None
-        if ppt_mode:
-            powerpoint = _ensure_powerpoint()
-            if powerpoint is None:
-                self.root.after(0, lambda: (
-                    self.convert_btn.config(state="normal"),
-                    messagebox.showerror(
-                        "PowerPoint Not Found",
-                        "Microsoft PowerPoint is required for PowerPoint conversion.\n"
-                        "Please ensure PowerPoint is installed."
-                    ),
-                ))
-                pythoncom.CoUninitialize()
-                return
-
+        self._pdf_app_pids = []
+        outlook = word = visio = excel = powerpoint = None
         success, failed = 0, []
-        total = len(self.files)
-        if visio_mode:      mode_key = "visio"
-        elif html_mode:     mode_key = "html"
-        elif excel_mode:    mode_key = "excel"
-        elif word_mode:     mode_key = "word_doc"
-        elif ppt_mode:      mode_key = "powerpoint"
-        elif image_mode:    mode_key = "image"
-        else:               mode_key = "email"
 
-        for i, src in enumerate(self.files):
-            if self._cancel_convert.is_set():
-                break
-            self._set_status(f"Converting: {src.name}  ({i + 1}/{total})")
+        def _launch(family):
+            # Dedicated, isolated Office instance + track its PID so Cancel can
+            # force-kill only ours (never the user's open Office windows).
             try:
-                out_dir = self._out_dir if self._out_dir else src.parent
-                convert_file(src, out_dir, outlook, word, visio, excel, powerpoint, mode_key)
-                success += 1
-            except Exception as exc:
-                failed.append((src.name, str(exc)))
-            self.root.after(0, lambda: self.progress.step(1))
+                app, pids = _launch_office_isolated(family)
+            except Exception:
+                app, pids = None, set()
+            self._pdf_app_pids.extend(pids)
+            return app
 
-        for app in (word, visio, excel, powerpoint):
-            if app is not None:
-                try:
-                    app.Quit()
-                except Exception:
-                    pass
+        def _abort(title, msg):
+            self.root.after(0, lambda: (
+                self.convert_btn.config(state="normal"),
+                self._set_cancel_state(self.cancel_btn, False),
+                self._pdf_timer.reset(),
+                messagebox.showerror(title, msg),
+            ))
 
         try:
-            pythoncom.CoUninitialize()
-        except Exception:
-            pass
+            # Outlook — email only. This is the user's email client, so it is
+            # launched shared and NEVER force-killed (email cancel is graceful).
+            if email_mode:
+                try:
+                    outlook = _ensure_outlook()
+                except Exception as exc:
+                    _abort("Outlook Error", str(exc))
+                    return
+
+            # Word — email, HTML, Word doc, and image modes
+            if email_mode or html_mode or word_mode or image_mode:
+                word = _launch("word")
+                if word is None and (html_mode or word_mode or image_mode):
+                    if html_mode:    label = "HTML / MHT"
+                    elif image_mode: label = "Image"
+                    else:            label = "Word document"
+                    _abort("Word Not Found",
+                           f"Microsoft Word is required for {label} conversion.\n"
+                           "Please ensure Word is installed.")
+                    return
+
+            if visio_mode:
+                visio = _launch("visio")
+                if visio is None:
+                    _abort("Visio Not Found",
+                           "Microsoft Visio is required for Visio conversion.\n"
+                           "Please ensure Visio is installed.")
+                    return
+
+            if excel_mode:
+                excel = _launch("excel")
+                if excel is None:
+                    _abort("Excel Not Found",
+                           "Microsoft Excel is required for Excel conversion.\n"
+                           "Please ensure Excel is installed.")
+                    return
+
+            if ppt_mode:
+                powerpoint = _launch("powerpoint")
+                if powerpoint is None:
+                    _abort("PowerPoint Not Found",
+                           "Microsoft PowerPoint is required for PowerPoint conversion.\n"
+                           "Please ensure PowerPoint is installed.")
+                    return
+
+            total = len(self.files)
+            if visio_mode:      mode_key = "visio"
+            elif html_mode:     mode_key = "html"
+            elif excel_mode:    mode_key = "excel"
+            elif word_mode:     mode_key = "word_doc"
+            elif ppt_mode:      mode_key = "powerpoint"
+            elif image_mode:    mode_key = "image"
+            else:               mode_key = "email"
+
+            for i, src in enumerate(self.files):
+                if self._cancel_convert.is_set():
+                    break
+                self._set_status(f"Converting: {src.name}  ({i + 1}/{total})")
+                self._pdf_timer.set_file(src.name)
+                out_dir = self._out_dir if self._out_dir else src.parent
+                out_path = _unique_pdf_path(out_dir, src.stem)
+                try:
+                    convert_file(src, out_dir, outlook, word, visio, excel, powerpoint, mode_key)
+                    success += 1
+                except Exception as exc:
+                    # Drop any partial PDF a force-kill may have left behind.
+                    try:
+                        if out_path.exists():
+                            out_path.unlink()
+                    except Exception:
+                        pass
+                    if not self._cancel_convert.is_set():
+                        failed.append((src.name, str(exc)))
+                self.root.after(0, lambda: self.progress.step(1))
+        finally:
+            # Quit our dedicated Office instances, then make sure none linger
+            # (e.g. after a kill). Outlook is intentionally left alone.
+            for app in (word, visio, excel, powerpoint):
+                if app is not None:
+                    try:
+                        app.Quit()
+                    except Exception:
+                        pass
+            for pid in list(self._pdf_app_pids):
+                _terminate_pid(pid)
+            self._pdf_app_pids = []
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
         self.root.after(0, lambda: self._finish(success, failed))
 
@@ -2781,26 +3458,32 @@ class ConverterApp:
         self.root.after(0, lambda: self.status_var.set(msg))
 
     def _finish(self, success, failed):
+        self._pdf_timer.stop()
+        elapsed = self._pdf_timer.elapsed_str()
+        self._pdf_timer.reset()
         self.convert_btn.config(state="normal")
         self._set_cancel_state(self.cancel_btn, False)
         if self._cancel_convert.is_set():
             self.status_var.set(f"⏹  Cancelled. {success} file(s) converted before stopping.")
             messagebox.showinfo(
                 "Conversion Cancelled",
-                f"Conversion was cancelled.\n{success} file(s) converted before stopping.",
+                f"Conversion was cancelled.\n{success} file(s) converted before stopping."
+                f"\n\nTotal time elapsed: {elapsed}",
             )
         elif not failed:
             self.status_var.set(f"✅  Done! {success} file(s) converted successfully.")
             messagebox.showinfo(
                 "Conversion Complete",
-                f"{success} file(s) converted to PDF successfully.",
+                f"{success} file(s) converted to PDF successfully."
+                f"\n\nTotal time elapsed: {elapsed}",
             )
         else:
             err_lines = "\n".join(f"• {n}: {e}" for n, e in failed)
             self.status_var.set(f"⚠️  {success} converted, {len(failed)} failed.")
             messagebox.showerror(
                 "Conversion Errors",
-                f"{success} succeeded, {len(failed)} failed:\n\n{err_lines}",
+                f"{success} succeeded, {len(failed)} failed:\n\n{err_lines}"
+                f"\n\nTotal time elapsed: {elapsed}",
             )
 
     # ── window ───────────────────────────────
