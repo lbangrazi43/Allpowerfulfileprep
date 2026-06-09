@@ -1934,12 +1934,15 @@ class ConverterApp:
             splash = None
 
         # Close PyInstaller's built-in bootloader splash (shown during the
-        # one-file unpack) now that our own splash is on screen. The pyi_splash
-        # module only exists inside the frozen build, so it's imported
-        # dynamically (and any failure ignored) — it's absent in dev/editor.
+        # one-file unpack) now that our own splash is on screen. This MUST be a
+        # static `import pyi_splash` — PyInstaller only bundles the pyi_splash
+        # runtime module when it sees a static import, so a dynamic import would
+        # leave it out of the build and the bootloader splash would never close
+        # (it then resurfaces on top of the app). The module is absent in
+        # dev/editor, hence the guard; the type-ignore silences that editor hint.
         try:
-            import importlib
-            importlib.import_module("pyi_splash").close()
+            import pyi_splash  # type: ignore
+            pyi_splash.close()
         except Exception:
             pass
 
