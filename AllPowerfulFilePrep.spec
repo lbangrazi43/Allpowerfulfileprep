@@ -14,7 +14,8 @@ hiddenimports = ['win32timezone']
 # pdfminer data). markitdown is imported lazily, so these must be collected
 # explicitly or "Convert to Markdown" would fail only at runtime.
 for _pkg in ('win32com', 'win32api', 'pywintypes', 'PIL',
-             'markitdown', 'magika', 'onnxruntime', 'extract_msg', 'pdfminer'):
+             'markitdown', 'magika', 'onnxruntime', 'extract_msg', 'pdfminer',
+             'msoffcrypto', 'olefile'):   # Password Removal (open-password decryption)
     tmp_ret = collect_all(_pkg)
     datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

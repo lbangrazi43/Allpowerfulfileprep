@@ -1116,6 +1116,93 @@ def _modernize_office_file(src_path: Path, out_path: Path, family: str, fmt: int
 
 
 # ─────────────────────────────────────────────
+# Password Removal — strip the open-password (encryption) from Office files.
+#
+# Office's "Encrypt with Password" wraps the document in a standard encrypted
+# container (ECMA-376 for .docx/.xlsx/.pptx; the OLE crypto streams for legacy
+# .doc/.xls/.ppt). We decrypt that container with msoffcrypto-tool — pure Python,
+# so NO Office process is launched, nothing can pop a hidden modal prompt, and a
+# wrong password fails instantly and cleanly (instead of Excel's COM Open, which
+# blocks on an interactive password dialog). The decrypted bytes ARE the original
+# document, so the unlocked copy keeps the exact same format/extension.
+
+# Office file types we accept for password removal. (msoffcrypto auto-detects the
+# real format from the file contents; this set just filters what can be added.)
+PWD_EXTS = {
+    ".doc", ".docx", ".docm", ".dot", ".dotx", ".dotm", ".rtf",
+    ".xls", ".xlsx", ".xlsm", ".xlsb", ".xlt", ".xltx", ".xltm",
+    ".ppt", ".pptx", ".pptm", ".pps", ".ppsx", ".pot", ".potx",
+}
+
+
+class _BadPassword(Exception):
+    """Raised when the supplied password is wrong for an encrypted file. Kept
+    distinct so the UI can show a specific 'incorrect password' message and
+    re-prompt for the same file."""
+
+
+class _NotEncrypted(Exception):
+    """Raised when a file has no open-password encryption to remove (e.g. it
+    isn't protected, or only carries a write-reservation/edit password, which is
+    not encryption and can't be stripped this way)."""
+
+
+def _office_is_encrypted(src_path: Path) -> bool:
+    """True if `src_path` is a password-encrypted Office file. Never raises —
+    anything unreadable/unrecognized is reported as not-encrypted."""
+    try:
+        import msoffcrypto
+        with open(src_path, "rb") as f:
+            return bool(msoffcrypto.OfficeFile(f).is_encrypted())
+    except Exception:
+        return False
+
+
+def _strip_office_password(src_path: Path, out_path: Path, password: str) -> None:
+    """Decrypt the password-protected Office file at `src_path` to `out_path`
+    using `password`. Pure Python (msoffcrypto) — no Office process, no prompts.
+    The original file is never modified. Raises _BadPassword on a wrong password
+    and _NotEncrypted if there's no encryption to remove."""
+    try:
+        import msoffcrypto
+        from msoffcrypto.exceptions import InvalidKeyError
+    except ImportError as e:
+        raise RuntimeError(
+            "The 'msoffcrypto-tool' package is required for Password Removal.\n"
+            "Install it with:  pip install msoffcrypto-tool"
+        ) from e
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(src_path, "rb") as f:
+        of = msoffcrypto.OfficeFile(f)
+        try:
+            encrypted = of.is_encrypted()
+        except Exception:
+            encrypted = True   # let the decrypt attempt surface the real error
+        if not encrypted:
+            raise _NotEncrypted()
+        try:
+            of.load_key(password=password)
+            with open(out_path, "wb") as g:
+                of.decrypt(g)
+        except InvalidKeyError as e:
+            # Remove any partial output left by a failed decrypt.
+            try:
+                if out_path.exists():
+                    out_path.unlink()
+            except Exception:
+                pass
+            raise _BadPassword(str(e))
+        except Exception:
+            try:
+                if out_path.exists():
+                    out_path.unlink()
+            except Exception:
+                pass
+            raise
+
+
+# ─────────────────────────────────────────────
 # AI Preparation — convert any file type to LLM-friendly Markdown
 # via Microsoft's markitdown.
 # ─────────────────────────────────────────────
@@ -1969,6 +2056,12 @@ class ConverterApp:
         self._cancel_office   = threading.Event()
         self._office_app_pids = {}   # family -> set of PIDs of our dedicated instances
 
+        # Password Removal page state
+        self._pwd_files   = []
+        self._pwd_out_dir = None
+        self._cancel_pwd  = threading.Event()
+        self._pwd_dialog  = None     # the open password prompt, if any
+
         # Navigation state
         self._active_page = None
         self._page_frames = {}
@@ -2076,7 +2169,8 @@ class ConverterApp:
         for page_key, label in [("pdf", "  PDF Conversion"),
                                 ("unzip", "  Folder Unzipping"),
                                 ("aiprep", "  Markdown Conversion"),
-                                ("office", "  Office Modernizer")]:
+                                ("office", "  Office Modernizer"),
+                                ("pwd", "  Password Removal")]:
             btn = tk.Button(
                 self._sidebar,
                 text=label,
@@ -2114,6 +2208,8 @@ class ConverterApp:
                 self._build_aiprep_page(frame)
             elif key == "office":
                 self._build_office_page(frame)
+            elif key == "pwd":
+                self._build_pwd_page(frame)
 
         self._page_frames[key].pack(fill="both", expand=True)
 
@@ -2142,6 +2238,14 @@ class ConverterApp:
             font=("Segoe UI", 14, "bold"),
             anchor="w", padx=18,
         ).pack(fill="x", pady=(14, 4))
+
+        tk.Label(
+            parent,
+            text=("Convert files to PDF. Pick a conversion mode, add the matching files, "
+                  "and each one is saved as a PDF in your chosen folder."),
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+            anchor="w", padx=18, justify="left", wraplength=620,
+        ).pack(fill="x", pady=(0, 4))
 
         # Mode selector row
         mode_frame = tk.Frame(parent, bg=APP_BG)
@@ -2287,6 +2391,14 @@ class ConverterApp:
             font=("Segoe UI", 14, "bold"),
             anchor="w", padx=18,
         ).pack(fill="x", pady=(14, 4))
+
+        tk.Label(
+            parent,
+            text=("Extract .zip files to your chosen folder. Nested zips (zips inside "
+                  "zips) are unpacked automatically, all the way down."),
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+            anchor="w", padx=18, justify="left", wraplength=620,
+        ).pack(fill="x", pady=(0, 4))
 
         # Drop zone
         uz_drop_frame = tk.Frame(
@@ -3188,6 +3300,400 @@ class ConverterApp:
             messagebox.showerror(
                 "Office Modernizer — Some Files Failed",
                 f"{converted} modernized, {len(failed)} failed:\n\n{err_lines}"
+                f"\n\nTotal time elapsed: {elapsed}",
+            )
+
+    # ── Password Removal page ────────────────
+    def _build_pwd_page(self, parent):
+        tk.Label(
+            parent, text="Password Removal",
+            bg=APP_BG, fg="#1a1a1a", font=("Segoe UI", 14, "bold"),
+            anchor="w", padx=18,
+        ).pack(fill="x", pady=(14, 4))
+
+        tk.Label(
+            parent,
+            text=("Remove the password from protected Office files. You'll be asked for "
+                  "each file's password in turn; an unlocked copy is saved with a "
+                  "'_nopass' suffix.\n"
+                  "Works with Word, Excel and PowerPoint (.docx, .xlsx, .pptx and older/"
+                  "template variants)."),
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+            anchor="w", padx=18, justify="left", wraplength=620,
+        ).pack(fill="x", pady=(0, 6))
+
+        # Drop zone
+        self._pwd_drop_frame = tk.Frame(
+            parent, bg=DROP_BG, highlightbackground=DROP_BD,
+            highlightthickness=2, relief="flat",
+        )
+        self._pwd_drop_frame.pack(fill="both", expand=True, padx=18, pady=(10, 6))
+        self._pwd_drop_label = tk.Label(
+            self._pwd_drop_frame,
+            text="Drop password-protected Office files here\nor click 'Add Files'",
+            bg=DROP_BG, fg="#4a6fa5", font=("Segoe UI", 11), justify="center",
+        )
+        self._pwd_drop_label.pack(expand=True, pady=20)
+        list_frame = tk.Frame(self._pwd_drop_frame, bg=DROP_BG)
+        list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical")
+        self._pwd_file_list = tk.Listbox(
+            list_frame, yscrollcommand=scrollbar.set, selectmode="extended",
+            bg="#ffffff", fg="#1a1a1a", font=("Segoe UI", 9),
+            relief="flat", bd=1, activestyle="none", highlightthickness=0,
+        )
+        scrollbar.config(command=self._pwd_file_list.yview)
+        scrollbar.pack(side="right", fill="y")
+        self._pwd_file_list.pack(fill="both", expand=True)
+        if HAS_DND:
+            for widget in (self._pwd_drop_frame, self._pwd_drop_label, list_frame, self._pwd_file_list):
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._pwd_on_drop)
+
+        # Add / Remove / Clear
+        btn_frame = tk.Frame(parent, bg=APP_BG)
+        btn_frame.pack(fill="x", padx=18, pady=(4, 4))
+        for label, cmd in [
+            ("Add Files",       self._pwd_add_files),
+            ("Remove Selected", self._pwd_remove_selected),
+            ("Clear All",       self._pwd_clear_files),
+        ]:
+            tk.Button(
+                btn_frame, text=label, command=cmd,
+                bg="#e0e8f0", fg="#333", font=("Segoe UI", 9),
+                relief="flat", padx=12, pady=4, cursor="hand2",
+            ).pack(side="left", padx=(0, 6))
+
+        # Output folder row
+        out_frame = tk.Frame(parent, bg=APP_BG)
+        out_frame.pack(fill="x", padx=18, pady=(2, 2))
+        tk.Label(
+            out_frame, text="Output folder:",
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+        ).pack(side="left")
+        self._pwd_out_var = tk.StringVar(value="Same as source file")
+        tk.Label(
+            out_frame, textvariable=self._pwd_out_var,
+            bg=APP_BG, fg=ACCENT, font=("Segoe UI", 9, "italic"),
+        ).pack(side="left", padx=4)
+        tk.Button(
+            out_frame, text="Choose…", command=self._pwd_choose_output,
+            bg="#e0e8f0", fg="#333", font=("Segoe UI", 9), relief="flat",
+            padx=8, pady=2, cursor="hand2",
+        ).pack(side="left", padx=4)
+
+        # Progress + status
+        self._pwd_progress = ttk.Progressbar(parent, mode="determinate")
+        self._pwd_progress.pack(fill="x", padx=18, pady=(6, 2))
+        self._pwd_status_var = tk.StringVar(
+            value="Ready — add password-protected Office files to unlock.")
+        tk.Label(parent, textvariable=self._pwd_status_var, bg=APP_BG, fg="#555",
+                 font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=20, pady=(0, 4))
+        self._pwd_timer = self._build_timer(parent)
+
+        # Remove + Cancel
+        pwd_btn_row = tk.Frame(parent, bg=APP_BG)
+        pwd_btn_row.pack(pady=(4, 14))
+        self._pwd_btn = tk.Button(
+            pwd_btn_row, text="Remove Passwords", command=self._start_pwd,
+            bg=ACCENT, fg=BTN_FG, font=("Segoe UI", 12, "bold"),
+            relief="flat", padx=30, pady=8, cursor="hand2",
+            activebackground="#005a9e", activeforeground=BTN_FG,
+        )
+        self._pwd_btn.pack(side="left")
+        self._pwd_cancel_btn = tk.Button(
+            pwd_btn_row, text="Cancel", command=self._cancel_pwd_op,
+            font=("Segoe UI", 10, "bold"), relief="flat", padx=16, pady=6,
+            activebackground=CANCEL_BG_ACTIVE, activeforeground=BTN_FG,
+        )
+        self._pwd_cancel_btn.pack(side="left", padx=(10, 0))
+        self._set_cancel_state(self._pwd_cancel_btn, False)
+
+    def _pwd_add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Select password-protected Office files",
+            filetypes=[("Office files",
+                        "*.doc *.docx *.docm *.dot *.dotx *.dotm *.rtf "
+                        "*.xls *.xlsx *.xlsm *.xlsb *.xlt *.xltx *.xltm "
+                        "*.ppt *.pptx *.pptm *.pps *.ppsx *.pot *.potx"),
+                       ("All files", "*.*")],
+        )
+        for p in paths:
+            self._pwd_add_path(p)
+
+    def _pwd_on_drop(self, event):
+        for p in self.root.tk.splitlist(event.data):
+            self._pwd_add_path(p)
+
+    def _pwd_add_path(self, p):
+        path = Path(p)
+        if not path.is_file():
+            return
+        if path.suffix.lower() not in PWD_EXTS:
+            return   # only accept supported Office files; ignore anything else
+        if path not in self._pwd_files:
+            self._pwd_files.append(path)
+            self._pwd_file_list.insert("end", path.name)
+        self._pwd_update_drop_label()
+
+    def _pwd_remove_selected(self):
+        for i in sorted(self._pwd_file_list.curselection(), reverse=True):
+            self._pwd_file_list.delete(i)
+            del self._pwd_files[i]
+        self._pwd_update_drop_label()
+
+    def _pwd_clear_files(self):
+        self._pwd_files.clear()
+        self._pwd_file_list.delete(0, "end")
+        self._pwd_update_drop_label()
+
+    def _pwd_update_drop_label(self):
+        if self._pwd_files:
+            self._pwd_drop_label.config(text=f"{len(self._pwd_files)} file(s) queued")
+        else:
+            self._pwd_drop_label.config(
+                text="Drop password-protected Office files here\nor click 'Add Files'")
+
+    def _pwd_choose_output(self):
+        d = filedialog.askdirectory(title="Select output folder")
+        if d:
+            self._pwd_out_dir = Path(d)
+            self._pwd_out_var.set(str(self._pwd_out_dir))
+        else:
+            self._pwd_out_dir = None
+            self._pwd_out_var.set("Same as source file")
+
+    def _cancel_pwd_op(self):
+        # Stop the batch. Decryption is fast pure-Python work, so the loop simply
+        # exits between files; there are no Office processes to kill.
+        self._cancel_pwd.set()
+        self._set_cancel_state(self._pwd_cancel_btn, False)
+        self._pwd_status_var.set("Stopping…")
+        # If a password prompt is open, close it so the worker unblocks and the
+        # batch can stop (an un-answered prompt would otherwise hold it).
+        dlg = getattr(self, "_pwd_dialog", None)
+        if dlg is not None:
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+    def _start_pwd(self):
+        if not self._pwd_files:
+            messagebox.showwarning("No Files", "Please add protected Office files first.")
+            return
+        self._cancel_pwd.clear()
+        self._pwd_btn.config(state="disabled")
+        self._set_cancel_state(self._pwd_cancel_btn, True)
+        self._pwd_progress["value"] = 0
+        self._pwd_progress["maximum"] = len(self._pwd_files)
+        self._pwd_timer.start()
+        threading.Thread(target=self._pwd_worker, daemon=True).start()
+
+    def _run_on_main(self, fn):
+        """Run `fn` on the Tk main thread and block the calling (worker) thread
+        until it has finished, returning whatever `fn` returned. Used so the
+        worker can put up modal dialogs (which must live on the main thread)."""
+        box = {"val": None}
+        done = threading.Event()
+
+        def _runner():
+            try:
+                box["val"] = fn()
+            finally:
+                done.set()
+
+        self.root.after(0, _runner)
+        done.wait()
+        return box["val"]
+
+    def _prompt_password(self, filename, note=""):
+        """MAIN-THREAD ONLY. Modal dialog asking for `filename`'s password.
+        Returns the entered password, or None if the user chose to skip the file.
+        `note` shows an optional message (e.g. an 'incorrect password' reminder)."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Password Required")
+        dlg.configure(bg=APP_BG)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        # Build the window hidden so we can place it BEFORE it's first mapped —
+        # otherwise the window manager drops it at the primary-screen corner
+        # (very noticeable on a multi-monitor setup) and ignores a late move.
+        dlg.withdraw()
+        result = {"pwd": None}     # None == skip
+
+        tk.Label(dlg, text="Enter the password for this document:",
+                 bg=APP_BG, fg="#333", font=("Segoe UI", 9)).pack(
+            anchor="w", padx=16, pady=(14, 0))
+        tk.Label(dlg, text=filename, bg=APP_BG, fg=ACCENT,
+                 font=("Segoe UI", 10, "bold"), wraplength=380, justify="left").pack(
+            anchor="w", padx=16, pady=(2, 6))
+        if note:
+            tk.Label(dlg, text=note, bg=APP_BG, fg=CANCEL_BG_ACTIVE,
+                     font=("Segoe UI", 8)).pack(anchor="w", padx=16)
+
+        var = tk.StringVar()
+        show_var = tk.BooleanVar(value=False)
+        entry = tk.Entry(dlg, textvariable=var, show="•",
+                         font=("Segoe UI", 10), width=38)
+        entry.pack(padx=16, pady=(6, 2))
+
+        def _toggle():
+            entry.config(show="" if show_var.get() else "•")
+        tk.Checkbutton(dlg, text="Show password", variable=show_var,
+                       command=_toggle, bg=APP_BG, fg="#555",
+                       activebackground=APP_BG, font=("Segoe UI", 8)).pack(
+            anchor="w", padx=14)
+
+        def _submit():
+            result["pwd"] = var.get()
+            dlg.destroy()
+
+        def _skip():
+            result["pwd"] = None
+            dlg.destroy()
+
+        row = tk.Frame(dlg, bg=APP_BG)
+        row.pack(pady=(8, 14))
+        tk.Button(row, text="Unlock", command=_submit, bg=ACCENT, fg=BTN_FG,
+                  font=("Segoe UI", 10, "bold"), relief="flat", padx=18, pady=5,
+                  cursor="hand2", activebackground="#005a9e",
+                  activeforeground=BTN_FG).pack(side="left", padx=(0, 8))
+        tk.Button(row, text="Skip File", command=_skip, bg="#e0e8f0", fg="#333",
+                  font=("Segoe UI", 10), relief="flat", padx=14, pady=5,
+                  cursor="hand2").pack(side="left")
+
+        entry.bind("<Return>", lambda e: _submit())
+        entry.bind("<Escape>", lambda e: _skip())
+        dlg.protocol("WM_DELETE_WINDOW", _skip)
+
+        # Center over the main window. Use the *requested* size (reliable while
+        # the window is still hidden) and set a full WxH+X+Y geometry, then show
+        # it — so it maps directly at the centered position.
+        dlg.update_idletasks()
+        w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+        rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+        rw, rh = self.root.winfo_width(), self.root.winfo_height()
+        x = rx + (rw - w) // 2
+        y = ry + (rh - h) // 2
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+        dlg.deiconify()
+
+        # Keep the prompt in front and focused, but DON'T grab_set — a hard modal
+        # grab would block the main-window Cancel button. Instead we expose the
+        # dialog so Cancel can dismiss it (treated as a skip) to stop the batch.
+        try:
+            dlg.attributes("-topmost", True)
+        except Exception:
+            pass
+        self._pwd_dialog = dlg
+        entry.focus_force()
+        self.root.wait_window(dlg)
+        self._pwd_dialog = None
+        return result["pwd"]
+
+    def _pwd_worker(self):
+        files = list(self._pwd_files)
+        total = len(files)
+        unlocked = 0
+        failed = []     # (name, reason)
+        skipped = []    # names
+
+        # Decryption is pure Python (msoffcrypto) — no Office, no COM, no hidden
+        # prompts — so each file is handled in a simple, interruptible loop.
+        for i, src in enumerate(files):
+            if self._cancel_pwd.is_set():
+                break
+            if src.suffix.lower() not in PWD_EXTS:
+                failed.append((src.name, "unsupported file type"))
+                self.root.after(0, lambda: self._pwd_progress.step(1))
+                continue
+
+            # Skip files that aren't actually encrypted — no point prompting.
+            if not _office_is_encrypted(src):
+                failed.append((src.name, "not password-protected (no open-password encryption)"))
+                self.root.after(0, lambda: self._pwd_progress.step(1))
+                continue
+
+            # Ask for this file's password, re-prompting on a wrong one until it
+            # succeeds or the user skips it.
+            note = ""
+            done_with_file = False
+            while not self._cancel_pwd.is_set():
+                self._set_pwd_status(
+                    f"Waiting for password: {src.name}  ({i + 1}/{total})")
+                pwd = self._run_on_main(
+                    lambda n=note: self._prompt_password(src.name, n))
+                if pwd is None:
+                    skipped.append(src.name)
+                    break   # user skipped this file
+
+                self._set_pwd_status(f"Unlocking: {src.name}  ({i + 1}/{total})")
+                self._pwd_timer.set_file(src.name)
+                out_dir = self._pwd_out_dir if self._pwd_out_dir else src.parent
+                out_path = _unique_output_path(out_dir, src.stem + "_nopass", src.suffix)
+                try:
+                    _strip_office_password(src, out_path, pwd)
+                    unlocked += 1
+                    done_with_file = True
+                except _BadPassword:
+                    # Explicit "incorrect password" dialog, then loop to re-prompt.
+                    self._run_on_main(lambda n=src.name: messagebox.showerror(
+                        "Incorrect Password",
+                        f"The password entered for \"{n}\" was incorrect.\n\n"
+                        "Please try again, or choose Skip File to move on."))
+                    note = "Incorrect password — please try again."
+                    continue
+                except _NotEncrypted:
+                    failed.append((src.name, "not password-protected"))
+                    done_with_file = True
+                except Exception as exc:
+                    failed.append((src.name, str(exc)))
+                    done_with_file = True
+
+                if done_with_file:
+                    break
+
+            self.root.after(0, lambda: self._pwd_progress.step(1))
+
+        self.root.after(0, lambda: self._pwd_finish(unlocked, failed, skipped))
+
+    def _set_pwd_status(self, msg):
+        self.root.after(0, lambda: self._pwd_status_var.set(msg))
+
+    def _pwd_finish(self, unlocked, failed, skipped):
+        self._pwd_timer.stop()
+        elapsed = self._pwd_timer.elapsed_str()
+        self._pwd_timer.reset()
+        self._pwd_btn.config(state="normal")
+        self._set_cancel_state(self._pwd_cancel_btn, False)
+
+        extra = ""
+        if skipped:
+            extra += f"\nSkipped: {len(skipped)} file(s)."
+
+        if self._cancel_pwd.is_set():
+            self._pwd_status_var.set(
+                f"⏹  Cancelled. {unlocked} file(s) unlocked before stopping.")
+            messagebox.showinfo(
+                "Password Removal Cancelled",
+                f"Operation cancelled.\n{unlocked} file(s) unlocked before stopping."
+                f"{extra}\n\nTotal time elapsed: {elapsed}",
+            )
+            return
+        if not failed:
+            self._pwd_status_var.set(f"✅  Done! {unlocked} file(s) unlocked.")
+            messagebox.showinfo(
+                "Password Removal Complete",
+                f"{unlocked} file(s) saved without password protection (\"_nopass\")."
+                f"{extra}\n\nTotal time elapsed: {elapsed}",
+            )
+        else:
+            err_lines = "\n".join(f"• {n}: {e}" for n, e in failed)
+            self._pwd_status_var.set(f"⚠️  {unlocked} unlocked, {len(failed)} failed.")
+            messagebox.showerror(
+                "Password Removal — Some Files Failed",
+                f"{unlocked} unlocked, {len(failed)} failed:{extra}\n\n{err_lines}"
                 f"\n\nTotal time elapsed: {elapsed}",
             )
 
