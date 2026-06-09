@@ -1209,6 +1209,44 @@ def _office_is_encrypted(src_path: Path) -> bool:
         return False
 
 
+def _is_password_protected(src_path: Path) -> bool:
+    """True if `src_path` is locked with a password and therefore can't be
+    processed by the other tools. Covers password-encrypted Office files
+    (.docx/.xlsx/.pptx and legacy .doc/.xls/.ppt) and password-encrypted ZIPs.
+    Best-effort and never raises — anything unrecognized is treated as not
+    protected. Used by every tool EXCEPT Password Removal to skip such files and
+    point the user at the Password Removal tool."""
+    try:
+        if _office_is_encrypted(src_path):
+            return True
+        # An Office-encrypted file is an OLE container, not a ZIP, so this only
+        # ever flags genuinely password-protected archives (a normal .docx/.zip
+        # has its entry encryption bit clear).
+        if zipfile.is_zipfile(src_path):
+            with zipfile.ZipFile(src_path) as z:
+                if any(zi.flag_bits & 0x1 for zi in z.infolist()):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _password_skip_note(protected, advice=None) -> str:
+    """Trailing advisory block for a completion dialog listing files skipped
+    because they're password-protected, or '' if there were none. Shown below
+    the normal results so the user knows what to do next. `advice` overrides the
+    default guidance (the default points at the Password Removal tool, which only
+    applies to Office documents)."""
+    if not protected:
+        return ""
+    names = "\n".join(f"   • {n}" for n in protected)
+    if advice is None:
+        advice = ("These files are locked with a password. Remove it first using the "
+                  "\"Password Removal\" tool, then run them through this tool again.")
+    return ("\n\n⚠️  Skipped — password-protected (could not be opened):\n"
+            f"{names}\n\n{advice}")
+
+
 def _strip_office_password(src_path: Path, out_path: Path, password: str) -> None:
     """Decrypt the password-protected Office file at `src_path` to `out_path`
     using `password`. Pure Python (msoffcrypto) — no Office process, no prompts.
@@ -1756,12 +1794,18 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
         return cancel_event is not None and cancel_event.is_set()
 
     success, failed = 0, []
+    protected = []         # password-protected archives we skipped
     extracted_files = []   # explicit list of files extracted from the zip(s)
     total = len(zip_paths)
 
     for i, zip_path in enumerate(zip_paths):
         if cancelled():
             break
+        # Skip password-protected archives — they can't be extracted here.
+        if _is_password_protected(zip_path):
+            protected.append(zip_path.name)
+            progress_cb()
+            continue
         status_cb(f"Extracting: {zip_path.name}  ({i + 1}/{total})")
         if item_cb is not None:
             item_cb(zip_path.name)
@@ -1817,7 +1861,7 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
         status_cb("Auto-PDF: converting extracted files…")
         pdf_failed = _auto_pdf_scan_and_convert(extracted_files, status_cb, cancel_event)
 
-    finish_cb(success, failed, pdf_failed)
+    finish_cb(success, failed, pdf_failed, protected)
 
 
 # ─────────────────────────────────────────────
@@ -2707,7 +2751,7 @@ class ConverterApp:
                 auto_pdf,
                 lambda msg: self.root.after(0, lambda m=msg: self._uz_status_var.set(m)),
                 lambda: self.root.after(0, lambda: self._uz_progress.step(1)),
-                lambda s, f, pf: self.root.after(0, lambda: self._uz_finish(s, f, pf)),
+                lambda s, f, pf, pr: self.root.after(0, lambda: self._uz_finish(s, f, pf, pr)),
                 self._cancel_unzip,
                 self._uz_timer.set_file,
             ),
@@ -2720,34 +2764,43 @@ class ConverterApp:
         self._set_cancel_state(self._uz_cancel_btn, False)
         self._uz_status_var.set("Cancelling… finishing the current item, then stopping.")
 
-    def _uz_finish(self, success, failed, pdf_failed=None):
+    def _uz_finish(self, success, failed, pdf_failed=None, protected=None):
         self._uz_timer.stop()
         elapsed = self._uz_timer.elapsed_str()
         self._uz_timer.reset()
         self._uz_btn.config(state="normal")
         self._set_cancel_state(self._uz_cancel_btn, False)
+        protected = protected or []
+        # ZIP passwords aren't Office encryption, so the Password Removal tool
+        # can't help here — give archive-appropriate guidance instead.
+        pw_note = _password_skip_note(
+            protected,
+            advice=("These archives are password-protected and can't be extracted here. "
+                    "Open them with your unzip program using the password. (The Password "
+                    "Removal tool only unlocks Office documents, not ZIP files.)"))
+        skip_status = f"  {len(protected)} skipped (password-protected)." if protected else ""
         if self._cancel_unzip.is_set():
             self._uz_status_var.set(f"⏹  Cancelled. {success} archive(s) extracted before stopping.")
             messagebox.showinfo(
                 "Unzip Cancelled",
                 f"Operation was cancelled.\n{success} archive(s) extracted before stopping."
-                f"\n\nTotal time elapsed: {elapsed}",
+                f"\n\nTotal time elapsed: {elapsed}{pw_note}",
             )
             return
         if not failed:
-            self._uz_status_var.set(f"Done! {success} archive(s) extracted successfully.")
+            self._uz_status_var.set(f"Done! {success} archive(s) extracted successfully.{skip_status}")
             messagebox.showinfo(
                 "Unzip Complete",
                 f"{success} archive(s) extracted successfully."
-                f"\n\nTotal time elapsed: {elapsed}",
+                f"\n\nTotal time elapsed: {elapsed}{pw_note}",
             )
         else:
             err_lines = "\n".join(f"• {n}: {e}" for n, e in failed)
-            self._uz_status_var.set(f"{success} extracted, {len(failed)} failed.")
+            self._uz_status_var.set(f"{success} extracted, {len(failed)} failed.{skip_status}")
             messagebox.showerror(
                 "Unzip Errors",
                 f"{success} succeeded, {len(failed)} failed:\n\n{err_lines}"
-                f"\n\nTotal time elapsed: {elapsed}",
+                f"\n\nTotal time elapsed: {elapsed}{pw_note}",
             )
 
         if pdf_failed:
@@ -2942,6 +2995,7 @@ class ConverterApp:
         total = len(files)
         converted = 0
         failed = []
+        protected = []
 
         # Ensure markitdown is available before looping; surface a clear error if not.
         try:
@@ -2960,6 +3014,11 @@ class ConverterApp:
         for i, src in enumerate(files):
             if self._cancel_ai.is_set():
                 break
+            # Skip password-protected files — point the user at Password Removal.
+            if _is_password_protected(src):
+                protected.append(src.name)
+                self.root.after(0, lambda: self._ai_progress.step(1))
+                continue
             self.root.after(0, lambda s=src, n=i: self._ai_status_var.set(
                 f"Converting: {s.name}  ({n + 1}/{total})"))
             self._ai_timer.set_file(src.name)
@@ -2989,36 +3048,39 @@ class ConverterApp:
                 failed.append(f"{src.name}: {exc}")
             self.root.after(0, lambda: self._ai_progress.step(1))
 
-        self.root.after(0, lambda: self._ai_finish(converted, failed))
+        self.root.after(0, lambda: self._ai_finish(converted, failed, protected))
 
-    def _ai_finish(self, converted, failed):
+    def _ai_finish(self, converted, failed, protected=None):
         self._ai_timer.stop()
         elapsed = self._ai_timer.elapsed_str()
         self._ai_timer.reset()
         self._ai_btn.config(state="normal")
         self._set_cancel_state(self._ai_cancel_btn, False)
+        protected = protected or []
+        pw_note = _password_skip_note(protected)
+        skip_status = f"  {len(protected)} skipped (password-protected)." if protected else ""
         if self._cancel_ai.is_set():
             self._ai_status_var.set(f"⏹  Cancelled. {converted} file(s) converted before stopping.")
             messagebox.showinfo(
                 "AI Preparation Cancelled",
                 f"Conversion cancelled.\n{converted} file(s) converted before stopping."
-                f"\n\nTotal time elapsed: {elapsed}",
+                f"\n\nTotal time elapsed: {elapsed}{pw_note}",
             )
             return
         if not failed:
-            self._ai_status_var.set(f"✅  Done! {converted} file(s) converted to Markdown.")
+            self._ai_status_var.set(f"✅  Done! {converted} file(s) converted to Markdown.{skip_status}")
             messagebox.showinfo(
                 "AI Preparation Complete",
                 f"{converted} file(s) converted to Markdown (.md)."
-                f"\n\nTotal time elapsed: {elapsed}",
+                f"\n\nTotal time elapsed: {elapsed}{pw_note}",
             )
         else:
             err_lines = "\n".join(f"• {n}" for n in failed)
-            self._ai_status_var.set(f"⚠️  {converted} converted, {len(failed)} failed.")
+            self._ai_status_var.set(f"⚠️  {converted} converted, {len(failed)} failed.{skip_status}")
             messagebox.showerror(
                 "AI Preparation — Some Files Failed",
                 f"{converted} converted, {len(failed)} failed:\n\n{err_lines}"
-                f"\n\nTotal time elapsed: {elapsed}",
+                f"\n\nTotal time elapsed: {elapsed}{pw_note}",
             )
 
     # ── Office Modernizer ────────────────────
@@ -3215,6 +3277,7 @@ class ConverterApp:
         total = len(files)
         converted = 0
         failed = []
+        protected = []
 
         pythoncom.CoInitialize()
         # Each family gets its own DEDICATED Office instance (launched lazily,
@@ -3228,6 +3291,11 @@ class ConverterApp:
             for i, src in enumerate(files):
                 if self._cancel_office.is_set():
                     break
+                # Skip password-protected files — point the user at Password Removal.
+                if _is_password_protected(src):
+                    protected.append(src.name)
+                    self.root.after(0, lambda: self._office_progress.step(1))
+                    continue
                 self._set_office_status(f"Converting: {src.name}  ({i + 1}/{total})")
                 self._office_timer.set_file(src.name)
                 info = LEGACY_OFFICE.get(src.suffix.lower())
@@ -3318,40 +3386,43 @@ class ConverterApp:
             except Exception:
                 pass
 
-        self.root.after(0, lambda: self._office_finish(converted, failed))
+        self.root.after(0, lambda: self._office_finish(converted, failed, protected))
 
     def _set_office_status(self, msg):
         self.root.after(0, lambda: self._office_status_var.set(msg))
 
-    def _office_finish(self, converted, failed):
+    def _office_finish(self, converted, failed, protected=None):
         self._office_timer.stop()
         elapsed = self._office_timer.elapsed_str()
         self._office_timer.reset()
         self._office_btn.config(state="normal")
         self._set_cancel_state(self._office_cancel_btn, False)
+        protected = protected or []
+        pw_note = _password_skip_note(protected)
+        skip_status = f"  {len(protected)} skipped (password-protected)." if protected else ""
         if self._cancel_office.is_set():
             self._office_status_var.set(
                 f"⏹  Cancelled. {converted} file(s) modernized before stopping.")
             messagebox.showinfo(
                 "Office Modernizer Cancelled",
                 f"Conversion cancelled.\n{converted} file(s) modernized before stopping."
-                f"\n\nTotal time elapsed: {elapsed}",
+                f"\n\nTotal time elapsed: {elapsed}{pw_note}",
             )
             return
         if not failed:
-            self._office_status_var.set(f"✅  Done! {converted} file(s) modernized.")
+            self._office_status_var.set(f"✅  Done! {converted} file(s) modernized.{skip_status}")
             messagebox.showinfo(
                 "Office Modernizer Complete",
                 f"{converted} file(s) converted to their modern Office formats."
-                f"\n\nTotal time elapsed: {elapsed}",
+                f"\n\nTotal time elapsed: {elapsed}{pw_note}",
             )
         else:
             err_lines = "\n".join(f"• {n}: {e}" for n, e in failed)
-            self._office_status_var.set(f"⚠️  {converted} modernized, {len(failed)} failed.")
+            self._office_status_var.set(f"⚠️  {converted} modernized, {len(failed)} failed.{skip_status}")
             messagebox.showerror(
                 "Office Modernizer — Some Files Failed",
                 f"{converted} modernized, {len(failed)} failed:\n\n{err_lines}"
-                f"\n\nTotal time elapsed: {elapsed}",
+                f"\n\nTotal time elapsed: {elapsed}{pw_note}",
             )
 
     # ── Password Removal page ────────────────
@@ -3900,7 +3971,7 @@ class ConverterApp:
         pythoncom.CoInitialize()
         self._pdf_app_pids = []
         outlook = word = visio = excel = powerpoint = None
-        success, failed = 0, []
+        success, failed, protected = 0, [], []
 
         def _launch(family):
             # Dedicated, isolated Office instance + track its PID so Cancel can
@@ -3978,6 +4049,11 @@ class ConverterApp:
             for i, src in enumerate(self.files):
                 if self._cancel_convert.is_set():
                     break
+                # Skip password-protected files — point the user at Password Removal.
+                if _is_password_protected(src):
+                    protected.append(src.name)
+                    self.root.after(0, lambda: self.progress.step(1))
+                    continue
                 self._set_status(f"Converting: {src.name}  ({i + 1}/{total})")
                 self._pdf_timer.set_file(src.name)
                 out_dir = self._out_dir if self._out_dir else src.parent
@@ -4012,38 +4088,41 @@ class ConverterApp:
             except Exception:
                 pass
 
-        self.root.after(0, lambda: self._finish(success, failed))
+        self.root.after(0, lambda: self._finish(success, failed, protected))
 
     def _set_status(self, msg):
         self.root.after(0, lambda: self.status_var.set(msg))
 
-    def _finish(self, success, failed):
+    def _finish(self, success, failed, protected=None):
         self._pdf_timer.stop()
         elapsed = self._pdf_timer.elapsed_str()
         self._pdf_timer.reset()
         self.convert_btn.config(state="normal")
         self._set_cancel_state(self.cancel_btn, False)
+        protected = protected or []
+        pw_note = _password_skip_note(protected)
+        skip_status = f"  {len(protected)} skipped (password-protected)." if protected else ""
         if self._cancel_convert.is_set():
             self.status_var.set(f"⏹  Cancelled. {success} file(s) converted before stopping.")
             messagebox.showinfo(
                 "Conversion Cancelled",
                 f"Conversion was cancelled.\n{success} file(s) converted before stopping."
-                f"\n\nTotal time elapsed: {elapsed}",
+                f"\n\nTotal time elapsed: {elapsed}{pw_note}",
             )
         elif not failed:
-            self.status_var.set(f"✅  Done! {success} file(s) converted successfully.")
+            self.status_var.set(f"✅  Done! {success} file(s) converted successfully.{skip_status}")
             messagebox.showinfo(
                 "Conversion Complete",
                 f"{success} file(s) converted to PDF successfully."
-                f"\n\nTotal time elapsed: {elapsed}",
+                f"\n\nTotal time elapsed: {elapsed}{pw_note}",
             )
         else:
             err_lines = "\n".join(f"• {n}: {e}" for n, e in failed)
-            self.status_var.set(f"⚠️  {success} converted, {len(failed)} failed.")
+            self.status_var.set(f"⚠️  {success} converted, {len(failed)} failed.{skip_status}")
             messagebox.showerror(
                 "Conversion Errors",
                 f"{success} succeeded, {len(failed)} failed:\n\n{err_lines}"
-                f"\n\nTotal time elapsed: {elapsed}",
+                f"\n\nTotal time elapsed: {elapsed}{pw_note}",
             )
 
     # ── window ───────────────────────────────
