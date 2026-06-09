@@ -738,6 +738,54 @@ def _ensure_excel():
         return None
 
 
+def _fit_excel_sheets_to_page(wb, excel):
+    """Make every worksheet print legibly before exporting to PDF.
+
+    By default Excel prints at 100%, so any table wider than the paper is sliced
+    across pages column-wise — which looks messy and is hard for a downstream
+    reader (human or AI) to follow. For each sheet we instead:
+      • scale all columns onto ONE page wide (FitToPagesWide=1) so a table is
+        never cut left-to-right, while letting rows flow onto as many pages tall
+        as needed (FitToPagesTall=False) so nothing is crushed vertically;
+      • switch to landscape when the used range is wider than it is tall, which
+        gives wide tables more room before they have to scale down;
+      • trim margins to use more of the page.
+    All settings are best-effort per sheet — a sheet that can't take a setting is
+    skipped rather than failing the whole conversion.
+    """
+    try:
+        sheets = wb.Worksheets
+        count = sheets.Count
+    except Exception:
+        return
+    for i in range(1, count + 1):
+        try:
+            ws = sheets(i)
+            ps = ws.PageSetup
+            # Fit columns to one page wide; paginate rows naturally.
+            ps.Zoom = False
+            ps.FitToPagesWide = 1
+            ps.FitToPagesTall = False
+        except Exception:
+            continue
+        # Landscape for wide content (more width before Excel scales it down).
+        try:
+            used = ws.UsedRange
+            if used.Width > used.Height:
+                ps.Orientation = 2          # xlLandscape
+        except Exception:
+            pass
+        # Narrow margins so more of the table fits at a larger scale.
+        try:
+            m = excel.InchesToPoints(0.25)
+            hm = excel.InchesToPoints(0.1)
+            ps.LeftMargin = ps.RightMargin = m
+            ps.TopMargin = ps.BottomMargin = m
+            ps.HeaderMargin = ps.FooterMargin = hm
+        except Exception:
+            pass
+
+
 def _excel_to_pdf(src_path: Path, out_path: Path, excel):
     """
     Convert a .xls, .xlsx, .xlsm, or .xlsb file to PDF via Excel COM.
@@ -758,6 +806,9 @@ def _excel_to_pdf(src_path: Path, out_path: Path, excel):
             ReadOnly=True,
             AddToMru=False,
         )
+
+        # Scale every sheet to fit one page wide so wide tables aren't sliced.
+        _fit_excel_sheets_to_page(wb, excel)
 
         # xlTypePDF = 0, xlQualityStandard = 0
         wb.ExportAsFixedFormat(
