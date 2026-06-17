@@ -2096,6 +2096,40 @@ def _lerp_rgb(c1, c2, t):
     return tuple(int(round(a[k] + (b[k] - a[k]) * t)) for k in range(3))
 
 
+def _shade(hex_color, t):
+    """Darken `hex_color` toward black by fraction t (0..1); returns '#rrggbb'.
+    Used to derive a hover/pressed shade from a button's OWN color so a click
+    darkens it in place, keeping its format, instead of Tk's grey 'active' look."""
+    r, g, b = _lerp_rgb(hex_color, "#000000", t)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _style_press_button(btn):
+    """Make a flat tk.Button visibly press in on click: darken its own background
+    a little on hover and more while held, then restore on release. Keeps the
+    button's color/format (no flip to Tk's default grey/white active state).
+    Guards on the disabled state so inactive buttons don't react."""
+    try:
+        base = btn.cget("bg")
+        fg = btn.cget("fg")
+    except Exception:
+        return
+    hover = _shade(base, 0.06)
+    pressed = _shade(base, 0.18)
+    btn.config(activebackground=hover, activeforeground=fg)
+
+    def _press(_e=None):
+        if str(btn["state"]) != "disabled":
+            btn.config(activebackground=pressed)
+
+    def _release(_e=None):
+        if str(btn["state"]) != "disabled":
+            btn.config(activebackground=hover)
+
+    btn.bind("<ButtonPress-1>", _press, add="+")
+    btn.bind("<ButtonRelease-1>", _release, add="+")
+
+
 class _ToggleSwitch(tk.Frame):
     """A modern pill-style on/off switch bound to a BooleanVar, with a text label
     to its right — a rounded, drop-in replacement for tk.Checkbutton that matches
@@ -2223,9 +2257,12 @@ class _ToggleSwitch(tk.Frame):
 class _ModernRadio(tk.Frame):
     """A Windows 11-style radio option: an anti-aliased ring with a filled accent
     dot when selected, plus a label. Several instances share one variable; clicking
-    selects this instance's value. Bigger and smoother than tk.Radiobutton."""
+    selects this instance's value. Bigger and smoother than tk.Radiobutton. The
+    accent dot grows in (and the deselected one shrinks out) with a short ease-out
+    animation when the selection changes, like a modern web radio."""
 
-    D, SS = 18, 4   # circle diameter (display px) / supersample factor
+    D, SS = 18, 4             # circle diameter (display px) / supersample factor
+    FRAMES, FRAME_MS = 8, 12  # dot fill-in animation length / cadence
 
     def __init__(self, parent, text, variable, value, command=None,
                  bg=APP_BG, fg="#333", font=("Segoe UI", 9)):
@@ -2235,6 +2272,9 @@ class _ModernRadio(tk.Frame):
         self._command = command
         self._bg = bg
         self._photo = None
+        self._anim_id = None
+        # Current fill amount of the accent dot: 0 = empty ring, 1 = full dot.
+        self._fill = 1.0 if variable.get() == value else 0.0
         self._canvas = tk.Canvas(self, width=self.D, height=self.D, bg=bg,
                                  highlightthickness=0, bd=0)
         self._img_id = self._canvas.create_image(0, 0, anchor="nw")
@@ -2244,31 +2284,68 @@ class _ModernRadio(tk.Frame):
         for w in (self._canvas, self._label):
             w.bind("<Button-1>", self._on_click)
             w.config(cursor="hand2")
-        self._var.trace_add("write", lambda *a: self._render())
-        self._render()
+        self._var.trace_add("write", lambda *a: self._on_var_change())
+        self._render(self._fill)
 
-    def _render(self):
+    def _render(self, fill):
+        """Draw the ring + accent dot at fill amount `fill` (0..1), anti-aliased.
+        The ring color eases from grey to accent and the dot grows from the centre
+        as `fill` rises, so selecting/deselecting animates smoothly."""
         from PIL import Image, ImageDraw, ImageTk
         ss = self.SS
         D = self.D * ss
         bg = _hex_to_rgb(self._bg)
-        selected = (self._var.get() == self._value)
         img = Image.new("RGB", (D, D), bg)
         d = ImageDraw.Draw(img)
-        ring = _hex_to_rgb(TOGGLE_ON if selected else "#8b97a3")
+        ring = _lerp_rgb("#8b97a3", TOGGLE_ON, fill)
         bw = max(2, D // 11)
         d.ellipse([bw // 2, bw // 2, D - 1 - bw // 2, D - 1 - bw // 2],
                   outline=ring, width=bw, fill=(255, 255, 255))
-        if selected:
-            inset = int(D * 0.30)
-            d.ellipse([inset, inset, D - inset, D - inset], fill=_hex_to_rgb(TOGGLE_ON))
+        if fill > 0:
+            # Full dot radius equals the old inset of 0.30*D from the edge; scale
+            # it by `fill` so the dot grows out from the centre.
+            r = (D / 2 - int(D * 0.30)) * fill
+            c = D / 2
+            d.ellipse([c - r, c - r, c + r, c + r], fill=_hex_to_rgb(TOGGLE_ON))
         img = img.resize((self.D, self.D), Image.LANCZOS)
         self._photo = ImageTk.PhotoImage(img)
         self._canvas.itemconfig(self._img_id, image=self._photo)
 
+    def _animate_to(self, target):
+        """Grow/shrink the accent dot from its current fill to `target` (0 or 1)."""
+        if self._anim_id is not None:
+            try:
+                self.after_cancel(self._anim_id)
+            except Exception:
+                pass
+            self._anim_id = None
+        start = self._fill
+        delta = target - start
+        if abs(delta) < 1e-6:
+            return
+
+        def _step(i):
+            if i >= self.FRAMES:
+                self._fill = target
+                self._render(target)
+                self._anim_id = None
+                return
+            f = (i + 1) / self.FRAMES
+            f = 1 - (1 - f) * (1 - f)            # ease-out
+            self._fill = start + delta * f
+            self._render(self._fill)
+            self._anim_id = self.after(self.FRAME_MS, lambda: _step(i + 1))
+
+        _step(0)
+
+    def _on_var_change(self):
+        # Fires on every instance sharing the variable: the newly selected radio
+        # animates its dot in, the previously selected one animates its dot out.
+        self._animate_to(1.0 if self._var.get() == self._value else 0.0)
+
     def _on_click(self, event=None):
         if self._var.get() != self._value:
-            self._var.set(self._value)       # trace re-renders the whole group
+            self._var.set(self._value)       # trace animates the whole group
             if self._command is not None:
                 self._command()
 
@@ -2639,6 +2716,113 @@ class _OpTimer:
             self._shown = False
 
 
+class _ProgressTracker:
+    """Drives a ttk.Progressbar to reflect BOTH completed items and a smooth
+    'working on the current item' trickle — reusable by every tool.
+
+    File-count progress is exact: for N items with K done, the bar sits at K/N.
+    True per-item progress isn't available (COM/markitdown don't report how far
+    through a single file they are), so while an item is being worked on the bar
+    EASES forward toward the next item's mark without quite reaching it, then
+    snaps exactly when the item completes. That gives an honest 'moving little by
+    little' feel. The bar does NOT move until an item is actually being
+    processed: the worker calls `begin_item()` when a file starts (which kicks
+    off the trickle) and `complete_item()` when it finishes (which snaps the bar
+    and stops the trickle until the next `begin_item`). So between files — and
+    before the first file starts — the bar holds still.
+
+    Thread model: `start`/`finish`/`reset` are called on the Tk thread; the
+    worker-thread signals `begin_item()`/`complete_item()` marshal onto the Tk
+    thread via `root.after`. The bar runs 0..SCALE so fractional motion stays
+    smooth.
+    """
+    SCALE = 1000        # bar maximum, so fractional movement looks continuous
+    TICK_MS = 50        # trickle animation cadence
+    EASE = 0.08         # fraction of the remaining gap covered per tick
+    CAP = 0.9           # within one item, ease at most this far to the next mark
+
+    def __init__(self, root, bar):
+        self.root = root
+        self.bar = bar
+        self._total = 1
+        self._done = 0
+        self._trickle = 0.0          # 0..1 progress *within* the current item
+        self._anim_id = None
+        self._running = False
+
+    def start(self, total):
+        """Begin an operation over `total` items (Tk thread). The bar starts empty
+        and stays still until the first `begin_item()`."""
+        self._total = max(1, int(total))
+        self._done = 0
+        self._trickle = 0.0
+        self._running = True
+        self._cancel_anim()
+        self.bar.config(maximum=self.SCALE)
+        self.bar["value"] = 0
+
+    def begin_item(self):
+        """Signal that processing of the next item has actually begun (safe from a
+        worker thread). Starts the within-item trickle toward the next mark."""
+        self.root.after(0, self._begin_item_main)
+
+    def complete_item(self):
+        """Mark one item done (safe from a worker thread)."""
+        self.root.after(0, self._complete_item_main)
+
+    def finish(self):
+        """End the operation, stopping the trickle (Tk thread)."""
+        self._running = False
+        self._cancel_anim()
+        self._render()
+
+    def reset(self):
+        """Clear the bar back to empty (Tk thread)."""
+        self._running = False
+        self._cancel_anim()
+        self._done = 0
+        self._trickle = 0.0
+        self.bar["value"] = 0
+
+    def _begin_item_main(self):
+        if not self._running:
+            return
+        self._trickle = 0.0
+        self._cancel_anim()
+        self._animate()              # trickle toward this item's completion
+
+    def _complete_item_main(self):
+        if not self._running:
+            return
+        self._done = min(self._done + 1, self._total)
+        self._trickle = 0.0
+        self._cancel_anim()          # stop trickling; wait for the next begin_item
+        self._render()               # snap to the exact completed fraction
+        if self._done >= self._total:
+            self._running = False    # everything done; bar sits full
+
+    def _animate(self):
+        if not self._running:
+            self._anim_id = None
+            return
+        self._trickle += (self.CAP - self._trickle) * self.EASE
+        self._render()
+        self._anim_id = self.root.after(self.TICK_MS, self._animate)
+
+    def _render(self):
+        frac = (self._done + self._trickle) / self._total
+        frac = max(0.0, min(1.0, frac))
+        self.bar["value"] = frac * self.SCALE
+
+    def _cancel_anim(self):
+        if self._anim_id is not None:
+            try:
+                self.root.after_cancel(self._anim_id)
+            except Exception:
+                pass
+            self._anim_id = None
+
+
 class ConverterApp:
     def __init__(self):
         # Give the process its own AppUserModelID *before* the window exists so
@@ -2904,8 +3088,27 @@ class ConverterApp:
                 self._build_pwd_page(frame)
             elif key == "structure":
                 self._build_structure_page(frame)
+            # Give this page's flat grey utility buttons a themed press-in effect.
+            self._enhance_page_buttons(frame)
 
         self._page_frames[key].pack(fill="both", expand=True)
+
+    def _enhance_page_buttons(self, widget):
+        """Recursively give a freshly-built page's flat grey utility buttons
+        (the #e0e8f0 Add / Remove / Clear / Choose… buttons) a press-in effect.
+        Buttons that already define their own active colors — the accent action
+        buttons, the red Cancel, the sidebar nav — are left untouched, so only
+        the ones that would otherwise flash Tk's grey 'active' look are styled.
+        Runs per page on first build, so new pages pick this up automatically."""
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Button):
+                try:
+                    base = str(child.cget("bg")).lower()
+                except Exception:
+                    base = ""
+                if base == "#e0e8f0":
+                    _style_press_button(child)
+            self._enhance_page_buttons(child)
 
     def _build_timer(self, parent):
         """Reserve a spot for the stacked 'Total Time Elapsed' + current-file
@@ -2951,7 +3154,7 @@ class ConverterApp:
         mode_menu = _ModernDropdown(
             mode_frame,
             textvariable=self._mode,
-            values=["Email (.eml, .msg)", "HTML / MHT (.html, .htm, .mht)", "Visio (.vsd, .vsdx)", "Excel (.xls, .xlsx, .csv)", "Word (.doc, .docx, .txt, .rtf, .xml)", "PowerPoint (.ppt, .pptx)", "Image (.jpg, .png, .bmp, .gif, .tiff)"],
+            values=["Email (.eml, .msg)", "HTML (.html, .htm, .mht)", "Visio (.vsd, .vsdx)", "Excel (.xls, .xlsx, .csv)", "Word (.doc, .docx, .txt, .rtf, .xml)", "PowerPoint (.ppt, .pptx)", "Image (.jpg, .png, .bmp, .gif, .tiff)"],
             command=self._on_mode_change,
             width=26,
             font=("Segoe UI", 9),
@@ -3040,6 +3243,7 @@ class ConverterApp:
         # Progress bar
         self.progress = ttk.Progressbar(parent, mode="determinate")
         self.progress.pack(fill="x", padx=18, pady=(4, 2))
+        self._pdf_tracker = _ProgressTracker(self.root, self.progress)
 
         # Status label
         self.status_var = tk.StringVar(value="Ready — add files to get started.")
@@ -3206,6 +3410,7 @@ class ConverterApp:
         # Progress bar
         self._uz_progress = ttk.Progressbar(parent, mode="determinate")
         self._uz_progress.pack(fill="x", padx=18, pady=(6, 2))
+        self._uz_tracker = _ProgressTracker(self.root, self._uz_progress)
 
         # Status label
         self._uz_status_var = tk.StringVar(value="Ready — add .zip files to get started.")
@@ -3273,6 +3478,9 @@ class ConverterApp:
         self._zip_files.clear()
         self._uz_file_list.delete(0, "end")
         self._uz_update_drop_label()
+        # Return the page to its ready state (clear any "Done!"/error status).
+        self._uz_status_var.set("Ready — add .zip files to get started.")
+        self._uz_tracker.reset()
 
     def _uz_update_drop_label(self):
         if self._zip_files:
@@ -3331,8 +3539,7 @@ class ConverterApp:
         self._cancel_unzip.clear()
         self._uz_btn.config(state="disabled")
         self._set_cancel_state(self._uz_cancel_btn, True)
-        self._uz_progress["value"] = 0
-        self._uz_progress["maximum"] = len(self._zip_files)
+        self._uz_tracker.start(len(self._zip_files))
         separate  = self._uz_separate.get()
         auto_pdf  = self._uz_auto_pdf.get()
         self._uz_timer.start()
@@ -3344,10 +3551,10 @@ class ConverterApp:
                 separate,
                 auto_pdf,
                 lambda msg: self.root.after(0, lambda m=msg: self._uz_status_var.set(m)),
-                lambda: self.root.after(0, lambda: self._uz_progress.step(1)),
+                self._uz_tracker.complete_item,
                 lambda s, f, pf, pr: self.root.after(0, lambda: self._uz_finish(s, f, pf, pr)),
                 self._cancel_unzip,
-                self._uz_timer.set_file,
+                lambda name: (self._uz_timer.set_file(name), self._uz_tracker.begin_item()),
             ),
             daemon=True,
         ).start()
@@ -3360,6 +3567,7 @@ class ConverterApp:
 
     def _uz_finish(self, success, failed, pdf_failed=None, protected=None):
         self._uz_timer.stop()
+        self._uz_tracker.finish()
         elapsed = self._uz_timer.elapsed_str()
         self._uz_timer.reset()
         self._uz_btn.config(state="normal")
@@ -3495,6 +3703,7 @@ class ConverterApp:
         # Progress + status
         self._ai_progress = ttk.Progressbar(parent, mode="determinate")
         self._ai_progress.pack(fill="x", padx=18, pady=(6, 2))
+        self._ai_tracker = _ProgressTracker(self.root, self._ai_progress)
         self._ai_status_var = tk.StringVar(value="Ready — add files to convert to Markdown.")
         tk.Label(parent, textvariable=self._ai_status_var, bg=APP_BG, fg="#555",
                  font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=20, pady=(0, 4))
@@ -3549,6 +3758,9 @@ class ConverterApp:
         self._ai_files.clear()
         self._ai_file_list.delete(0, "end")
         self._ai_update_drop_label()
+        # Return the page to its ready state (clear any "Done!"/error status).
+        self._ai_status_var.set("Ready — add files to convert to Markdown.")
+        self._ai_tracker.reset()
 
     def _ai_update_drop_label(self):
         if self._ai_files:
@@ -3577,8 +3789,7 @@ class ConverterApp:
         self._cancel_ai.clear()
         self._ai_btn.config(state="disabled")
         self._set_cancel_state(self._ai_cancel_btn, True)
-        self._ai_progress["value"] = 0
-        self._ai_progress["maximum"] = len(self._ai_files)
+        self._ai_tracker.start(len(self._ai_files))
         self._ai_timer.start()
         threading.Thread(target=self._aiprep_worker, daemon=True).start()
 
@@ -3613,11 +3824,12 @@ class ConverterApp:
             # Skip password-protected files — point the user at Password Removal.
             if _is_password_protected(src):
                 protected.append(src.name)
-                self.root.after(0, lambda: self._ai_progress.step(1))
+                self._ai_tracker.complete_item()
                 continue
             self.root.after(0, lambda s=src, n=i: self._ai_status_var.set(
                 f"Converting: {s.name}  ({n + 1}/{total})"))
             self._ai_timer.set_file(src.name)
+            self._ai_tracker.begin_item()
             try:
                 out_dir = self._ai_out_dir if self._ai_out_dir else src.parent
                 out = _to_markdown(src, out_dir)
@@ -3639,12 +3851,13 @@ class ConverterApp:
                     failed.append(src.name)
             except Exception as exc:
                 failed.append(f"{src.name}: {exc}")
-            self.root.after(0, lambda: self._ai_progress.step(1))
+            self._ai_tracker.complete_item()
 
         self.root.after(0, lambda: self._ai_finish(converted, failed, protected))
 
     def _ai_finish(self, converted, failed, protected=None):
         self._ai_timer.stop()
+        self._ai_tracker.finish()
         elapsed = self._ai_timer.elapsed_str()
         self._ai_timer.reset()
         self._ai_btn.config(state="normal")
@@ -3765,6 +3978,7 @@ class ConverterApp:
         # Progress + status
         self._office_progress = ttk.Progressbar(parent, mode="determinate")
         self._office_progress.pack(fill="x", padx=18, pady=(6, 2))
+        self._office_tracker = _ProgressTracker(self.root, self._office_progress)
         self._office_status_var = tk.StringVar(
             value="Ready — add legacy Office files to modernize.")
         tk.Label(parent, textvariable=self._office_status_var, bg=APP_BG, fg="#555",
@@ -3823,6 +4037,9 @@ class ConverterApp:
         self._office_files.clear()
         self._office_file_list.delete(0, "end")
         self._office_update_drop_label()
+        # Return the page to its ready state (clear any "Done!"/error status).
+        self._office_status_var.set("Ready — add legacy Office files to modernize.")
+        self._office_tracker.reset()
 
     def _office_update_drop_label(self):
         if self._office_files:
@@ -3858,8 +4075,7 @@ class ConverterApp:
         self._cancel_office.clear()
         self._office_btn.config(state="disabled")
         self._set_cancel_state(self._office_cancel_btn, True)
-        self._office_progress["value"] = 0
-        self._office_progress["maximum"] = len(self._office_files)
+        self._office_tracker.start(len(self._office_files))
         self._office_timer.start()
         threading.Thread(target=self._office_worker, daemon=True).start()
 
@@ -3889,14 +4105,15 @@ class ConverterApp:
                 # Skip password-protected files — point the user at Password Removal.
                 if _is_password_protected(src):
                     protected.append(src.name)
-                    self.root.after(0, lambda: self._office_progress.step(1))
+                    self._office_tracker.complete_item()
                     continue
                 self._set_office_status(f"Converting: {src.name}  ({i + 1}/{total})")
                 self._office_timer.set_file(src.name)
+                self._office_tracker.begin_item()
                 info = LEGACY_OFFICE.get(src.suffix.lower())
                 if info is None:
                     failed.append((src.name, "unsupported file type"))
-                    self.root.after(0, lambda: self._office_progress.step(1))
+                    self._office_tracker.complete_item()
                     continue
                 family, out_ext, fmt = info
                 if not ensured[family]:
@@ -3959,7 +4176,7 @@ class ConverterApp:
                     ensured[family] = False
                     self._office_app_pids.pop(family, None)
 
-                self.root.after(0, lambda: self._office_progress.step(1))
+                self._office_tracker.complete_item()
         finally:
             # Close our dedicated instances (already-killed ones error here —
             # ignored), then make sure none of our launched processes linger.
@@ -3985,6 +4202,7 @@ class ConverterApp:
 
     def _office_finish(self, converted, failed, protected=None):
         self._office_timer.stop()
+        self._office_tracker.finish()
         elapsed = self._office_timer.elapsed_str()
         self._office_timer.reset()
         self._office_btn.config(state="normal")
@@ -4099,6 +4317,7 @@ class ConverterApp:
         # Progress + status
         self._pwd_progress = ttk.Progressbar(parent, mode="determinate")
         self._pwd_progress.pack(fill="x", padx=18, pady=(6, 2))
+        self._pwd_tracker = _ProgressTracker(self.root, self._pwd_progress)
         self._pwd_status_var = tk.StringVar(
             value="Ready — add password-protected Office files to unlock.")
         tk.Label(parent, textvariable=self._pwd_status_var, bg=APP_BG, fg="#555",
@@ -4160,6 +4379,9 @@ class ConverterApp:
         self._pwd_files.clear()
         self._pwd_file_list.delete(0, "end")
         self._pwd_update_drop_label()
+        # Return the page to its ready state (clear any "Done!"/error status).
+        self._pwd_status_var.set("Ready — add password-protected Office files to unlock.")
+        self._pwd_tracker.reset()
 
     def _pwd_update_drop_label(self):
         if self._pwd_files:
@@ -4199,8 +4421,7 @@ class ConverterApp:
         self._cancel_pwd.clear()
         self._pwd_btn.config(state="disabled")
         self._set_cancel_state(self._pwd_cancel_btn, True)
-        self._pwd_progress["value"] = 0
-        self._pwd_progress["maximum"] = len(self._pwd_files)
+        self._pwd_tracker.start(len(self._pwd_files))
         self._pwd_timer.start()
         threading.Thread(target=self._pwd_worker, daemon=True).start()
 
@@ -4319,13 +4540,13 @@ class ConverterApp:
                 break
             if src.suffix.lower() not in PWD_EXTS:
                 failed.append((src.name, "unsupported file type"))
-                self.root.after(0, lambda: self._pwd_progress.step(1))
+                self._pwd_tracker.complete_item()
                 continue
 
             # Skip files that aren't actually encrypted — no point prompting.
             if not _office_is_encrypted(src):
                 failed.append((src.name, "not password-protected (no open-password encryption)"))
-                self.root.after(0, lambda: self._pwd_progress.step(1))
+                self._pwd_tracker.complete_item()
                 continue
 
             # Ask for this file's password, re-prompting on a wrong one until it
@@ -4343,6 +4564,7 @@ class ConverterApp:
 
                 self._set_pwd_status(f"Unlocking: {src.name}  ({i + 1}/{total})")
                 self._pwd_timer.set_file(src.name)
+                self._pwd_tracker.begin_item()
                 out_dir = self._pwd_out_dir if self._pwd_out_dir else src.parent
                 out_path = _unique_output_path(out_dir, src.stem + "_nopass", src.suffix)
                 try:
@@ -4367,7 +4589,7 @@ class ConverterApp:
                 if done_with_file:
                     break
 
-            self.root.after(0, lambda: self._pwd_progress.step(1))
+            self._pwd_tracker.complete_item()
 
         self.root.after(0, lambda: self._pwd_finish(unlocked, failed, skipped))
 
@@ -4376,6 +4598,7 @@ class ConverterApp:
 
     def _pwd_finish(self, unlocked, failed, skipped):
         self._pwd_timer.stop()
+        self._pwd_tracker.finish()
         elapsed = self._pwd_timer.elapsed_str()
         self._pwd_timer.reset()
         self._pwd_btn.config(state="normal")
@@ -4523,6 +4746,7 @@ class ConverterApp:
         # Progress + status
         self._ds_progress = ttk.Progressbar(parent, mode="determinate")
         self._ds_progress.pack(fill="x", padx=18, pady=(6, 2))
+        self._ds_tracker = _ProgressTracker(self.root, self._ds_progress)
         self._ds_status_var = tk.StringVar(
             value="Ready — add .zip files to extract and organize.")
         tk.Label(parent, textvariable=self._ds_status_var, bg=APP_BG, fg="#555",
@@ -4578,6 +4802,9 @@ class ConverterApp:
         self._ds_files.clear()
         self._ds_file_list.delete(0, "end")
         self._ds_update_drop_label()
+        # Return the page to its ready state (clear any "Done!"/error status).
+        self._ds_status_var.set("Ready — add .zip files to extract and organize.")
+        self._ds_tracker.reset()
 
     def _ds_update_drop_label(self):
         if self._ds_files:
@@ -4634,8 +4861,7 @@ class ConverterApp:
         self._cancel_ds.clear()
         self._ds_btn.config(state="disabled")
         self._set_cancel_state(self._ds_cancel_btn, True)
-        self._ds_progress["value"] = 0
-        self._ds_progress["maximum"] = len(self._ds_files)
+        self._ds_tracker.start(len(self._ds_files))
         self._ds_timer.start()
         threading.Thread(target=self._ds_worker, daemon=True).start()
 
@@ -4662,10 +4888,11 @@ class ConverterApp:
             # Skip password-protected archives — they can't be extracted here.
             if _is_password_protected(zip_path):
                 protected.append(zip_path.name)
-                self.root.after(0, lambda: self._ds_progress.step(1))
+                self._ds_tracker.complete_item()
                 continue
 
             self._set_ds_status(f"Extracting: {zip_path.name}  ({i + 1}/{total})")
+            self._ds_tracker.begin_item()
             tmp = Path(tempfile.mkdtemp())
             try:
                 with zipfile.ZipFile(zip_path, "r") as zf:
@@ -4675,12 +4902,12 @@ class ConverterApp:
             except zipfile.BadZipFile:
                 bad_zips.append((zip_path.name, "not a valid ZIP file or corrupted"))
                 shutil.rmtree(tmp, ignore_errors=True)
-                self.root.after(0, lambda: self._ds_progress.step(1))
+                self._ds_tracker.complete_item()
                 continue
             except Exception as exc:
                 bad_zips.append((zip_path.name, str(exc)))
                 shutil.rmtree(tmp, ignore_errors=True)
-                self.root.after(0, lambda: self._ds_progress.step(1))
+                self._ds_tracker.complete_item()
                 continue
 
             # No output folder chosen → save beside the source zip ("same as
@@ -4700,7 +4927,7 @@ class ConverterApp:
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
 
-            self.root.after(0, lambda: self._ds_progress.step(1))
+            self._ds_tracker.complete_item()
 
         self.root.after(
             0, lambda: self._ds_finish(saved, renamed, failed, notes, protected, bad_zips))
@@ -4774,6 +5001,7 @@ class ConverterApp:
 
     def _ds_finish(self, saved, renamed, failed, notes, protected, bad_zips):
         self._ds_timer.stop()
+        self._ds_tracker.finish()
         elapsed = self._ds_timer.elapsed_str()
         self._ds_timer.reset()
         self._ds_btn.config(state="normal")
@@ -4842,8 +5070,8 @@ class ConverterApp:
     def _add_files(self):
         m = self._mode.get()
         if m.startswith("HTML"):
-            filetypes = [("HTML / MHT files", "*.html *.htm *.mht *.mhtml"), ("All files", "*.*")]
-            title = "Select HTML / MHT files"
+            filetypes = [("HTML files", "*.html *.htm *.mht *.mhtml"), ("All files", "*.*")]
+            title = "Select HTML files"
         elif m.startswith("Visio"):
             filetypes = [("Visio files", "*.vsd *.vsdx"), ("All files", "*.*")]
             title = "Select Visio files"
@@ -4889,6 +5117,9 @@ class ConverterApp:
         self.files.clear()
         self.file_list.delete(0, "end")
         self._update_drop_label()
+        # Return the page to its ready state (clear any "Done!"/error status).
+        self.status_var.set("Ready — add files to get started.")
+        self._pdf_tracker.reset()
 
     def _update_drop_label(self):
         if self.files:
@@ -4939,7 +5170,7 @@ class ConverterApp:
     def _start_convert(self):
         if not self.files:
             m = self._mode.get()
-            if m.startswith("HTML"):         label = "HTML / MHT"
+            if m.startswith("HTML"):         label = "HTML"
             elif m.startswith("Visio"):      label = "Visio"
             elif m.startswith("Excel"):      label = "Excel / CSV"
             elif m.startswith("Word"):       label = "Word / text"
@@ -4951,8 +5182,7 @@ class ConverterApp:
         self._cancel_convert.clear()
         self.convert_btn.config(state="disabled")
         self._set_cancel_state(self.cancel_btn, True)
-        self.progress["value"] = 0
-        self.progress["maximum"] = len(self.files)
+        self._pdf_tracker.start(len(self.files))
         self._pdf_timer.start()
         threading.Thread(target=self._convert_worker, daemon=True).start()
 
@@ -5003,7 +5233,7 @@ class ConverterApp:
             if email_mode or html_mode or word_mode or image_mode:
                 word = _launch("word")
                 if word is None and (html_mode or word_mode or image_mode):
-                    if html_mode:    label = "HTML / MHT"
+                    if html_mode:    label = "HTML"
                     elif image_mode: label = "Image"
                     else:            label = "Word document"
                     _abort("Word Not Found",
@@ -5050,10 +5280,11 @@ class ConverterApp:
                 # Skip password-protected files — point the user at Password Removal.
                 if _is_password_protected(src):
                     protected.append(src.name)
-                    self.root.after(0, lambda: self.progress.step(1))
+                    self._pdf_tracker.complete_item()
                     continue
                 self._set_status(f"Converting: {src.name}  ({i + 1}/{total})")
                 self._pdf_timer.set_file(src.name)
+                self._pdf_tracker.begin_item()
                 out_dir = self._out_dir if self._out_dir else src.parent
                 out_path = _unique_pdf_path(out_dir, src.stem)
                 try:
@@ -5068,7 +5299,7 @@ class ConverterApp:
                         pass
                     if not self._cancel_convert.is_set():
                         failed.append((src.name, str(exc)))
-                self.root.after(0, lambda: self.progress.step(1))
+                self._pdf_tracker.complete_item()
         finally:
             # Quit our dedicated Office instances, then make sure none linger
             # (e.g. after a kill). Outlook is intentionally left alone.
@@ -5093,6 +5324,7 @@ class ConverterApp:
 
     def _finish(self, success, failed, protected=None):
         self._pdf_timer.stop()
+        self._pdf_tracker.finish()
         elapsed = self._pdf_timer.elapsed_str()
         self._pdf_timer.reset()
         self.convert_btn.config(state="normal")
