@@ -18,6 +18,7 @@ import tempfile
 import shutil
 import html as htmllib
 import re
+import json
 import zipfile
 
 try:
@@ -961,6 +962,41 @@ def _unique_output_path(directory: Path, stem: str, ext: str) -> Path:
     return candidate
 
 
+def _resolved_set(paths) -> set:
+    """Resolve an iterable of paths to a set of canonical Paths, for safe
+    membership checks. Unresolvable paths are skipped."""
+    out = set()
+    for p in paths:
+        try:
+            out.add(Path(p).resolve())
+        except Exception:
+            pass
+    return out
+
+
+def _delete_original_file(src: Path, allowed: set) -> bool:
+    """HARD SAFEGUARD for every 'delete originals after operation' feature.
+
+    Delete `src` ONLY if its resolved path is in `allowed` — the explicit set of
+    files the user actually supplied to this operation. This guarantees the app
+    can never delete a file that wasn't part of the upload, even if an output
+    folder happens to contain other, unrelated files. Returns True iff deleted.
+
+    Callers must build `allowed` from the operation's own input list (e.g.
+    `_resolved_set(self._ai_files)`), never from a directory scan.
+    """
+    try:
+        if src.resolve() not in allowed:
+            return False           # not part of the upload — refuse to delete
+    except Exception:
+        return False
+    try:
+        src.unlink()
+        return True
+    except Exception:
+        return False
+
+
 # ─────────────────────────────────────────────
 # Legacy Office → modern Office (one-to-one, by family)
 #
@@ -1464,6 +1500,163 @@ def _email_attachments_to_markdown(src_path: Path, md_out_path: Path) -> int:
     return len(saved)
 
 
+# ─────────────────────────────────────────────
+# Document Structuring — AI filename suggestions and organize-by-filetype.
+# The AI naming reads the opening text of a document and asks the AI service
+# for a professional, standardized filename; everything is best-effort and
+# degrades gracefully when text or the API is unavailable.
+# ─────────────────────────────────────────────
+
+# AI naming backend (SHELL — not live yet). The service details below will be
+# provided later by the developer and baked into this build; end users never
+# see or configure anything. While any PLACEHOLDER value remains,
+# _ai_backend_ready() is False, the AI-naming checkbox is disabled in the UI,
+# and the feature cannot run.
+_AI_BACKEND = {
+    "endpoint":    "https://PLACEHOLDER-ENDPOINT",   # TODO: real endpoint, provided later
+    "api_key":     "PLACEHOLDER_API_KEY",            # TODO: real key, provided later
+    "deployment":  "PLACEHOLDER_DEPLOYMENT",         # TODO: real deployment/model, provided later
+    "api_version": "2024-06-01",
+}
+
+
+def _ai_backend_ready() -> bool:
+    """True once the developer has replaced every PLACEHOLDER in _AI_BACKEND."""
+    return not any("PLACEHOLDER" in str(v) for v in _AI_BACKEND.values())
+
+
+def _extract_document_text(src_path: Path, limit: int = 1500) -> str:
+    """Return up to `limit` characters of text from a document, for AI naming.
+    Reuses markitdown (already bundled) so it works across PDF/Word/Excel/etc.
+    Returns '' if no usable text can be extracted (the caller then falls back)."""
+    try:
+        md = _get_markitdown()
+        result = md.convert(str(src_path.resolve()))
+        text = (result.text_content or "")
+        text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text).strip()
+        return text[:limit]
+    except Exception:
+        return ""
+
+
+def _sanitize_suggested_name(name: str) -> str:
+    """Clean an AI-suggested filename: strip illegal characters, any extension it
+    tacked on, surrounding quotes/whitespace, and cap the length. '' if nothing
+    usable remains."""
+    name = (name or "").strip().strip('"').strip("'").strip()
+    # Drop a trailing extension the model may have appended.
+    name = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", name).strip()
+    # Remove characters illegal in Windows filenames.
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name).strip().strip(".")
+    return name[:120].strip()
+
+
+def _ai_suggest_filename(text: str, cfg: dict, timeout: int = 30):
+    """Ask the AI backend for a professional, standardized base filename (no
+    extension) given a document's opening text. Returns the suggestion, or None
+    on any failure (network, auth, bad response) so the caller can fall back.
+    Pure stdlib (urllib) — no extra dependency to bundle. The request shape
+    targets an Azure-OpenAI-style chat-completions endpoint and may be adjusted
+    when the real service details are provided."""
+    import urllib.request
+    url = (f"{cfg['endpoint'].rstrip('/')}/openai/deployments/{cfg['deployment']}"
+           f"/chat/completions?api-version={cfg['api_version']}")
+    system = (
+        "You are a document-naming assistant for a professional services firm. "
+        "Given the opening text of a document, propose ONE concise, professional, "
+        "standardized file name WITHOUT a file extension. Base it on the document "
+        "type, date, entity/organization name, and the period covered when those "
+        "are present. Prefer the form 'Entity - Document Type - Period' using Title "
+        "Case, at most ~12 words. Reply with ONLY the file name — no quotes, no "
+        "extension, no explanation."
+    )
+    body = json.dumps({
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "Document opening text:\n\n" + text},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 40,
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("api-key", cfg["api_key"])
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            resp = json.load(r)
+        suggestion = _sanitize_suggested_name(
+            resp["choices"][0]["message"]["content"])
+        return suggestion or None
+    except Exception:
+        return None
+
+
+def _sanitize_date(raw: str):
+    """Pull a YYYY-MM-DD date out of the model's reply. Returns the date string,
+    or None if the reply has no valid date (e.g. it said 'NONE')."""
+    m = re.search(r"\d{4}-\d{2}-\d{2}", raw or "")
+    return m.group(0) if m else None
+
+
+def _ai_infer_date(text: str, cfg: dict, timeout: int = 30):
+    """Ask the AI backend for the date a document was created/issued, inferred
+    from its opening text, as YYYY-MM-DD (used as a filename prefix). Returns the
+    date string, or None on any failure or when no date can be determined.
+    Pure stdlib (urllib); same Azure-OpenAI-style request shape as
+    _ai_suggest_filename, adjustable when the real service details arrive."""
+    import urllib.request
+    url = (f"{cfg['endpoint'].rstrip('/')}/openai/deployments/{cfg['deployment']}"
+           f"/chat/completions?api-version={cfg['api_version']}")
+    system = (
+        "You determine the single most relevant date of a document — the date it "
+        "was created, issued, signed, or dated — from its opening text. Reply with "
+        "ONLY that date in strict YYYY-MM-DD format. If only a month and year are "
+        "clear, use 01 for the day; if only a year is clear, use 01-01. If no date "
+        "can be determined, reply with exactly NONE. No other words."
+    )
+    body = json.dumps({
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "Document opening text:\n\n" + text},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 16,
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("api-key", cfg["api_key"])
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            resp = json.load(r)
+        return _sanitize_date(resp["choices"][0]["message"]["content"])
+    except Exception:
+        return None
+
+
+# Extension → friendly folder name for "Organize by filetype". Unknown
+# extensions fall back to the upper-cased extension (e.g. ".odt" -> "ODT").
+FILETYPE_FOLDERS = {
+    ".pdf": "PDF",
+    ".doc": "Word Documents", ".docx": "Word Documents", ".docm": "Word Documents",
+    ".dot": "Word Documents", ".dotx": "Word Documents", ".rtf": "Word Documents",
+    ".txt": "Text Files", ".md": "Text Files",
+    ".xls": "Excel Spreadsheets", ".xlsx": "Excel Spreadsheets", ".xlsm": "Excel Spreadsheets",
+    ".xlsb": "Excel Spreadsheets", ".csv": "Excel Spreadsheets",
+    ".ppt": "PowerPoint", ".pptx": "PowerPoint", ".pps": "PowerPoint", ".ppsx": "PowerPoint",
+    ".jpg": "Images", ".jpeg": "Images", ".png": "Images", ".gif": "Images",
+    ".bmp": "Images", ".tiff": "Images", ".tif": "Images", ".webp": "Images",
+    ".msg": "Emails", ".eml": "Emails",
+    ".html": "Web Pages", ".htm": "Web Pages", ".mht": "Web Pages", ".mhtml": "Web Pages",
+    ".zip": "Archives",
+    ".vsd": "Visio", ".vsdx": "Visio",
+}
+
+
+def _filetype_folder(ext: str) -> str:
+    ext = (ext or "").lower()
+    return FILETYPE_FOLDERS.get(ext, ext.lstrip(".").upper() or "Other")
+
+
 def convert_file(src_path: Path, out_dir: Path, outlook, word, visio, excel, powerpoint, mode: str) -> Path:
     """
     Convert a single file to PDF.
@@ -1686,6 +1879,10 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
     word = excel = visio = powerpoint = outlook = None
 
     try:
+        # Hard safeguard: auto-PDF may only ever delete files that were actually
+        # extracted from the upload (the explicit candidate list) — never any
+        # other file that happens to share the output folder.
+        originals = _resolved_set(candidate_files)
         files = [
             f for f in candidate_files
             if f.is_file()
@@ -1717,7 +1914,7 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
                         shutil.copy2(str(src), str(tmp_txt))
                         _word_to_pdf(tmp_txt, out_path, word)
                         if out_path.exists() and out_path.stat().st_size > 0:
-                            src.unlink()
+                            _delete_original_file(src, originals)
                             converted += 1
                         else:
                             pdf_failed.append(src.name)
@@ -1758,7 +1955,7 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
 
                     # Only delete the original if the PDF was actually written
                     if out_path.exists() and out_path.stat().st_size > 0:
-                        src.unlink()
+                        _delete_original_file(src, originals)
                         converted += 1
                     else:
                         pdf_failed.append(src.name)
@@ -1881,6 +2078,352 @@ SIDEBAR_BG  = "#1e2d3d"
 SIDEBAR_FG  = "#c9d8e8"
 SIDEBAR_SEL = "#0078d4"
 SIDEBAR_W   = 190
+
+# Toggle-switch palette
+TOGGLE_ON       = "#0078d4"    # filled track when on (accent)
+TOGGLE_OFF      = "#bcc5cf"    # grey track when off
+TOGGLE_DISABLED = "#d8dde2"    # washed-out track when disabled
+
+
+def _hex_to_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _lerp_rgb(c1, c2, t):
+    """Blend two '#rrggbb' colors; t=0 -> c1, t=1 -> c2. Returns an (r,g,b) tuple."""
+    a, b = _hex_to_rgb(c1), _hex_to_rgb(c2)
+    return tuple(int(round(a[k] + (b[k] - a[k]) * t)) for k in range(3))
+
+
+class _ToggleSwitch(tk.Frame):
+    """A modern pill-style on/off switch bound to a BooleanVar, with a text label
+    to its right — a rounded, drop-in replacement for tk.Checkbutton that matches
+    the app theme. The pill is rendered anti-aliased (supersampled with Pillow) so
+    it looks smooth rather than blocky, and the knob slides with a short animation
+    when toggled. Supports `command`, a "disabled" state, and live updates when the
+    variable is set elsewhere. Pack/grid it like any widget."""
+
+    W, H, PAD = 32, 18, 2     # display size; knob diameter = H - 2*PAD
+    SS = 4                    # supersampling factor for anti-aliasing
+    FRAMES, FRAME_MS = 8, 12  # knob-slide animation length / cadence
+
+    def __init__(self, parent, text, variable, command=None, state="normal",
+                 bg=APP_BG, fg="#333", font=("Segoe UI", 9)):
+        super().__init__(parent, bg=bg)
+        self._var = variable
+        self._command = command
+        self._state = state
+        self._enabled_fg = fg
+        self._bg = bg
+        self._pos = 1.0 if variable.get() else 0.0   # current knob position 0..1
+        self._anim_id = None
+        self._photo = None                            # keep a ref so it isn't GC'd
+        self._canvas = tk.Canvas(self, width=self.W, height=self.H, bg=bg,
+                                 highlightthickness=0, bd=0)
+        self._img_id = self._canvas.create_image(0, 0, anchor="nw")
+        self._canvas.pack(side="left", pady=1)
+        self._label = tk.Label(self, text=text, bg=bg, fg=fg, font=font,
+                               anchor="w", justify="left")
+        self._label.pack(side="left", padx=(8, 0))
+        for w in (self._canvas, self._label):
+            w.bind("<Button-1>", self._on_click)
+        self._apply_cursor()
+        self._update_label_fg()
+        self._var.trace_add("write", self._on_var_change)
+        self._render(self._pos)
+
+    def _apply_cursor(self):
+        cur = "hand2" if self._state == "normal" else "arrow"
+        self._canvas.config(cursor=cur)
+        self._label.config(cursor=cur)
+
+    def _update_label_fg(self):
+        self._label.config(
+            fg="#9aa3ad" if self._state == "disabled" else self._enabled_fg)
+
+    def _render(self, pos):
+        """Draw the pill + knob at knob position `pos` (0..1), anti-aliased."""
+        from PIL import Image, ImageDraw, ImageTk
+        ss = self.SS
+        W, H, pad = self.W * ss, self.H * ss, self.PAD * ss
+        bg = _hex_to_rgb(self._bg)
+        if self._state == "disabled":
+            track = _hex_to_rgb(TOGGLE_DISABLED)
+        else:
+            track = _lerp_rgb(TOGGLE_OFF, TOGGLE_ON, pos)
+        img = Image.new("RGB", (W, H), bg)
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle([0, 0, W - 1, H - 1], radius=H // 2, fill=track)
+        knob = H - 2 * pad
+        travel = W - 2 * pad - knob
+        x0 = pad + travel * pos
+        d.ellipse([x0, pad, x0 + knob, pad + knob], fill=(255, 255, 255))
+        img = img.resize((self.W, self.H), Image.LANCZOS)
+        self._photo = ImageTk.PhotoImage(img)
+        self._canvas.itemconfig(self._img_id, image=self._photo)
+
+    def _animate_to(self, target):
+        """Slide the knob from its current position to `target` (0 or 1)."""
+        if self._anim_id is not None:
+            try:
+                self.after_cancel(self._anim_id)
+            except Exception:
+                pass
+            self._anim_id = None
+        start = self._pos
+        delta = target - start
+        if abs(delta) < 1e-6:
+            return
+
+        def _step(i):
+            if i >= self.FRAMES:
+                self._pos = target
+                self._render(target)
+                self._anim_id = None
+                return
+            f = (i + 1) / self.FRAMES
+            f = 1 - (1 - f) * (1 - f)            # ease-out
+            self._pos = start + delta * f
+            self._render(self._pos)
+            self._anim_id = self.after(self.FRAME_MS, lambda: _step(i + 1))
+
+        _step(0)
+
+    def _on_var_change(self, *_a):
+        target = 1.0 if self._var.get() else 0.0
+        self._update_label_fg()
+        if self._state == "disabled":
+            self._pos = target                  # snap; no animation when disabled
+            self._render(target)
+        else:
+            self._animate_to(target)
+
+    def _on_click(self, event=None):
+        if self._state == "disabled":
+            return
+        self._var.set(not self._var.get())      # trace drives the animation
+        if self._command is not None:
+            self._command()
+
+    def config(self, **kwargs):
+        if "state" in kwargs:
+            self._state = kwargs.pop("state")
+            self._apply_cursor()
+            self._update_label_fg()
+            self._render(self._pos)
+        if "text" in kwargs:
+            self._label.config(text=kwargs.pop("text"))
+        if kwargs:
+            super().config(**kwargs)
+
+    configure = config
+
+
+class _ModernRadio(tk.Frame):
+    """A Windows 11-style radio option: an anti-aliased ring with a filled accent
+    dot when selected, plus a label. Several instances share one variable; clicking
+    selects this instance's value. Bigger and smoother than tk.Radiobutton."""
+
+    D, SS = 18, 4   # circle diameter (display px) / supersample factor
+
+    def __init__(self, parent, text, variable, value, command=None,
+                 bg=APP_BG, fg="#333", font=("Segoe UI", 9)):
+        super().__init__(parent, bg=bg)
+        self._var = variable
+        self._value = value
+        self._command = command
+        self._bg = bg
+        self._photo = None
+        self._canvas = tk.Canvas(self, width=self.D, height=self.D, bg=bg,
+                                 highlightthickness=0, bd=0)
+        self._img_id = self._canvas.create_image(0, 0, anchor="nw")
+        self._canvas.pack(side="left")
+        self._label = tk.Label(self, text=text, bg=bg, fg=fg, font=font)
+        self._label.pack(side="left", padx=(7, 0))
+        for w in (self._canvas, self._label):
+            w.bind("<Button-1>", self._on_click)
+            w.config(cursor="hand2")
+        self._var.trace_add("write", lambda *a: self._render())
+        self._render()
+
+    def _render(self):
+        from PIL import Image, ImageDraw, ImageTk
+        ss = self.SS
+        D = self.D * ss
+        bg = _hex_to_rgb(self._bg)
+        selected = (self._var.get() == self._value)
+        img = Image.new("RGB", (D, D), bg)
+        d = ImageDraw.Draw(img)
+        ring = _hex_to_rgb(TOGGLE_ON if selected else "#8b97a3")
+        bw = max(2, D // 11)
+        d.ellipse([bw // 2, bw // 2, D - 1 - bw // 2, D - 1 - bw // 2],
+                  outline=ring, width=bw, fill=(255, 255, 255))
+        if selected:
+            inset = int(D * 0.30)
+            d.ellipse([inset, inset, D - inset, D - inset], fill=_hex_to_rgb(TOGGLE_ON))
+        img = img.resize((self.D, self.D), Image.LANCZOS)
+        self._photo = ImageTk.PhotoImage(img)
+        self._canvas.itemconfig(self._img_id, image=self._photo)
+
+    def _on_click(self, event=None):
+        if self._var.get() != self._value:
+            self._var.set(self._value)       # trace re-renders the whole group
+            if self._command is not None:
+                self._command()
+
+
+def _apply_round_corners(win):
+    """Best-effort Windows 11 slightly-rounded corners for a borderless Toplevel
+    (DWM). No-op off Windows or if the call fails."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        # DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUNDSMALL = 3
+        pref = ctypes.c_int(3)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, 33, ctypes.byref(pref), ctypes.sizeof(pref))
+    except Exception:
+        pass
+
+
+class _ModernDropdown(tk.Frame):
+    """A readonly combobox-style selector with a Windows 11 feel: a white field +
+    chevron that opens a popup which animates open (expanding downward) and has
+    slightly rounded corners. Bound to a StringVar; calls `command` when the
+    selection changes (mirroring a Combobox's <<ComboboxSelected>>)."""
+
+    ROW_H = 28
+    FRAMES, FRAME_MS = 7, 12
+
+    def __init__(self, parent, textvariable, values, command=None,
+                 width=26, font=("Segoe UI", 9), bg=APP_BG):
+        super().__init__(parent, bg=bg)
+        self._var = textvariable
+        self._values = list(values)
+        self._command = command
+        self._font = font
+        self._popup = None
+        self._anim_id = None
+
+        self._box = tk.Frame(self, bg="#ffffff", highlightthickness=1,
+                             highlightbackground="#aab4bf", bd=0)
+        self._box.pack()
+        self._value_lbl = tk.Label(self._box, textvariable=self._var, bg="#ffffff",
+                                   fg="#1a1a1a", font=font, anchor="w",
+                                   width=width, padx=8, pady=4)
+        self._value_lbl.pack(side="left")
+        self._chevron = tk.Label(self._box, text="▾", bg="#ffffff", fg="#5a6b7b",
+                                 font=("Segoe UI", 10), padx=6)
+        self._chevron.pack(side="left")
+        for w in (self._box, self._value_lbl, self._chevron):
+            w.bind("<Button-1>", self._toggle_popup)
+            w.config(cursor="hand2")
+
+    def _toggle_popup(self, event=None):
+        if self._popup is not None:
+            self._close_popup()
+        else:
+            self._open_popup()
+
+    def _open_popup(self):
+        import tkinter.font as tkfont
+        self.update_idletasks()
+        x = self._box.winfo_rootx()
+        y = self._box.winfo_rooty() + self._box.winfo_height()
+        box_w = self._box.winfo_width()
+        fm = tkfont.Font(font=self._font)
+        text_w = max((fm.measure(v) for v in self._values), default=0)
+        w = max(box_w, text_w + 28)
+        full_h = self.ROW_H * len(self._values) + 4
+
+        pop = tk.Toplevel(self)
+        pop.overrideredirect(True)
+        try:
+            pop.attributes("-topmost", True)
+        except Exception:
+            pass
+        pop.configure(bg="#ffffff")
+        self._popup = pop
+
+        panel = tk.Frame(pop, bg="#ffffff", highlightthickness=1,
+                         highlightbackground="#aab4bf")
+        panel.place(x=0, y=0, width=w, height=full_h)
+        for i, val in enumerate(self._values):
+            sel = (val == self._var.get())
+            row = tk.Label(panel, text=val, bg=("#eaf2fb" if sel else "#ffffff"),
+                           fg="#1a1a1a", font=self._font, anchor="w", padx=10)
+            row.place(x=2, y=2 + i * self.ROW_H, width=w - 4, height=self.ROW_H)
+            row.bind("<Enter>", lambda e, r=row: r.config(bg="#d6e7fa"))
+            row.bind("<Leave>", lambda e, r=row, v=val: r.config(
+                bg="#eaf2fb" if v == self._var.get() else "#ffffff"))
+            row.bind("<Button-1>", lambda e, v=val: self._choose(v))
+            row.config(cursor="hand2")
+
+        _apply_round_corners(pop)
+
+        pop.geometry(f"{w}x1+{x}+{y}")
+        pop.bind("<Escape>", lambda e: self._close_popup())
+        pop.bind("<Button-1>", self._maybe_close_outside)
+        try:
+            pop.grab_set()
+        except Exception:
+            pass
+        self._animate_open(x, y, w, full_h, 0)
+
+    def _animate_open(self, x, y, w, full_h, i):
+        self._anim_id = None
+        if self._popup is None:
+            return
+        if i > self.FRAMES:
+            self._popup.geometry(f"{w}x{full_h}+{x}+{y}")
+            return
+        f = i / self.FRAMES
+        f = 1 - (1 - f) * (1 - f)             # ease-out
+        h = max(1, int(full_h * f))
+        self._popup.geometry(f"{w}x{h}+{x}+{y}")
+        # Schedule on self (a persistent widget), not the popup, so closing the
+        # popup mid-animation can cleanly cancel the pending tick.
+        self._anim_id = self.after(
+            self.FRAME_MS, lambda: self._animate_open(x, y, w, full_h, i + 1))
+
+    def _maybe_close_outside(self, event):
+        pop = self._popup
+        if pop is None:
+            return
+        px, py = pop.winfo_rootx(), pop.winfo_rooty()
+        pw, ph = pop.winfo_width(), pop.winfo_height()
+        if not (px <= event.x_root < px + pw and py <= event.y_root < py + ph):
+            self._close_popup()
+
+    def _choose(self, value):
+        changed = (value != self._var.get())
+        self._var.set(value)
+        self._close_popup()
+        if changed and self._command is not None:
+            self._command()
+
+    def _close_popup(self):
+        if self._anim_id is not None:
+            try:
+                self.after_cancel(self._anim_id)
+            except Exception:
+                pass
+            self._anim_id = None
+        pop = self._popup
+        self._popup = None
+        if pop is not None:
+            try:
+                pop.grab_release()
+            except Exception:
+                pass
+            try:
+                pop.destroy()
+            except Exception:
+                pass
 
 
 def _resource_base():
@@ -2017,6 +2560,15 @@ class _OpTimer:
         self._running = False
         self._shown = False
         self._final_secs = 0
+        self._after_id = None   # pending root.after callback, so we never stack ticks
+
+    def _cancel_pending(self):
+        if self._after_id is not None:
+            try:
+                self.root.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
 
     @staticmethod
     def _fmt(secs):
@@ -2031,6 +2583,8 @@ class _OpTimer:
             self.total_lbl.pack(fill="x", padx=20)
             self.file_lbl.pack(fill="x", padx=20, pady=(0, 2))
             self._shown = True
+        # Drop any tick still queued from a previous run so loops can't overlap.
+        self._cancel_pending()
         self._start = time.monotonic()
         self._file_name = None
         self._file_start = None
@@ -2046,6 +2600,7 @@ class _OpTimer:
 
     def _tick(self):
         if not self._running:
+            self._after_id = None
             return
         now = time.monotonic()
         if self._start is not None:
@@ -2053,12 +2608,13 @@ class _OpTimer:
         if self._file_name is not None and self._file_start is not None:
             self.file_var.set(
                 f"Current file ({self._file_name}):  " + self._fmt(now - self._file_start))
-        self.root.after(250, self._tick)
+        self._after_id = self.root.after(250, self._tick)
 
     def stop(self):
         if not self._running and self._start is None:
             return
         self._running = False
+        self._cancel_pending()
         if self._start is not None:
             self._final_secs = time.monotonic() - self._start
             self.total_var.set("Total Time Elapsed:  " + self._fmt(self._final_secs))
@@ -2071,6 +2627,7 @@ class _OpTimer:
     def reset(self):
         """Clear the timer and hide it from the window (ready for the next run)."""
         self._running = False
+        self._cancel_pending()
         self._start = None
         self._file_name = None
         self._file_start = None
@@ -2097,6 +2654,13 @@ class ConverterApp:
             self.root = TkinterDnD.Tk()
         else:
             self.root = tk.Tk()
+
+        # Surface (rather than silently swallow) any exception raised inside a Tk
+        # callback. In the windowed build there is no console, so the default
+        # handler's traceback goes nowhere and a wedged callback looks like a
+        # freeze; this shows it once and keeps the app running.
+        self._error_dialog_open = False
+        self.root.report_callback_exception = self._on_tk_error
 
         # Hide the window *immediately* — before any geometry/icon work forces a
         # paint — so the blank Tk window never flashes on screen at launch.
@@ -2157,6 +2721,14 @@ class ConverterApp:
         self._cancel_pwd  = threading.Event()
         self._pwd_dialog  = None     # the open password prompt, if any
 
+        # Document Structuring page state
+        self._ds_files    = []
+        self._ds_out_dir  = None
+        self._cancel_ds   = threading.Event()
+        self._ds_rename   = tk.BooleanVar(value=False)
+        self._ds_date     = tk.BooleanVar(value=False)
+        self._ds_organize = tk.BooleanVar(value=True)
+
         # Navigation state
         self._active_page = None
         self._page_frames = {}
@@ -2189,6 +2761,30 @@ class ConverterApp:
         self.root.lift()
         if splash is not None:
             splash.close()
+
+    def _on_tk_error(self, exc, val, tb):
+        """Handle an uncaught exception from any Tk callback: log the traceback
+        and show a single, non-blocking-storm error dialog. Guarded so a callback
+        that errors repeatedly (e.g. a periodic `after`) can't stack dialogs."""
+        import traceback
+        try:
+            sys.stderr.write("".join(traceback.format_exception(exc, val, tb)))
+        except Exception:
+            pass
+        if self._error_dialog_open:
+            return
+        self._error_dialog_open = True
+        try:
+            messagebox.showerror(
+                "Unexpected Error",
+                "Something went wrong and the action couldn't be completed:\n\n"
+                f"{type(val).__name__}: {val}\n\n"
+                "The app is still running — you can try again.",
+            )
+        except Exception:
+            pass
+        finally:
+            self._error_dialog_open = False
 
     def _set_icon(self):
         """Load icon.ico and set both the title bar and taskbar icon at a legible size."""
@@ -2265,7 +2861,8 @@ class ConverterApp:
                                 ("unzip", "  Folder Unzipping"),
                                 ("aiprep", "  Markdown Conversion"),
                                 ("office", "  Office Modernizer"),
-                                ("pwd", "  Password Removal")]:
+                                ("pwd", "  Password Removal"),
+                                ("structure", "  Document Structuring")]:
             btn = tk.Button(
                 self._sidebar,
                 text=label,
@@ -2305,6 +2902,8 @@ class ConverterApp:
                 self._build_office_page(frame)
             elif key == "pwd":
                 self._build_pwd_page(frame)
+            elif key == "structure":
+                self._build_structure_page(frame)
 
         self._page_frames[key].pack(fill="both", expand=True)
 
@@ -2349,16 +2948,15 @@ class ConverterApp:
             mode_frame, text="Conversion mode:",
             bg=APP_BG, fg="#555", font=("Segoe UI", 9),
         ).pack(side="left")
-        mode_menu = ttk.Combobox(
+        mode_menu = _ModernDropdown(
             mode_frame,
             textvariable=self._mode,
             values=["Email (.eml, .msg)", "HTML / MHT (.html, .htm, .mht)", "Visio (.vsd, .vsdx)", "Excel (.xls, .xlsx, .csv)", "Word (.doc, .docx, .txt, .rtf, .xml)", "PowerPoint (.ppt, .pptx)", "Image (.jpg, .png, .bmp, .gif, .tiff)"],
-            state="readonly",
+            command=self._on_mode_change,
             width=26,
             font=("Segoe UI", 9),
         )
         mode_menu.pack(side="left", padx=8)
-        mode_menu.bind("<<ComboboxSelected>>", self._on_mode_change)
 
         # Drop zone
         self.drop_frame = tk.Frame(
@@ -2589,24 +3187,20 @@ class ConverterApp:
             ("Each zip into its own folder", True),
             ("All into one folder",          False),
         ]:
-            tk.Radiobutton(
+            _ModernRadio(
                 uz_org_frame, text=text, variable=self._uz_separate, value=val,
-                bg=APP_BG, fg="#333", activebackground=APP_BG,
                 font=("Segoe UI", 9),
-            ).pack(side="left", padx=(0, 14))
+            ).pack(side="left", padx=(0, 16))
 
         # Auto-PDF checkbox
         uz_autopdf_frame = tk.Frame(parent, bg=APP_BG)
         uz_autopdf_frame.pack(fill="x", padx=18, pady=(6, 2))
 
         self._uz_auto_pdf = tk.BooleanVar(value=False)
-        tk.Checkbutton(
+        _ToggleSwitch(
             uz_autopdf_frame,
             text="Auto-convert files to PDF after unzipping  (originals deleted on success)",
             variable=self._uz_auto_pdf,
-            bg=APP_BG, fg="#333", activebackground=APP_BG,
-            font=("Segoe UI", 9),
-            anchor="w",
         ).pack(side="left")
 
         # Progress bar
@@ -2893,10 +3487,9 @@ class ConverterApp:
         opt_frame = tk.Frame(parent, bg=APP_BG)
         opt_frame.pack(fill="x", padx=18, pady=(2, 2))
         self._ai_delete_orig = tk.BooleanVar(value=False)
-        tk.Checkbutton(
+        _ToggleSwitch(
             opt_frame, text="Delete original files after successful conversion",
-            variable=self._ai_delete_orig, bg=APP_BG, fg="#333",
-            activebackground=APP_BG, font=("Segoe UI", 9), anchor="w",
+            variable=self._ai_delete_orig,
         ).pack(side="left")
 
         # Progress + status
@@ -2992,6 +3585,9 @@ class ConverterApp:
     def _aiprep_worker(self):
         files = list(self._ai_files)
         delete_orig = self._ai_delete_orig.get()
+        # Only ever delete files the user actually uploaded — never anything else
+        # that may live in the output folder. See _delete_original_file.
+        originals = _resolved_set(files)
         total = len(files)
         converted = 0
         failed = []
@@ -3038,10 +3634,7 @@ class ConverterApp:
                         except Exception:
                             pass   # attachment handling is best-effort
                     if delete_orig:
-                        try:
-                            src.unlink()
-                        except Exception:
-                            pass
+                        _delete_original_file(src, originals)
                 else:
                     failed.append(src.name)
             except Exception as exc:
@@ -3164,10 +3757,9 @@ class ConverterApp:
         opt_frame = tk.Frame(parent, bg=APP_BG)
         opt_frame.pack(fill="x", padx=18, pady=(2, 2))
         self._office_delete_orig = tk.BooleanVar(value=False)
-        tk.Checkbutton(
+        _ToggleSwitch(
             opt_frame, text="Delete original files after successful conversion",
-            variable=self._office_delete_orig, bg=APP_BG, fg="#333",
-            activebackground=APP_BG, font=("Segoe UI", 9), anchor="w",
+            variable=self._office_delete_orig,
         ).pack(side="left")
 
         # Progress + status
@@ -3274,6 +3866,9 @@ class ConverterApp:
     def _office_worker(self):
         files = list(self._office_files)
         delete_orig = self._office_delete_orig.get()
+        # Only ever delete files the user actually uploaded — never anything else
+        # that may live in the output folder. See _delete_original_file.
+        originals = _resolved_set(files)
         total = len(files)
         converted = 0
         failed = []
@@ -3337,10 +3932,7 @@ class ConverterApp:
                     _modernize_office_file(src, out_path, family, fmt, apps[family])
                     converted += 1
                     if delete_orig:
-                        try:
-                            src.unlink()
-                        except Exception:
-                            pass
+                        _delete_original_file(src, originals)
                 except Exception as exc:
                     # Remove any partial/corrupt output left behind — e.g. when
                     # the conversion was force-killed mid-save. The path is
@@ -3662,10 +4254,9 @@ class ConverterApp:
 
         def _toggle():
             entry.config(show="" if show_var.get() else "•")
-        tk.Checkbutton(dlg, text="Show password", variable=show_var,
-                       command=_toggle, bg=APP_BG, fg="#555",
-                       activebackground=APP_BG, font=("Segoe UI", 8)).pack(
-            anchor="w", padx=14)
+        _ToggleSwitch(dlg, text="Show password", variable=show_var,
+                      command=_toggle, fg="#555", font=("Segoe UI", 8)).pack(
+            anchor="w", padx=14, pady=(2, 0))
 
         def _submit():
             result["pwd"] = var.get()
@@ -3816,6 +4407,413 @@ class ConverterApp:
             messagebox.showerror(
                 "Password Removal — Some Files Failed",
                 f"{unlocked} unlocked, {len(failed)} failed:{extra}\n\n{err_lines}"
+                f"\n\nTotal time elapsed: {elapsed}",
+            )
+
+    # ── Document Structuring page ──────────────────────
+    def _build_structure_page(self, parent):
+        tk.Label(
+            parent, text="Document Structuring",
+            bg=APP_BG, fg="#1a1a1a", font=("Segoe UI", 14, "bold"),
+            anchor="w", padx=18,
+        ).pack(fill="x", pady=(14, 4))
+
+        tk.Label(
+            parent,
+            text=("Add ZIP archives. Each one is extracted first (including any nested "
+                  "zips), then the extracted documents are standardized and organized: "
+                  "optionally renamed to AI-suggested professional names and/or sorted "
+                  "into folders by file type. Originals are never modified, and any "
+                  "files already in the output folder are left untouched — only the "
+                  "extracted documents are saved (and organized) there."),
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+            anchor="w", padx=18, justify="left", wraplength=620,
+        ).pack(fill="x", pady=(0, 6))
+
+        # Drop zone
+        self._ds_drop_frame = tk.Frame(
+            parent, bg=DROP_BG, highlightbackground=DROP_BD,
+            highlightthickness=2, relief="flat",
+        )
+        self._ds_drop_frame.pack(fill="both", expand=True, padx=18, pady=(10, 6))
+        self._ds_drop_label = tk.Label(
+            self._ds_drop_frame,
+            text="Drop .zip files here\nor click 'Add Zip Files'",
+            bg=DROP_BG, fg="#4a6fa5", font=("Segoe UI", 11), justify="center",
+        )
+        self._ds_drop_label.pack(expand=True, pady=20)
+        list_frame = tk.Frame(self._ds_drop_frame, bg=DROP_BG)
+        list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical")
+        self._ds_file_list = tk.Listbox(
+            list_frame, yscrollcommand=scrollbar.set, selectmode="extended",
+            bg="#ffffff", fg="#1a1a1a", font=("Segoe UI", 9),
+            relief="flat", bd=1, activestyle="none", highlightthickness=0,
+        )
+        scrollbar.config(command=self._ds_file_list.yview)
+        scrollbar.pack(side="right", fill="y")
+        self._ds_file_list.pack(fill="both", expand=True)
+        if HAS_DND:
+            for widget in (self._ds_drop_frame, self._ds_drop_label, list_frame, self._ds_file_list):
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._ds_on_drop)
+
+        # Add / Remove / Clear
+        btn_frame = tk.Frame(parent, bg=APP_BG)
+        btn_frame.pack(fill="x", padx=18, pady=(4, 4))
+        for label, cmd in [
+            ("Add Zip Files",   self._ds_add_files),
+            ("Remove Selected", self._ds_remove_selected),
+            ("Clear All",       self._ds_clear_files),
+        ]:
+            tk.Button(
+                btn_frame, text=label, command=cmd,
+                bg="#e0e8f0", fg="#333", font=("Segoe UI", 9),
+                relief="flat", padx=12, pady=4, cursor="hand2",
+            ).pack(side="left", padx=(0, 6))
+
+        # Options. The AI-naming checkbox stays disabled until the AI backend
+        # is live (placeholders replaced) — the feature is a shell for now.
+        opt_frame = tk.Frame(parent, bg=APP_BG)
+        opt_frame.pack(fill="x", padx=18, pady=(2, 0))
+        ai_ready = _ai_backend_ready()
+        if not ai_ready:
+            self._ds_rename.set(False)
+            self._ds_date.set(False)
+        self._ds_rename_check = _ToggleSwitch(
+            opt_frame,
+            text="AI filename suggestions" + ("" if ai_ready else "  (coming soon)"),
+            variable=self._ds_rename,
+            state=("normal" if ai_ready else "disabled"),
+        )
+        self._ds_rename_check.pack(anchor="w", pady=2)
+        self._ds_date_check = _ToggleSwitch(
+            opt_frame,
+            text="Add the document's inferred date as a filename prefix (Date_Name)"
+                 + ("" if ai_ready else "  (coming soon)"),
+            variable=self._ds_date,
+            state=("normal" if ai_ready else "disabled"),
+        )
+        self._ds_date_check.pack(anchor="w", pady=2)
+        _ToggleSwitch(
+            opt_frame, text="Organize into folders by file type",
+            variable=self._ds_organize,
+        ).pack(anchor="w", pady=2)
+
+        # Output folder row (optional — defaults to each zip's own folder). The
+        # folder need NOT be empty: only the extracted files are written/organized
+        # here, existing files are never moved, swept into subfolders, or overwritten.
+        out_frame = tk.Frame(parent, bg=APP_BG)
+        out_frame.pack(fill="x", padx=18, pady=(4, 2))
+        tk.Label(
+            out_frame, text="Output folder:",
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+        ).pack(side="left")
+        self._ds_out_var = tk.StringVar(value="Same as source file")
+        tk.Label(
+            out_frame, textvariable=self._ds_out_var,
+            bg=APP_BG, fg=ACCENT, font=("Segoe UI", 9, "italic"),
+        ).pack(side="left", padx=4)
+        tk.Button(
+            out_frame, text="Choose…", command=self._ds_choose_output,
+            bg="#e0e8f0", fg="#333", font=("Segoe UI", 9), relief="flat",
+            padx=8, pady=2, cursor="hand2",
+        ).pack(side="left", padx=4)
+
+        # Progress + status
+        self._ds_progress = ttk.Progressbar(parent, mode="determinate")
+        self._ds_progress.pack(fill="x", padx=18, pady=(6, 2))
+        self._ds_status_var = tk.StringVar(
+            value="Ready — add .zip files to extract and organize.")
+        tk.Label(parent, textvariable=self._ds_status_var, bg=APP_BG, fg="#555",
+                 font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=20, pady=(0, 4))
+        self._ds_timer = self._build_timer(parent)
+
+        # Run + Cancel
+        ds_btn_row = tk.Frame(parent, bg=APP_BG)
+        ds_btn_row.pack(pady=(4, 14))
+        self._ds_btn = tk.Button(
+            ds_btn_row, text="Structure Documents", command=self._start_ds,
+            bg=ACCENT, fg=BTN_FG, font=("Segoe UI", 12, "bold"),
+            relief="flat", padx=30, pady=8, cursor="hand2",
+            activebackground="#005a9e", activeforeground=BTN_FG,
+        )
+        self._ds_btn.pack(side="left")
+        self._ds_cancel_btn = tk.Button(
+            ds_btn_row, text="Cancel", command=self._cancel_ds_op,
+            font=("Segoe UI", 10, "bold"), relief="flat", padx=16, pady=6,
+            activebackground=CANCEL_BG_ACTIVE, activeforeground=BTN_FG,
+        )
+        self._ds_cancel_btn.pack(side="left", padx=(10, 0))
+        self._set_cancel_state(self._ds_cancel_btn, False)
+
+    def _ds_add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Select ZIP files",
+            filetypes=[("ZIP archives", "*.zip"), ("All files", "*.*")],
+        )
+        for p in paths:
+            self._ds_add_path(p)
+
+    def _ds_on_drop(self, event):
+        for p in self.root.tk.splitlist(event.data):
+            self._ds_add_path(p)
+
+    def _ds_add_path(self, p):
+        path = Path(p)
+        if not path.is_file() or path.suffix.lower() != ".zip":
+            return   # only accept .zip archives; ignore anything else
+        if path not in self._ds_files:
+            self._ds_files.append(path)
+            self._ds_file_list.insert("end", path.name)
+        self._ds_update_drop_label()
+
+    def _ds_remove_selected(self):
+        for i in sorted(self._ds_file_list.curselection(), reverse=True):
+            self._ds_file_list.delete(i)
+            del self._ds_files[i]
+        self._ds_update_drop_label()
+
+    def _ds_clear_files(self):
+        self._ds_files.clear()
+        self._ds_file_list.delete(0, "end")
+        self._ds_update_drop_label()
+
+    def _ds_update_drop_label(self):
+        if self._ds_files:
+            self._ds_drop_label.config(text=f"{len(self._ds_files)} zip file(s) queued")
+        else:
+            self._ds_drop_label.config(text="Drop .zip files here\nor click 'Add Zip Files'")
+
+    def _ds_choose_output(self):
+        d = filedialog.askdirectory(title="Select output folder")
+        if d:
+            self._ds_out_dir = Path(d)
+            self._ds_out_var.set(str(self._ds_out_dir))
+        else:
+            self._ds_out_dir = None
+            self._ds_out_var.set("Same as source file")
+
+    def _cancel_ds_op(self):
+        # Stop the batch. Work is copies + short network calls, so the loop
+        # exits between files; there are no Office processes to kill.
+        self._cancel_ds.set()
+        self._set_cancel_state(self._ds_cancel_btn, False)
+        self._ds_status_var.set("Stopping…")
+
+    def _start_ds(self):
+        if not self._ds_files:
+            messagebox.showwarning("No Files", "Please add ZIP files first.")
+            return
+        do_rename = self._ds_rename.get()
+        do_date = self._ds_date.get()
+        do_organize = self._ds_organize.get()
+
+        cfg = None
+        if do_rename or do_date:
+            # Hard gate: the AI backend is a shell until the real service
+            # details are baked in. The checkboxes are disabled too; this guard
+            # is belt-and-braces.
+            if not _ai_backend_ready():
+                messagebox.showinfo(
+                    "AI Features Not Available Yet",
+                    "The AI features (filename suggestions and date prefixing) "
+                    "aren't available in this version yet. Organizing into folders "
+                    "by file type still works.")
+                return
+            cfg = _AI_BACKEND
+
+        # Snapshot the job on the main thread — the worker must not read Tk vars.
+        self._ds_job = {
+            "rename": do_rename,
+            "date": do_date,
+            "organize": do_organize,
+            "cfg": cfg,
+            "out_dir": self._ds_out_dir,
+        }
+        self._cancel_ds.clear()
+        self._ds_btn.config(state="disabled")
+        self._set_cancel_state(self._ds_cancel_btn, True)
+        self._ds_progress["value"] = 0
+        self._ds_progress["maximum"] = len(self._ds_files)
+        self._ds_timer.start()
+        threading.Thread(target=self._ds_worker, daemon=True).start()
+
+    def _ds_worker(self):
+        job = self._ds_job
+        do_rename, do_date, do_organize = job["rename"], job["date"], job["organize"]
+        cfg, out_base = job["cfg"], job["out_dir"]
+        zips = list(self._ds_files)
+        total = len(zips)
+        saved = 0
+        renamed = 0
+        failed = []        # (name, reason) — files that couldn't be saved
+        notes = []         # (name, info) — kept original name, with the reason why
+        protected = []     # password-protected archives we skipped
+        bad_zips = []      # (name, reason) — archives that couldn't be extracted
+
+        # Each ZIP is extracted into its own temp dir (nested zips expanded in
+        # place), then every extracted file is structured into the output folder.
+        for i, zip_path in enumerate(zips):
+            if self._cancel_ds.is_set():
+                break
+            self._ds_timer.set_file(zip_path.name)
+
+            # Skip password-protected archives — they can't be extracted here.
+            if _is_password_protected(zip_path):
+                protected.append(zip_path.name)
+                self.root.after(0, lambda: self._ds_progress.step(1))
+                continue
+
+            self._set_ds_status(f"Extracting: {zip_path.name}  ({i + 1}/{total})")
+            tmp = Path(tempfile.mkdtemp())
+            try:
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    zf.extractall(tmp)
+                _recursive_unzip_in_place(tmp)   # expand nested zips at any depth
+                extracted = sorted(p for p in tmp.rglob("*") if p.is_file())
+            except zipfile.BadZipFile:
+                bad_zips.append((zip_path.name, "not a valid ZIP file or corrupted"))
+                shutil.rmtree(tmp, ignore_errors=True)
+                self.root.after(0, lambda: self._ds_progress.step(1))
+                continue
+            except Exception as exc:
+                bad_zips.append((zip_path.name, str(exc)))
+                shutil.rmtree(tmp, ignore_errors=True)
+                self.root.after(0, lambda: self._ds_progress.step(1))
+                continue
+
+            # No output folder chosen → save beside the source zip ("same as
+            # source"). The folder may already contain unrelated files; that's
+            # fine — only the extracted files are written here.
+            base = out_base if out_base else zip_path.parent
+            try:
+                ntotal = len(extracted)
+                for j, src in enumerate(extracted):
+                    if self._cancel_ds.is_set():
+                        break
+                    s, r = self._ds_structure_file(
+                        src, zip_path.name, base, do_rename, do_date,
+                        do_organize, cfg, i, total, j, ntotal, failed, notes)
+                    saved += s
+                    renamed += r
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+            self.root.after(0, lambda: self._ds_progress.step(1))
+
+        self.root.after(
+            0, lambda: self._ds_finish(saved, renamed, failed, notes, protected, bad_zips))
+
+    def _ds_structure_file(self, src, zip_name, out_base, do_rename, do_date,
+                           do_organize, cfg, i, total, j, ntotal, failed, notes):
+        """Optionally AI-rename and/or AI-date-prefix one extracted file, then
+        copy it into the output folder. When both AI options are on the result is
+        'Date_AISuggestedName'; date-only gives 'Date_OriginalName'. Mutates
+        `failed`/`notes`; returns (saved_count, renamed_count) as 0/1."""
+        new_stem = src.stem
+        name_changed = False
+        date_prefix = None
+        where = f"{zip_name} ({i + 1}/{total}) — {j + 1}/{ntotal}"
+
+        # Both AI features read the same opening text, so extract it just once.
+        if do_rename or do_date:
+            if _is_password_protected(src):
+                notes.append((src.name, "password-protected — kept original name "
+                                        "(use Password Removal first)"))
+            else:
+                self._set_ds_status(f"Reading: {src.name}  [{where}]")
+                text = _extract_document_text(src)
+                if not text:
+                    notes.append((src.name, "no readable text (or unsupported type) — "
+                                            "kept original name, no date added"))
+                else:
+                    if do_rename and not self._cancel_ds.is_set():
+                        self._set_ds_status(f"Asking AI for a name: {src.name}  [{where}]")
+                        suggestion = _ai_suggest_filename(text, cfg)
+                        if suggestion and suggestion != src.stem:
+                            new_stem = suggestion
+                            name_changed = True
+                        elif not suggestion:
+                            notes.append((src.name, "no AI name suggestion (API "
+                                                    "unavailable) — kept original name"))
+                    if do_date and not self._cancel_ds.is_set():
+                        self._set_ds_status(f"Asking AI for the date: {src.name}  [{where}]")
+                        date_prefix = _ai_infer_date(text, cfg)
+                        if not date_prefix:
+                            notes.append((src.name, "no date could be inferred — "
+                                                    "no date prefix added"))
+                if self._cancel_ds.is_set():
+                    return (0, 0)
+
+        # Date goes first, then '_', then the (possibly AI-renamed) base name.
+        if date_prefix:
+            new_stem = f"{date_prefix}_{new_stem}"
+            name_changed = True
+
+        self._set_ds_status(f"Saving: {new_stem}{src.suffix}  [{where}]")
+        target_dir = out_base
+        if do_organize:
+            target_dir = target_dir / _filetype_folder(src.suffix)
+        try:
+            # Safe to share a non-empty output folder: we only ever CREATE the
+            # filetype subfolder (if missing) and COPY this one extracted file in.
+            # Files already in the output folder are never moved into the new
+            # subfolders, and _unique_output_path guarantees we never overwrite an
+            # existing file (it suffixes _2, _3, …). Originals are copied, not moved.
+            target_dir.mkdir(parents=True, exist_ok=True)
+            out_path = _unique_output_path(target_dir, new_stem, src.suffix)
+            shutil.copy2(src, out_path)
+            return (1, 1 if name_changed else 0)
+        except Exception as exc:
+            failed.append((src.name, str(exc)))
+            return (0, 0)
+
+    def _set_ds_status(self, msg):
+        self.root.after(0, lambda: self._ds_status_var.set(msg))
+
+    def _ds_finish(self, saved, renamed, failed, notes, protected, bad_zips):
+        self._ds_timer.stop()
+        elapsed = self._ds_timer.elapsed_str()
+        self._ds_timer.reset()
+        self._ds_btn.config(state="normal")
+        self._set_cancel_state(self._ds_cancel_btn, False)
+
+        extra = ""
+        if renamed:
+            extra += f"\n{renamed} file(s) renamed."
+        if protected:
+            extra += (f"\n{len(protected)} archive(s) skipped (password-protected): "
+                      + ", ".join(protected))
+        if bad_zips:
+            bad_lines = "\n".join(f"• {n}: {e}" for n, e in bad_zips)
+            extra += f"\n\nArchives that couldn't be extracted:\n{bad_lines}"
+        if notes:
+            note_lines = "\n".join(f"• {n}: {info}" for n, info in notes)
+            extra += f"\n\nKept original names:\n{note_lines}"
+
+        if self._cancel_ds.is_set():
+            self._ds_status_var.set(
+                f"⏹  Cancelled. {saved} file(s) saved before stopping.")
+            messagebox.showinfo(
+                "Document Structuring Cancelled",
+                f"Operation cancelled.\n{saved} file(s) saved before stopping."
+                f"{extra}\n\nTotal time elapsed: {elapsed}",
+            )
+            return
+        if not failed:
+            self._ds_status_var.set(f"✅  Done! {saved} file(s) saved.")
+            messagebox.showinfo(
+                "Document Structuring Complete",
+                f"{saved} file(s) extracted and saved to the output folder.{extra}"
+                f"\n\nTotal time elapsed: {elapsed}",
+            )
+        else:
+            err_lines = "\n".join(f"• {n}: {e}" for n, e in failed)
+            self._ds_status_var.set(f"⚠️  {saved} saved, {len(failed)} failed.")
+            messagebox.showerror(
+                "Document Structuring — Some Files Failed",
+                f"{saved} saved, {len(failed)} failed:{extra}\n\n{err_lines}"
                 f"\n\nTotal time elapsed: {elapsed}",
             )
 
