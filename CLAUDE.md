@@ -49,6 +49,12 @@ Releases are published manually (not via CI):
 3. Create the GitHub release and upload `dist/AllPowerfulFilePrep.exe` as an asset
    via the REST API, using a token obtained from `git credential fill`
    (host `github.com`). `gh` is not installed in this environment.
+4. **Auto-archive the previous stable release.** Immediately after publishing a new
+   stable (non-prerelease) release, set the previously-visible stable release to
+   `draft: true` via the REST API, so only the newest stable release stays public.
+   Invariant: at most one published stable release at a time (prereleases/betas are
+   left visible). Drafting preserves the tag + asset and is reversible. This does
+   **not** apply when cutting a prerelease/beta — those don't archive anything.
 
 ## Architecture
 
