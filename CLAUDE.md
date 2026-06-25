@@ -153,13 +153,16 @@ collisions; files are copied, not moved). Password-protected archives are skippe
 bad/corrupt zips are reported. (Note: Folder Unzipping still *does* require an
 empty output folder — that constraint was removed only from Document Structuring.)
 
-**AI naming backend — currently a SHELL.** The service details live in the
-module-level `_AI_BACKEND` dict and will be baked into the build by the
-developer; **end users never see or configure anything**. While any `PLACEHOLDER`
-value remains, `_ai_backend_ready()` is False, both AI checkboxes (rename and
-date-prefix) render disabled with "(coming soon)", and `_start_ds` refuses any AI
-path (organize-by-filetype still works). Renames apply AI suggestions automatically —
-there is deliberately no per-file approval dialog. The API is called with stdlib
-`urllib` (no SDK dependency; request shape is Azure-OpenAI-style chat
-completions, adjustable when real details arrive) and every step degrades
-gracefully when text extraction yields nothing or the API is unreachable.
+**AI naming backend — credentials come from the environment, never the build.**
+No secret is hardcoded or baked into the source/`.exe`; `_load_ai_backend()`
+reads the endpoint, key, and deployment from environment variables at call time
+(`APFP_AI_ENDPOINT`, `APFP_AI_API_KEY`, `APFP_AI_DEPLOYMENT`, optional
+`APFP_AI_API_VERSION` defaulting to `2024-06-01`). This keeps the shipped binary
+safe to distribute — a malicious reader of the source/binary finds no key to
+exploit. When any required variable is unset, `_ai_backend_ready()` is False,
+both AI checkboxes (rename and date-prefix) render disabled with "(coming soon)",
+and `_start_ds` refuses any AI path (organize-by-filetype still works). Renames
+apply AI suggestions automatically — there is deliberately no per-file approval
+dialog. The API is called with stdlib `urllib` (no SDK dependency; request shape
+is Azure-OpenAI-style chat completions) and every step degrades gracefully when
+text extraction yields nothing or the API is unreachable.

@@ -1507,22 +1507,44 @@ def _email_attachments_to_markdown(src_path: Path, md_out_path: Path) -> int:
 # degrades gracefully when text or the API is unavailable.
 # ─────────────────────────────────────────────
 
-# AI naming backend (SHELL — not live yet). The service details below will be
-# provided later by the developer and baked into this build; end users never
-# see or configure anything. While any PLACEHOLDER value remains,
-# _ai_backend_ready() is False, the AI-naming checkbox is disabled in the UI,
-# and the feature cannot run.
-_AI_BACKEND = {
-    "endpoint":    "https://PLACEHOLDER-ENDPOINT",   # TODO: real endpoint, provided later
-    "api_key":     "PLACEHOLDER_API_KEY",            # TODO: real key, provided later
-    "deployment":  "PLACEHOLDER_DEPLOYMENT",         # TODO: real deployment/model, provided later
-    "api_version": "2024-06-01",
-}
+# AI naming backend. Credentials are NEVER hardcoded or baked into this build —
+# the endpoint, key, and deployment are read at runtime from environment
+# variables so no secret ever exists as plain text in the source or in the
+# shipped .exe. This keeps the build safe to distribute and run on a local
+# laptop: a malicious reader of the source/binary finds no key to exploit. The
+# secret lives only in the OS/user environment (or a secrets manager / launcher
+# script) on machines that are meant to use the feature.
+#
+# Required environment variables (set them outside this build):
+#   APFP_AI_ENDPOINT     e.g. https://my-resource.openai.azure.com
+#   APFP_AI_API_KEY      the Azure OpenAI key
+#   APFP_AI_DEPLOYMENT   the deployment/model name
+#   APFP_AI_API_VERSION  optional; defaults to 2024-06-01
+#
+# When any of the three required variables is unset, _ai_backend_ready() is
+# False, both AI checkboxes render disabled with "(coming soon)", and the
+# feature cannot run.
+_AI_ENV_PREFIX = "APFP_AI_"
+
+
+def _load_ai_backend() -> dict:
+    """Read the AI backend config from the environment at call time. Returns a
+    dict with the keys the request helpers expect; required values are '' when
+    unset. No secret is ever stored in source or this module — it only reads
+    os.environ on demand."""
+    return {
+        "endpoint":    os.environ.get(_AI_ENV_PREFIX + "ENDPOINT", "").strip().rstrip("/"),
+        "api_key":     os.environ.get(_AI_ENV_PREFIX + "API_KEY", "").strip(),
+        "deployment":  os.environ.get(_AI_ENV_PREFIX + "DEPLOYMENT", "").strip(),
+        "api_version": os.environ.get(_AI_ENV_PREFIX + "API_VERSION", "").strip() or "2024-06-01",
+    }
 
 
 def _ai_backend_ready() -> bool:
-    """True once the developer has replaced every PLACEHOLDER in _AI_BACKEND."""
-    return not any("PLACEHOLDER" in str(v) for v in _AI_BACKEND.values())
+    """True only when the endpoint, key, and deployment are all present in the
+    environment. The credentials live entirely outside this build."""
+    cfg = _load_ai_backend()
+    return all(cfg[k] for k in ("endpoint", "api_key", "deployment"))
 
 
 def _extract_document_text(src_path: Path, limit: int = 1500) -> str:
@@ -4838,9 +4860,9 @@ class ConverterApp:
 
         cfg = None
         if do_rename or do_date:
-            # Hard gate: the AI backend is a shell until the real service
-            # details are baked in. The checkboxes are disabled too; this guard
-            # is belt-and-braces.
+            # Hard gate: the AI backend is unavailable unless its credentials are
+            # present in the environment (never baked into this build). The
+            # checkboxes are disabled too; this guard is belt-and-braces.
             if not _ai_backend_ready():
                 messagebox.showinfo(
                     "AI Features Not Available Yet",
@@ -4848,7 +4870,7 @@ class ConverterApp:
                     "aren't available in this version yet. Organizing into folders "
                     "by file type still works.")
                 return
-            cfg = _AI_BACKEND
+            cfg = _load_ai_backend()
 
         # Snapshot the job on the main thread — the worker must not read Tk vars.
         self._ds_job = {
