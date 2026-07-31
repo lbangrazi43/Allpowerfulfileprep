@@ -39,11 +39,6 @@ except ImportError:
 # Outlook COM conversion
 # ─────────────────────────────────────────────
 
-# Outlook constants
-olFolderInbox      = 6
-olMsg              = 3      # .msg save format
-PR_ATTACH_METHOD   = 0x37200003
-
 def _ensure_outlook():
     """Return an Outlook Application COM object, raising clearly if unavailable."""
     if not HAS_COM:
@@ -81,7 +76,6 @@ def _save_eml_attachments(src_path: Path, out_path: Path):
     import email as emaillib
     import email.policy
     from email.header import decode_header, make_header
-    import base64
 
     def decode_str(value):
         if not value:
@@ -156,8 +150,8 @@ def _save_msg_attachments(mail, out_path: Path) -> int:
         try:
             att = attachments.Item(i)
 
-            # PR_ATTACH_METHOD: 5 = OLE object (skip), 6 = embedded message
-            # Type 5/6 are rarely useful as files; skip them
+            # Attachment type 5 = OLE object, 6 = embedded message.
+            # Rarely useful as standalone files; skip them.
             try:
                 att_type = att.Type
                 if att_type in (5, 6):
@@ -423,7 +417,7 @@ def _parse_eml_to_html(src_path: Path) -> str:
     return _inject_print_css(full_html)
 
 
-def _eml_to_pdf(src_path: Path, out_path: Path, outlook, word):
+def _eml_to_pdf(src_path: Path, out_path: Path, word):
     """
     Convert a .eml file to PDF and extract attachments.
     Parses the .eml directly in Python (no Outlook involvement) then
@@ -628,20 +622,6 @@ def _mail_to_pdf_via_word(mail, out_path: Path, word) -> bool:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _ensure_word():
-    """
-    Launch a hidden Word Application COM instance.
-    Returns the COM object, or None if Word is not installed.
-    """
-    try:
-        w = win32com.client.Dispatch("Word.Application")
-        w.Visible = False
-        w.DisplayAlerts = False
-        return w
-    except Exception:
-        return None
-
-
 def _print_mail_to_pdf(mail, out_path: Path, word):
     """
     Convert an open Outlook mail item to PDF.
@@ -679,19 +659,6 @@ def _print_mail_to_pdf(mail, out_path: Path, word):
     )
 
 
-def _ensure_visio():
-    """
-    Launch a hidden Visio Application COM instance.
-    Returns the COM object, or None if Visio is not installed.
-    """
-    try:
-        v = win32com.client.Dispatch("Visio.Application")
-        v.Visible = False
-        return v
-    except Exception:
-        return None
-
-
 def _visio_to_pdf(src_path: Path, out_path: Path, visio):
     """
     Convert a .vsd or .vsdx file to PDF via Visio COM.
@@ -723,20 +690,6 @@ def _visio_to_pdf(src_path: Path, out_path: Path, visio):
                 doc.Close()
             except Exception:
                 pass
-
-
-def _ensure_excel():
-    """
-    Launch a hidden Excel Application COM instance.
-    Returns the COM object, or None if Excel is not installed.
-    """
-    try:
-        xl = win32com.client.Dispatch("Excel.Application")
-        xl.Visible = False
-        xl.DisplayAlerts = False
-        return xl
-    except Exception:
-        return None
 
 
 def _fit_excel_sheets_to_page(wb, excel):
@@ -874,19 +827,158 @@ def _word_to_pdf(src_path: Path, out_path: Path, word):
                 pass
 
 
-def _ensure_powerpoint():
+# Plain-text report dumps produced by legacy / ERP / mainframe systems. Word
+# picks an importer by extension and has none registered for these, so they go
+# through a temp .txt copy (see _text_report_to_pdf).
+TEXT_REPORT_EXTS = (".rep", ".rpt", ".prn", ".lst")
+
+# Consolas' advance width is ~0.55 em, so N characters at F points occupy about
+# N * 0.55 * F points. Used to pick a font size that fits the widest line.
+_MONO_ADVANCE     = 0.55
+_REPORT_FONT_MIN  = 5.0
+_REPORT_FONT_MAX  = 11.0
+# Wider than this many columns and the report gets a landscape page before we
+# start shrinking type — a readable landscape report beats a 6pt portrait one.
+_REPORT_LANDSCAPE_COLS = 96
+
+
+def _looks_binary(raw: bytes) -> bool:
+    """True if a byte sample is not plausibly plain text.
+
+    Report dumps are ASCII, so a NUL byte means we were handed a binary file
+    wearing a report extension — a compiled Crystal Reports .rpt, say. Pushing
+    one through Word would emit pages of mojibake instead of failing, so
+    callers reject it up front.
     """
-    Launch a hidden PowerPoint Application COM instance.
-    Returns the COM object, or None if PowerPoint is not installed.
+    if b"\x00" in raw:
+        return True
+    if not raw:
+        return False
+    # Tab/BS/LF/FF/CR/ESC plus printable ASCII, and any high byte (code pages).
+    textish = bytes((7, 8, 9, 10, 12, 13, 27)) + bytes(range(0x20, 0x100))
+    return sum(b not in textish for b in raw) / len(raw) > 0.30
+
+
+def _read_report_text(src_path: Path) -> str:
+    """Decode a report dump, tolerating the code pages legacy systems emit."""
+    raw = src_path.read_bytes()
+    if _looks_binary(raw[:8192]):
+        raise RuntimeError(
+            f"{src_path.name} looks like a binary file, not a plain-text report. "
+            "Only text report dumps can be converted."
+        )
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1", errors="replace")
+
+
+def _fit_report_to_page(doc, word, longest_line):
+    """Lay an imported report out so no line wraps.
+
+    Word imports plain text in the Normal style — a proportional font with
+    paragraph spacing — which destroys the column alignment a fixed-width
+    report depends on. This forces monospace, removes the inter-line spacing
+    that would otherwise double-space the whole report, and sizes the page and
+    type to the widest line.
     """
+    wdOrientLandscape = 1
+    wdLineSpaceSingle = 0
+
     try:
-        ppt = win32com.client.Dispatch("PowerPoint.Application")
-        # PowerPoint doesn't support Visible=False the same way;
-        # minimise the window instead so it doesn't steal focus
-        ppt.WindowState = 2   # ppWindowMinimized
-        return ppt
+        doc.Content.Font.Name = "Consolas"
     except Exception:
-        return None
+        pass
+
+    # Word's Normal style adds space between paragraphs; every report line is
+    # its own paragraph, so without this the output is double-spaced.
+    try:
+        pf = doc.Content.ParagraphFormat
+        pf.SpaceBefore = 0
+        pf.SpaceAfter = 0
+        pf.LineSpacingRule = wdLineSpaceSingle
+    except Exception:
+        pass
+
+    try:
+        for section in doc.Sections:
+            ps = section.PageSetup
+            if longest_line > _REPORT_LANDSCAPE_COLS:
+                ps.Orientation = wdOrientLandscape
+            ps.LeftMargin = ps.RightMargin = word.InchesToPoints(0.4)
+            ps.TopMargin = ps.BottomMargin = word.InchesToPoints(0.4)
+    except Exception:
+        pass
+
+    if longest_line <= 0:
+        return
+    try:
+        ps = doc.Sections(1).PageSetup
+        printable = ps.PageWidth - ps.LeftMargin - ps.RightMargin
+        size = printable / (_MONO_ADVANCE * longest_line)
+        doc.Content.Font.Size = round(
+            max(_REPORT_FONT_MIN, min(_REPORT_FONT_MAX, size)), 1)
+    except Exception:
+        pass
+
+
+def _text_report_to_pdf(src_path: Path, out_path: Path, word):
+    """Convert a plain-text report dump to PDF via Word COM.
+
+    Handles TEXT_REPORT_EXTS and extensionless text files. The text is copied
+    to a temp .txt because that is the only reliable way to get Word to open
+    an unknown extension as plain text rather than running format detection.
+    Form feeds are left intact — Word maps them to page breaks, so the
+    report's own pagination survives into the PDF.
+    """
+    if word is None:
+        raise RuntimeError(
+            "Microsoft Word is required to convert text reports.\n"
+            "Please ensure Word is installed."
+        )
+
+    text = _read_report_text(src_path)
+    longest = max((len(ln.rstrip("\r")) for ln in text.split("\n")), default=0)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="apfp_report_"))
+    tmp_txt = tmp_dir / ((src_path.stem or "report") + ".txt")
+    doc = None
+    try:
+        # Write the BOM so Word detects UTF-8 instead of guessing a code page.
+        tmp_txt.write_text(text, encoding="utf-8-sig", newline="")
+        doc = word.Documents.Open(
+            str(tmp_txt.resolve()),
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+        )
+        _fit_report_to_page(doc, word, longest)
+        doc.ExportAsFixedFormat(
+            OutputFileName=str(out_path.resolve()),
+            ExportFormat=17,        # wdExportFormatPDF
+            OpenAfterExport=False,
+            OptimizeFor=0,          # wdExportOptimizeForPrint
+            Range=0,                # wdExportAllDocument
+            Item=0,                 # wdExportDocumentContent
+            IncludeDocProps=True,
+            KeepIRM=True,
+            CreateBookmarks=0,
+            DocStructureTags=True,
+            BitmapMissingFonts=True,
+            UseISO19005_1=False,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Text report to PDF conversion failed: {e}")
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=False)
+            except Exception:
+                pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _ppt_to_pdf(src_path: Path, out_path: Path, powerpoint):
@@ -1092,6 +1184,45 @@ def _terminate_pid(pid: int):
 OFFICE_FILE_TIMEOUT = 300   # 5 minutes
 
 
+class _FileWatchdog:
+    """Bounds one file's conversion so a single stuck file can't hang a batch.
+
+    Used as a context manager around a single `convert`/`modernize` call. If the
+    body hasn't finished within OFFICE_FILE_TIMEOUT the tracked PIDs — which are
+    only ever the instances *we* launched — are force-killed, which makes the
+    blocked COM call raise so the loop can record a failure and move on.
+
+    `fired` lets the caller report "timed out" instead of the incidental COM
+    error the kill produced. With no PIDs to kill (e.g. a PowerPoint that
+    attached to the user's own instance) the watchdog stays inert rather than
+    risk touching a process we didn't start.
+    """
+
+    def __init__(self, pids):
+        self._pids = set(pids or ())
+        self._done = threading.Event()
+        self._thread = None
+        self.fired = False
+
+    def __enter__(self):
+        if self._pids:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def _run(self):
+        if not self._done.wait(OFFICE_FILE_TIMEOUT):
+            self.fired = True
+            for pid in self._pids:
+                _terminate_pid(pid)
+
+    def __exit__(self, *exc_info):
+        self._done.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        return False
+
+
 def _launch_office_isolated(family: str):
     """Launch a DEDICATED, isolated Office instance for `family` via DispatchEx
     and return (app, pids). `pids` is the set of newly-created Office process
@@ -1132,18 +1263,30 @@ def _launch_office_isolated(family: str):
                          ("ConfirmConversions", False),
                          ("DoNotPromptForConvert", True),
                          ("WarnBeforeSavingPrintingSendingMarkup", False),
-                         ("SaveNormalPrompt", False)):
+                         ("SaveNormalPrompt", False),
+                         # Background repagination reflows the document on every
+                         # edit we make while fitting it to the page. Export
+                         # repaginates anyway, so this is pure wasted work.
+                         ("Pagination", False)):
             try:
                 setattr(app.Options, opt, val)
             except Exception:
                 pass
     elif family == "excel":
         for prop, val in (("AskToUpdateLinks", False),
-                          ("AlertBeforeOverwriting", False)):
+                          ("AlertBeforeOverwriting", False),
+                          # Stop workbook event handlers (Workbook_Open and
+                          # friends) from running in our hidden instance.
+                          ("EnableEvents", False)):
             try:
                 setattr(app, prop, val)
             except Exception:
                 pass
+    # Nothing is on screen in a hidden instance, so painting is wasted time.
+    try:
+        app.ScreenUpdating = False
+    except Exception:
+        pass
     pids = _office_pids(exe) - before
     return app, pids
 
@@ -1245,13 +1388,26 @@ def _office_is_encrypted(src_path: Path) -> bool:
         return False
 
 
+# The only formats that can carry open-password encryption: the Office
+# containers msoffcrypto understands, plus ZIP archives. Checking anything else
+# means opening and parsing a file that can never be protected, which is pure
+# overhead on batches of images, text, or email.
+ENCRYPTABLE_EXTS = PWD_EXTS | {".zip"}
+
+
 def _is_password_protected(src_path: Path) -> bool:
     """True if `src_path` is locked with a password and therefore can't be
     processed by the other tools. Covers password-encrypted Office files
     (.docx/.xlsx/.pptx and legacy .doc/.xls/.ppt) and password-encrypted ZIPs.
     Best-effort and never raises — anything unrecognized is treated as not
     protected. Used by every tool EXCEPT Password Removal to skip such files and
-    point the user at the Password Removal tool."""
+    point the user at the Password Removal tool.
+
+    Judged by extension first, so a protected file given a misleading extension
+    (an encrypted .docx renamed to .txt) reads as unprotected — it would fail
+    later in conversion anyway, and every tool already filters by extension."""
+    if src_path.suffix.lower() not in ENCRYPTABLE_EXTS:
+        return False
     try:
         if _office_is_encrypted(src_path):
             return True
@@ -1682,7 +1838,8 @@ def _filetype_folder(ext: str) -> str:
 def convert_file(src_path: Path, out_dir: Path, outlook, word, visio, excel, powerpoint, mode: str) -> Path:
     """
     Convert a single file to PDF.
-    mode: 'email', 'html', 'visio', 'excel', 'word_doc', 'powerpoint', 'image'
+    mode: 'email', 'html', 'visio', 'excel', 'word_doc', 'powerpoint', 'image',
+          'text_report'
     Returns the path of the created PDF. Never overwrites an existing PDF.
     """
     ext = src_path.suffix.lower()
@@ -1692,7 +1849,7 @@ def convert_file(src_path: Path, out_dir: Path, outlook, word, visio, excel, pow
         if ext == ".msg":
             _msg_to_pdf(src_path, out_path, outlook, word)
         elif ext == ".eml":
-            _eml_to_pdf(src_path, out_path, outlook, word)
+            _eml_to_pdf(src_path, out_path, word)
         else:
             raise ValueError(f"Unsupported file type for Email mode: {ext}")
     elif mode == "html":
@@ -1703,6 +1860,8 @@ def convert_file(src_path: Path, out_dir: Path, outlook, word, visio, excel, pow
         _excel_to_pdf(src_path, out_path, excel)
     elif mode == "word_doc":
         _word_to_pdf(src_path, out_path, word)
+    elif mode == "text_report":
+        _text_report_to_pdf(src_path, out_path, word)
     elif mode == "powerpoint":
         _ppt_to_pdf(src_path, out_path, powerpoint)
     elif mode == "image":
@@ -1874,6 +2033,8 @@ AUTO_PDF_EXTS = {
     ".txt": "word_doc",   ".rtf": "word_doc",  ".xml": "word_doc",
     ".ppt": "powerpoint", ".pptx": "powerpoint",
     ".pps": "powerpoint", ".ppsx": "powerpoint",
+    ".rep": "text_report", ".rpt": "text_report",
+    ".prn": "text_report", ".lst": "text_report",
     ".jpg": "image",      ".jpeg": "image",   ".png": "image",
     ".bmp": "image",      ".gif": "image",    ".tiff": "image",  ".tif": "image",
 }
@@ -1890,7 +2051,10 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
     Existing .pdf files are always skipped and never deleted.
     The original is deleted ONLY if the output PDF exists and has non-zero size.
     Returns a list of filenames that could not be converted.
-    COM applications are initialized lazily and quit when done.
+
+    Office applications are launched lazily as DEDICATED, isolated instances and
+    only those are quit at the end — the user's own open Office windows are
+    never hidden, driven, or closed.
     """
     if not HAS_COM:
         status_cb("Auto-PDF skipped: pywin32 is not installed.")
@@ -1898,7 +2062,25 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
 
     pdf_failed = []
     pythoncom.CoInitialize()
-    word = excel = visio = powerpoint = outlook = None
+    apps = {}          # family -> COM app (None when that Office app is missing)
+    app_pids = set()   # PIDs of ONLY the instances we launched
+    outlook = None
+
+    def _app(family):
+        """Lazily launch a dedicated instance for `family`, tracking its PID.
+
+        Must go through _launch_office_isolated: a plain Dispatch() attaches to
+        the user's already-open Office window, which we would then hide and —
+        with alerts suppressed — Quit at the end, discarding their unsaved work.
+        """
+        if family not in apps:
+            try:
+                app_obj, pids = _launch_office_isolated(family)
+            except Exception:
+                app_obj, pids = None, set()
+            apps[family] = app_obj
+            app_pids.update(pids)
+        return apps[family]
 
     try:
         # Hard safeguard: auto-PDF may only ever delete files that were actually
@@ -1924,59 +2106,46 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
                     continue
                 ext = src.suffix.lower()
 
-                if ext == "":
-                    # No extension — treat as plain text via a temp .txt copy so
-                    # Word opens it without a format-detection dialog.
+                extensionless = (ext == "")
+                if extensionless:
+                    # No extension — treat as a plain-text report. The converter
+                    # makes its own temp .txt copy so Word opens it without a
+                    # format-detection dialog, and rejects binaries cleanly.
+                    mode = "text_report"
                     status_cb(f"Auto-PDF ({i + 1}/{total}): {src.name}  (no extension, treating as text)")
-                    tmp_txt = src.parent / (src.name + ".txt")
-                    out_path = _unique_pdf_path(src.parent, src.name)
-                    try:
-                        if word is None:
-                            word = _ensure_word()
-                        shutil.copy2(str(src), str(tmp_txt))
-                        _word_to_pdf(tmp_txt, out_path, word)
-                        if out_path.exists() and out_path.stat().st_size > 0:
-                            _delete_original_file(src, originals)
-                            converted += 1
-                        else:
-                            pdf_failed.append(src.name)
-                    except Exception:
-                        pdf_failed.append(src.name)
-                    finally:
-                        try:
-                            tmp_txt.unlink()
-                        except Exception:
-                            pass
-                    continue
+                else:
+                    mode = AUTO_PDF_EXTS[ext]
+                    status_cb(f"Auto-PDF ({i + 1}/{total}): {src.name}")
+                out_path = None
 
-                mode = AUTO_PDF_EXTS[ext]
-                status_cb(f"Auto-PDF ({i + 1}/{total}): {src.name}")
+                # Bound each file so one stuck conversion can't hang the batch.
+                wd = _FileWatchdog(app_pids)
                 try:
-                    if mode == "image":
-                        if word is None:
-                            word = _ensure_word()
-                        out_path = _unique_pdf_path(src.parent, src.stem)
-                        _image_to_pdf(src, out_path, word)
-                    else:
-                        if mode in ("word_doc", "html") and word is None:
-                            word = _ensure_word()
-                        if mode == "excel" and excel is None:
-                            excel = _ensure_excel()
-                        if mode == "visio" and visio is None:
-                            visio = _ensure_visio()
-                        if mode == "powerpoint" and powerpoint is None:
-                            powerpoint = _ensure_powerpoint()
-                        if mode == "email":
-                            if outlook is None:
+                    with wd:
+                        if extensionless:
+                            # Converted directly rather than through convert_file
+                            # so the PDF keeps the full name — these files have
+                            # no stem to name it after.
+                            out_path = _unique_pdf_path(src.parent, src.name)
+                            _text_report_to_pdf(src, out_path, _app("word"))
+                        elif mode == "image":
+                            out_path = _unique_pdf_path(src.parent, src.stem)
+                            _image_to_pdf(src, out_path, _app("word"))
+                        else:
+                            if mode == "email" and outlook is None:
                                 outlook = _ensure_outlook()
-                            if word is None:
-                                word = _ensure_word()
-                        out_path = convert_file(
-                            src, src.parent, outlook, word, visio, excel, powerpoint, mode
-                        )
+                            out_path = convert_file(
+                                src, src.parent, outlook,
+                                _app("word") if mode in ("word_doc", "html",
+                                                         "text_report", "email") else None,
+                                _app("visio") if mode == "visio" else None,
+                                _app("excel") if mode == "excel" else None,
+                                _app("powerpoint") if mode == "powerpoint" else None,
+                                mode,
+                            )
 
                     # Only delete the original if the PDF was actually written
-                    if out_path.exists() and out_path.stat().st_size > 0:
+                    if out_path is not None and out_path.exists() and out_path.stat().st_size > 0:
                         _delete_original_file(src, originals)
                         converted += 1
                     else:
@@ -1984,15 +2153,25 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
                 except Exception:
                     pdf_failed.append(src.name)
 
+                # The watchdog killed our instances — drop them so the next file
+                # lazily launches fresh, healthy ones.
+                if wd.fired:
+                    apps.clear()
+                    app_pids.clear()
+
             status_cb(f"Auto-PDF done: {converted}/{total} file(s) converted.")
 
     finally:
-        for app in (word, excel, visio, powerpoint):
+        # Quit only the instances we launched, then make sure none linger (e.g.
+        # after a watchdog kill). Outlook is the user's mail client: never quit.
+        for app in apps.values():
             if app is not None:
                 try:
                     app.Quit()
                 except Exception:
                     pass
+        for pid in app_pids:
+            _terminate_pid(pid)
         try:
             pythoncom.CoUninitialize()
         except Exception:
@@ -2547,7 +2726,7 @@ class _SplashScreen:
     NAVY, GREEN, BG = "#073b5e", "#9aca3c", "#ffffff"
 
     def __init__(self, root):
-        from PIL import Image, ImageTk
+        from PIL import ImageTk
         self.root = root
         self.win = tk.Toplevel(root)
         self.win.overrideredirect(True)          # no title bar / borders
@@ -2852,7 +3031,7 @@ class ConverterApp:
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "AllPowerfulFilePrep.App")
+                "BoxOfScraps.App")
         except Exception:
             pass
 
@@ -2872,7 +3051,7 @@ class ConverterApp:
         # paint — so the blank Tk window never flashes on screen at launch.
         self.root.withdraw()
 
-        self.root.title("File Preparation Toolkit")
+        self.root.title("Box of Scraps")
         self.root.resizable(True, True)
         self.root.minsize(860, 600)
         self.root.configure(bg=APP_BG)
@@ -2936,7 +3115,6 @@ class ConverterApp:
         self._ds_organize = tk.BooleanVar(value=True)
 
         # Navigation state
-        self._active_page = None
         self._page_frames = {}
         self._nav_buttons = {}
 
@@ -3055,7 +3233,7 @@ class ConverterApp:
 
         tk.Label(
             self._sidebar,
-            text="All Powerful\nFile Prep",
+            text="Box of\nScraps",
             bg=SIDEBAR_BG, fg="#ffffff",
             font=("Segoe UI", 11, "bold"),
             justify="center", pady=20,
@@ -3090,7 +3268,6 @@ class ConverterApp:
         for btn in self._nav_buttons.values():
             btn.config(bg=SIDEBAR_BG, fg=SIDEBAR_FG)
         self._nav_buttons[key].config(bg=SIDEBAR_SEL, fg="#ffffff")
-        self._active_page = key
 
         for frame in self._page_frames.values():
             frame.pack_forget()
@@ -3176,7 +3353,14 @@ class ConverterApp:
         mode_menu = _ModernDropdown(
             mode_frame,
             textvariable=self._mode,
-            values=["Email (.eml, .msg)", "HTML (.html, .htm, .mht)", "Visio (.vsd, .vsdx)", "Excel (.xls, .xlsx, .csv)", "Word (.doc, .docx, .txt, .rtf, .xml)", "PowerPoint (.ppt, .pptx)", "Image (.jpg, .png, .bmp, .gif, .tiff)"],
+            values=["Email (.eml, .msg)",
+                    "Text Report (.rep, .rpt, .prn, .lst)",
+                    "HTML (.html, .htm, .mht)",
+                    "Image (.jpg, .png, .bmp, .gif, .tiff)",
+                    "Word (.doc, .docx, .txt, .rtf, .xml)",
+                    "Excel (.xls, .xlsx, .csv)",
+                    "PowerPoint (.ppt, .pptx)",
+                    "Visio (.vsd, .vsdx)"],
             command=self._on_mode_change,
             width=26,
             font=("Segoe UI", 9),
@@ -4150,25 +4334,13 @@ class ConverterApp:
                 out_dir = self._office_out_dir if self._office_out_dir else src.parent
                 out_path = _unique_output_path(out_dir, src.stem, out_ext)
 
-                # Watchdog: if this file isn't done within OFFICE_FILE_TIMEOUT,
-                # assume its dedicated instance is stuck on a hidden dialog and
-                # force-kill it so the batch can skip this file and continue.
-                pids = set(self._office_app_pids.get(family) or ())
-                timed_out = {"v": False}
-                done = threading.Event()
-
-                def _watchdog(pids=pids, timed_out=timed_out, done=done):
-                    if not pids:
-                        return   # nothing we can safely kill (e.g. shared PowerPoint)
-                    if not done.wait(OFFICE_FILE_TIMEOUT):
-                        timed_out["v"] = True
-                        for p in pids:
-                            _terminate_pid(p)
-
-                wd = threading.Thread(target=_watchdog, daemon=True)
-                wd.start()
+                # Bound this file: if it isn't done within OFFICE_FILE_TIMEOUT
+                # its dedicated instance is assumed stuck on a hidden dialog and
+                # force-killed, so the batch can skip it and continue.
+                wd = _FileWatchdog(self._office_app_pids.get(family))
                 try:
-                    _modernize_office_file(src, out_path, family, fmt, apps[family])
+                    with wd:
+                        _modernize_office_file(src, out_path, family, fmt, apps[family])
                     converted += 1
                     if delete_orig:
                         _delete_original_file(src, originals)
@@ -4183,17 +4355,14 @@ class ConverterApp:
                         pass
                     if self._cancel_office.is_set():
                         pass                       # user cancelled — not a failure
-                    elif timed_out["v"]:
+                    elif wd.fired:
                         failed.append((src.name, "timed out — appeared stuck, skipped"))
                     else:
                         failed.append((src.name, str(exc)))
-                finally:
-                    done.set()
-                    wd.join(timeout=2)
 
                 # If the watchdog killed the instance, drop it so the next file
                 # of this family gets a fresh, healthy one.
-                if timed_out["v"]:
+                if wd.fired:
                     apps[family] = None
                     ensured[family] = False
                     self._office_app_pids.pop(family, None)
@@ -5081,6 +5250,8 @@ class ConverterApp:
             return (".ppt", ".pptx", ".pps", ".ppsx")
         if m.startswith("Image"):
             return (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif")
+        if m.startswith("Text Report"):
+            return TEXT_REPORT_EXTS
         return (".eml", ".msg")
 
     def _on_mode_change(self, event=None):
@@ -5109,6 +5280,9 @@ class ConverterApp:
         elif m.startswith("Image"):
             filetypes = [("Image files", "*.jpg *.jpeg *.png *.bmp *.gif *.tiff *.tif"), ("All files", "*.*")]
             title = "Select image files"
+        elif m.startswith("Text Report"):
+            filetypes = [("Text report files", "*.rep *.rpt *.prn *.lst"), ("All files", "*.*")]
+            title = "Select text report files"
         else:
             filetypes = [("Email files", "*.eml *.msg"), ("All files", "*.*")]
             title = "Select email files"
@@ -5158,6 +5332,8 @@ class ConverterApp:
             self.drop_label.config(text="Drop .ppt / .pptx files here\nor click 'Add Files'")
         elif self._mode.get().startswith("Image"):
             self.drop_label.config(text="Drop image files here\nor click 'Add Files'")
+        elif self._mode.get().startswith("Text Report"):
+            self.drop_label.config(text="Drop .rep / .rpt / .prn / .lst files here\nor click 'Add Files'")
         else:
             self.drop_label.config(text="Drop .eml / .msg files here\nor click 'Add Files'")
 
@@ -5198,6 +5374,7 @@ class ConverterApp:
             elif m.startswith("Word"):       label = "Word / text"
             elif m.startswith("PowerPoint"): label = "PowerPoint"
             elif m.startswith("Image"):      label = "image"
+            elif m.startswith("Text Report"): label = "text report"
             else:                            label = "email"
             messagebox.showwarning("No Files", f"Please add {label} files first.")
             return
@@ -5216,7 +5393,9 @@ class ConverterApp:
         word_mode   = m.startswith("Word")
         ppt_mode    = m.startswith("PowerPoint")
         image_mode  = m.startswith("Image")
-        email_mode  = not any([html_mode, visio_mode, excel_mode, word_mode, ppt_mode, image_mode])
+        report_mode = m.startswith("Text Report")
+        email_mode  = not any([html_mode, visio_mode, excel_mode, word_mode,
+                               ppt_mode, image_mode, report_mode])
 
         pythoncom.CoInitialize()
         self._pdf_app_pids = []
@@ -5251,13 +5430,14 @@ class ConverterApp:
                     _abort("Outlook Error", str(exc))
                     return
 
-            # Word — email, HTML, Word doc, and image modes
-            if email_mode or html_mode or word_mode or image_mode:
+            # Word — email, HTML, Word doc, image, and text report modes
+            if email_mode or html_mode or word_mode or image_mode or report_mode:
                 word = _launch("word")
-                if word is None and (html_mode or word_mode or image_mode):
-                    if html_mode:    label = "HTML"
-                    elif image_mode: label = "Image"
-                    else:            label = "Word document"
+                if word is None and (html_mode or word_mode or image_mode or report_mode):
+                    if html_mode:     label = "HTML"
+                    elif image_mode:  label = "Image"
+                    elif report_mode: label = "text report"
+                    else:             label = "Word document"
                     _abort("Word Not Found",
                            f"Microsoft Word is required for {label} conversion.\n"
                            "Please ensure Word is installed.")
@@ -5294,7 +5474,15 @@ class ConverterApp:
             elif word_mode:     mode_key = "word_doc"
             elif ppt_mode:      mode_key = "powerpoint"
             elif image_mode:    mode_key = "image"
+            elif report_mode:   mode_key = "text_report"
             else:               mode_key = "email"
+
+            # The one isolated Office app this mode drives — the app the
+            # per-file watchdog may have to kill and replace. (Email mode also
+            # uses Outlook, but that is the user's mail client: shared, never
+            # tracked, never killed.)
+            family = {"visio": "visio", "excel": "excel",
+                      "powerpoint": "powerpoint"}.get(mode_key, "word")
 
             for i, src in enumerate(self.files):
                 if self._cancel_convert.is_set():
@@ -5309,8 +5497,12 @@ class ConverterApp:
                 self._pdf_tracker.begin_item()
                 out_dir = self._out_dir if self._out_dir else src.parent
                 out_path = _unique_pdf_path(out_dir, src.stem)
+                # Bound this file so one stuck conversion can't hang the batch.
+                wd = _FileWatchdog(self._pdf_app_pids)
                 try:
-                    convert_file(src, out_dir, outlook, word, visio, excel, powerpoint, mode_key)
+                    with wd:
+                        convert_file(src, out_dir, outlook, word, visio,
+                                     excel, powerpoint, mode_key)
                     success += 1
                 except Exception as exc:
                     # Drop any partial PDF a force-kill may have left behind.
@@ -5319,8 +5511,23 @@ class ConverterApp:
                             out_path.unlink()
                     except Exception:
                         pass
-                    if not self._cancel_convert.is_set():
+                    if self._cancel_convert.is_set():
+                        pass                    # user cancelled — not a failure
+                    elif wd.fired:
+                        failed.append((src.name, "timed out — appeared stuck, skipped"))
+                    else:
                         failed.append((src.name, str(exc)))
+
+                # The watchdog killed our instance — stand up a fresh one so the
+                # rest of the batch still has a healthy app to work with.
+                if wd.fired and not self._cancel_convert.is_set():
+                    self._pdf_app_pids = []
+                    replacement = _launch(family)
+                    if   family == "excel":      excel = replacement
+                    elif family == "visio":      visio = replacement
+                    elif family == "powerpoint": powerpoint = replacement
+                    else:                        word = replacement
+
                 self._pdf_tracker.complete_item()
         finally:
             # Quit our dedicated Office instances, then make sure none linger

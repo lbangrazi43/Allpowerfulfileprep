@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-"All Powerful File Prep" — a Windows desktop file-preparation toolkit. Single-file
+"Box of Scraps" — a Windows desktop file-preparation toolkit. Single-file
 Python/Tkinter GUI shipped as a one-file PyInstaller `.exe`. Windows-only: most
 features drive Microsoft Office through COM automation (`win32com`) and use Win32
 APIs via `ctypes`. The entire application lives in **`File.py`** (~4,000 lines);
@@ -21,8 +21,8 @@ python -m py_compile File.py
 
 # Build the one-file exe. Use the GLOBAL Python 3.12 — it has PyInstaller AND the
 # bundled deps; the .venv has the runtime deps but NOT PyInstaller.
-py -3.12 -m PyInstaller --noconfirm AllPowerfulFilePrep.spec
-# -> dist/AllPowerfulFilePrep.exe
+py -3.12 -m PyInstaller --noconfirm BoxOfScraps.spec
+# -> dist/BoxOfScraps.exe
 # If `build/` triggers a OneDrive PermissionError, delete the build/ folder first
 # rather than passing --clean.
 
@@ -46,7 +46,7 @@ their whole run and avoid `CoUninitialize()` between Office launches.
 Releases are published manually (not via CI):
 1. Build the exe with the command above (confirm `PYI_EXIT=0`).
 2. Commit on `main` with a `Co-Authored-By:` trailer; tag `vX.Y.Z`; push both.
-3. Create the GitHub release and upload `dist/AllPowerfulFilePrep.exe` as an asset
+3. Create the GitHub release and upload `dist/BoxOfScraps.exe` as an asset
    via the REST API, using a token obtained from `git credential fill`
    (host `github.com`). `gh` is not installed in this environment.
 4. **Auto-archive the previous stable release.** Immediately after publishing a new
@@ -84,12 +84,30 @@ the tools launch a **dedicated, isolated instance** via
 /after so it learns the PID of *only the instance it started*). This is what lets
 Cancel and the per-file watchdog force-kill a stuck conversion with
 `_terminate_pid(pid)` **without ever touching the user's own open Office
-windows** — a hard requirement throughout. `OFFICE_FILE_TIMEOUT` (300s) bounds a
-single hung file. `_launch_office_isolated` also disables macros and pre-answers
-the modal prompts (update-links, convert, overwrite) that otherwise hang a hidden
-instance. PowerPoint can attach to the user's existing instance (no new PID) and
-is then deliberately never killed; Outlook is the user's mail client and is never
-killed either.
+windows** — a hard requirement throughout. `_launch_office_isolated` also disables
+macros, pre-answers the modal prompts (update-links, convert, overwrite) that
+otherwise hang a hidden instance, and turns off the work that is pointless in an
+invisible app (`ScreenUpdating`, Word background `Pagination`, Excel
+`EnableEvents`). PowerPoint can attach to the user's existing instance (no new
+PID) and is then deliberately never killed; Outlook is the user's mail client and
+is never killed either.
+
+**Every worker that drives Office must go through `_launch_office_isolated` —
+never a bare `Dispatch`.** `Dispatch` *attaches to the user's already-open Office
+window*; the worker then hides it, drives it, and quits it at the end with alerts
+suppressed, silently discarding their unsaved work. (Auto-PDF did exactly this
+until it was fixed to use isolated instances.) A helper that launches Office
+without returning PIDs to track is a bug, not a shortcut.
+
+**`_FileWatchdog` bounds a single file** so one stuck conversion can't hang a
+batch. Used as a context manager around each file by all three conversion workers
+(`_convert_worker`, `_office_worker`, `_auto_pdf_scan_and_convert`); after
+`OFFICE_FILE_TIMEOUT` (300s) it force-kills the tracked PIDs, which makes the
+blocked COM call raise so the loop records a failure and continues. `fired`
+distinguishes a timeout from a real conversion error. With no PIDs to kill (a
+PowerPoint that attached to the user's instance) it stays inert rather than risk
+a process we didn't start. Each worker replaces the killed instance before the
+next file.
 
 **Password Removal uses pure-Python `msoffcrypto`, NOT COM — on purpose.** Excel's
 COM `Workbooks.Open` pops a *blocking interactive* password dialog on a wrong
@@ -97,7 +115,24 @@ password (Word/PowerPoint raise cleanly, Excel does not), which would hang a
 hidden instance. `msoffcrypto` decrypts the standard encrypted container with no
 Office process, no prompt, and an instant clean error on a bad password. The other
 tools call `_is_password_protected()` to skip locked files and point the user at
-Password Removal.
+Password Removal. That check short-circuits on extension first
+(`ENCRYPTABLE_EXTS` = `PWD_EXTS` + `.zip`), so batches of images/text/email don't
+pay to open and parse files that can never be encrypted.
+
+**Text report conversion (`.rep`/`.rpt`/`.prn`/`.lst`).** Plain-text report dumps
+from legacy/ERP/mainframe systems. Word selects an importer by extension and has
+none registered for these, so `_text_report_to_pdf` writes a temp `.txt` copy
+(UTF-8 with BOM, in its own `mkdtemp`) and opens *that* — never the original, and
+never a temp file next to the user's source. `_read_report_text` decodes through
+utf-8/cp1252/latin-1 and calls `_looks_binary` first, so a binary file wearing a
+report extension (a compiled Crystal Reports `.rpt`) fails with a clear message
+instead of emitting mojibake. `_fit_report_to_page` then forces Consolas, zeroes
+the paragraph spacing Word's Normal style would otherwise double-space the report
+with, and goes landscape past `_REPORT_LANDSCAPE_COLS` before scaling the type to
+the widest line. Wired into the PDF page (mode `"Text Report"` → `mode_key
+"text_report"`) and into `AUTO_PDF_EXTS` for Folder Unzipping's auto-PDF. The same
+function now also handles auto-PDF's **extensionless** files, which previously
+inlined their own temp-copy logic.
 
 **Cross-cutting helpers worth reusing:**
 - `_unique_output_path` / `_unique_pdf_path` — never overwrite; suffix `_2`, `_3`…
@@ -128,7 +163,7 @@ Password Removal.
     (not the transient popup) and cancelled on close.
   - Shared color helpers: `_hex_to_rgb`, `_lerp_rgb`; palette `TOGGLE_ON/OFF/DISABLED`.
 
-**Packaging specifics (`AllPowerfulFilePrep.spec`).** One-file build that
+**Packaging specifics (`BoxOfScraps.spec`).** One-file build that
 `collect_all`s pywin32/PIL/markitdown/msoffcrypto and excludes heavy ML/GUI libs
 (torch, scipy, PyQt, …) to shrink the archive and speed startup. It bundles a
 bootloader `Splash` shown during one-file unpack; the app closes it with
