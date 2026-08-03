@@ -230,6 +230,14 @@ points carry the whole feature:
   app. The `.old` backup can't be deleted by the update that created it (it's
   still the running image), so `_cleanup_previous_update` clears it at the next
   startup.
+  **The new build MUST land at the same path under the same filename** — taskbar
+  pins, desktop and Start Menu shortcuts are `.lnk` files that resolve by path, so
+  keeping the path identical is what lets a pinned copy survive an update and
+  launch the new version. Verified end-to-end, including that shell *link
+  tracking* does not hijack the pin onto `BoxOfScraps.exe.old`: tracking only
+  engages when the stored path fails to resolve, and here it always resolves.
+  Anything that installs to a versioned folder or renamed exe would silently break
+  every pin and shortcut the user has.
 
 Safeguards, in the order they fire: `_current_exe_path()` returns None unless
 `sys.frozen` — from source `sys.executable` is python.exe, and every disk-touching
