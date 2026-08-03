@@ -44,12 +44,24 @@ their whole run and avoid `CoUninitialize()` between Office launches.
 ## Releases
 
 Releases are published manually (not via CI):
-1. Build the exe with the command above (confirm `PYI_EXIT=0`).
-2. Commit on `main` with a `Co-Authored-By:` trailer; tag `vX.Y.Z`; push both.
-3. Create the GitHub release and upload `dist/BoxOfScraps.exe` as an asset
+1. **Bump `APP_VERSION` in `File.py` first.** It is the single source of truth
+   for the in-app updater, which compares it against the newest release tag.
+   Ship a stale value and the new exe still believes it is the old version, so
+   it offers the same update forever. It must match the tag you are about to
+   push.
+2. Build the exe with the command above (confirm `PYI_EXIT=0`).
+3. Commit on `main` with a `Co-Authored-By:` trailer; tag `vX.Y.Z`; push both.
+4. Create the GitHub release and upload `dist/BoxOfScraps.exe` as an asset
    via the REST API, using a token obtained from `git credential fill`
    (host `github.com`). `gh` is not installed in this environment.
-4. **Auto-archive the previous stable release.** Immediately after publishing a new
+   The asset **must** be named exactly `BoxOfScraps.exe` — that is the name the
+   updater looks for — and must be the bare `.exe`, never a zip (files extracted
+   from a zip inherit its Mark-of-the-Web tag, which reintroduces the manual
+   Unblock step the updater exists to avoid).
+   Optionally also upload `BoxOfScraps.exe.sha256` (a `sha256sum`-style line);
+   when present the updater verifies the download against it, and when absent it
+   falls back to its PE-header validation.
+5. **Auto-archive the previous stable release.** Immediately after publishing a new
    stable (non-prerelease) release, set the previously-visible stable release to
    `draft: true` via the REST API, so only the newest stable release stays public.
    Invariant: at most one published stable release at a time (prereleases/betas are
@@ -187,6 +199,58 @@ into the created subfolders, or overwritten (`_unique_output_path` suffixes
 collisions; files are copied, not moved). Password-protected archives are skipped;
 bad/corrupt zips are reported. (Note: Folder Unzipping still *does* require an
 empty output folder — that constraint was removed only from Document Structuring.)
+
+**Self-update from GitHub Releases (the "About & Updates" page).** `APP_VERSION`
+(top of `File.py`) is compared against `/releases/latest`, which returns only the
+newest *published, non-prerelease* release — so it dovetails with the auto-archive
+invariant above and betas are never offered to users. The page has **one** accent
+button: it reads "Check for Updates", and finding a newer release turns that same
+button into "Download & Install X" in place (`_upd_set_mode`), so there is never a
+dead Install button on screen. After each check the button locks for
+`UPDATE_CHECK_COOLDOWN` (30s) and counts down in its own label — GitHub's quota is
+60 calls an hour *per IP*, shared by everyone behind one office connection, so a
+spammed button could exhaust it for the whole building. If the quota is hit anyway,
+the error names the local time it resets, read from the `X-RateLimit-Reset` header
+(a 403 only counts as a quota error when `X-RateLimit-Remaining` is 0). Two design
+points carry the whole feature:
+
+- **No "Unblock" step.** The Properties → Unblock checkbox exists because the
+  *downloading application* writes the Mark-of-the-Web alternate data stream
+  (`:Zone.Identifier`, `ZoneId=3`). Browsers do; `urllib` does not. Because
+  `_download_release_asset` fetches the exe itself the file arrives untagged and
+  runs immediately, and SmartScreen's shell prompt — which fires *on* that tag —
+  never appears. `_strip_mark_of_the_web` deletes the stream anyway at every step
+  so the guarantee never rests on that behaviour. (Verified empirically: a
+  urllib-downloaded asset has no `:Zone.Identifier`.)
+- **No helper `.bat`.** Windows locks a running image against deletion and
+  overwriting but *permits renaming it*, so `_swap_in_new_exe` does two renames
+  in-process — `target → target.old`, then `staged → target` — instead of a batch
+  script that has to outlive the process and poll for it to exit. If the second
+  rename fails the first is undone, so a failed update always leaves a working
+  app. The `.old` backup can't be deleted by the update that created it (it's
+  still the running image), so `_cleanup_previous_update` clears it at the next
+  startup.
+
+Safeguards, in the order they fire: `_current_exe_path()` returns None unless
+`sys.frozen` — from source `sys.executable` is python.exe, and every disk-touching
+path refuses rather than swap *that* out. `_other_operation_running()` reads the
+existing per-page Cancel-button states (enabled for exactly the duration of an
+operation) to refuse an update that would close the app mid-conversion.
+`_dir_is_writable` runs *before* the ~120 MB download so a Program Files install
+fails fast and offers `_relaunch_as_admin` instead of dying at the swap;
+`_has_room_for_update` checks for the download plus the backup. Nothing touches
+the installed app until the download passes `_looks_like_windows_exe` (MZ + PE
+signature — catches a captive-portal page served with a 200) plus a size floor and
+the optional published SHA-256. The download lands in the *system* temp dir, never
+beside the exe, so a synced install doesn't push 120 MB through OneDrive and back;
+`_stage_beside` then moves it onto the exe's own volume because `os.replace`
+cannot rename across volumes. `_replace_with_retry` absorbs the transient locks a
+sync client or AV scanner takes on a file it just watched change (~9s of backoff),
+and `_cloud_sync_provider` detects OneDrive/Dropbox/Box/Google Drive — via
+OneDrive's own env vars first, then whole-path-component matching so a folder
+named "Box of Scraps" isn't mistaken for Box — to warn in the confirm dialog.
+Every failure path leaves the current version untouched and offers the releases
+page in a browser.
 
 **AI naming backend — credentials come from the environment, never the build.**
 No secret is hardcoded or baked into the source/`.exe`; `_load_ai_backend()`

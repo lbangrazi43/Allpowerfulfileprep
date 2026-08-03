@@ -21,6 +21,13 @@ import re
 import json
 import zipfile
 
+# The running app's version, and the single source of truth for the "Check for
+# Updates" feature: it is compared against the newest GitHub release tag to
+# decide whether an update exists. MUST be bumped before every release build —
+# leaving it stale makes the freshly-installed exe still believe it is the old
+# version, so it offers the same update forever.
+APP_VERSION = "1.7.0"
+
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     HAS_DND = True
@@ -2263,6 +2270,412 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
 
 
 # ─────────────────────────────────────────────
+# Self-update from GitHub Releases
+# ─────────────────────────────────────────────
+#
+# The app updates itself in place: it downloads the newest BoxOfScraps.exe from
+# the repo's latest release and swaps it over the running one. Two details make
+# that safe and painless, and both are load-bearing:
+#
+#  * NO "Unblock" STEP. The Properties > Unblock checkbox exists because the
+#    *downloading application* tags a file with the Mark-of-the-Web alternate
+#    data stream (:Zone.Identifier, ZoneId=3). Browsers and mail clients do this
+#    deliberately; urllib does not. Because we fetch the exe ourselves the file
+#    arrives untagged, so it runs immediately and SmartScreen's shell prompt —
+#    which fires *on* the MOTW tag — never appears. `_strip_mark_of_the_web`
+#    removes the tag explicitly anyway so the guarantee doesn't rest on that.
+#
+#  * NO HELPER BATCH SCRIPT. Windows locks a running image against deletion and
+#    overwriting, but permits it to be RENAMED. So the swap is two renames done
+#    in-process (see `_swap_in_new_exe`) rather than a .bat that has to outlive
+#    the process, poll for it to exit, and then move files. That avoids a
+#    flashing console window and a second artifact for antivirus to distrust.
+
+GITHUB_OWNER      = "lbangrazi43"
+GITHUB_REPO       = "Allpowerfulfileprep"
+UPDATE_ASSET_NAME = "BoxOfScraps.exe"
+GITHUB_API_LATEST = (f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+                     f"/releases/latest")
+RELEASES_PAGE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+
+UPDATE_USER_AGENT     = f"BoxOfScraps/{APP_VERSION}"   # GitHub rejects UA-less calls
+UPDATE_NET_TIMEOUT    = 30                  # seconds, version check
+UPDATE_DL_TIMEOUT     = 120                 # seconds, per read on the download
+UPDATE_MIN_EXE_BYTES  = 5 * 1024 * 1024     # sanity floor for a real build
+UPDATE_BACKUP_SUFFIX  = ".old"
+UPDATE_CHUNK          = 256 * 1024
+# Minimum gap between version checks. GitHub allows 60 unauthenticated API calls
+# an hour per *IP address* — which everyone behind one office connection shares —
+# so a user leaning on the button could burn the quota for their whole building.
+UPDATE_CHECK_COOLDOWN = 30                  # seconds
+
+
+class _UpdateCancelled(Exception):
+    """Raised inside the download loop when the user presses Cancel."""
+
+
+def _parse_version(tag: str) -> tuple:
+    """Turn a release tag or version string into a comparable tuple.
+
+    'v1.7.0' -> (1, 7, 0, 1);  '1.7.0-beta.2' -> (1, 7, 0, 0).
+    The trailing element ranks a final release above any of its own prereleases,
+    so someone running 1.7.0 is never offered 1.7.0-beta.2 as an 'update'."""
+    s = (tag or "").strip().lstrip("vV")
+    core, _, pre = s.partition("-")
+    parts = []
+    for chunk in core.split(".")[:3]:
+        m = re.match(r"\d+", chunk)
+        parts.append(int(m.group(0)) if m else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts) + (0 if pre else 1,)
+
+
+def _rate_limit_reset_text(err) -> str:
+    """Local clock time at which GitHub's hourly quota refills, read from the
+    X-RateLimit-Reset header (a Unix timestamp). Returns "" when the header is
+    missing or unparseable, so callers can drop the clause entirely rather than
+    print a wrong time. Formatted by hand because strftime's 12-hour,
+    no-leading-zero flag differs between platforms."""
+    try:
+        epoch = int((err.headers.get("X-RateLimit-Reset") or "").strip())
+        t = time.localtime(epoch)
+    except (AttributeError, TypeError, ValueError, OSError):
+        return ""
+    hour = t.tm_hour % 12 or 12
+    return f"{hour}:{t.tm_min:02d} {'AM' if t.tm_hour < 12 else 'PM'}"
+
+
+def _fetch_latest_release(timeout: int = UPDATE_NET_TIMEOUT) -> dict:
+    """Fetch the newest published, non-prerelease GitHub release.
+
+    /releases/latest skips drafts and prereleases by design, which lines up with
+    the release runbook's invariant that only one stable release is public at a
+    time — so beta tags are never offered to users and the drafted previous
+    release stops being advertised the moment a new one ships.
+
+    Raises RuntimeError carrying a message fit to show a user (offline, blocked
+    by a proxy, rate-limited) rather than leaking a urllib traceback."""
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(GITHUB_API_LATEST)
+    req.add_header("User-Agent", UPDATE_USER_AGENT)
+    req.add_header("Accept", "application/vnd.github+json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        # A 403 is only a quota problem when the remaining-calls header says 0;
+        # 429 is always one. Anything else 403 is a genuine refusal.
+        if e.code in (403, 429):
+            remaining = (e.headers.get("X-RateLimit-Remaining") or "").strip()
+            if e.code == 429 or remaining == "0":
+                when = _rate_limit_reset_text(e)
+                raise RuntimeError(
+                    "GitHub's update-check limit has been reached. It allows 60 "
+                    "checks an hour per internet connection, shared by everyone "
+                    "on your network — so this can happen even if you've only "
+                    "checked once."
+                    + (f"\n\nTry again after {when}." if when
+                       else "\n\nThe limit resets within the hour."))
+            raise RuntimeError(f"GitHub refused the request (HTTP {e.code}).")
+        if e.code == 404:
+            raise RuntimeError(
+                "No published release was found for this app on GitHub.")
+        raise RuntimeError(f"GitHub returned HTTP {e.code} ({e.reason}).")
+    except Exception as e:
+        raise RuntimeError(
+            "Couldn't reach GitHub. Check your internet connection — a company "
+            f"firewall or proxy may also be blocking it.\n\nDetail: {e}")
+
+
+def _find_release_asset(release: dict, name: str):
+    """Find a named file attached to a release, or None."""
+    for asset in release.get("assets") or []:
+        if (asset.get("name") or "").lower() == name.lower():
+            return asset
+    return None
+
+
+def _current_exe_path():
+    """Path to the running one-file .exe, or None when running from source.
+
+    The single most important safeguard in this module: from a source checkout
+    `sys.executable` is python.exe, and every path below would happily rename
+    and overwrite *that*. Everything that touches disk refuses when this is
+    None."""
+    if not getattr(sys, "frozen", False):
+        return None
+    try:
+        return Path(sys.executable).resolve()
+    except OSError:
+        return Path(sys.executable)
+
+
+def _strip_mark_of_the_web(path: Path) -> None:
+    """Remove the :Zone.Identifier alternate data stream ('this came from the
+    internet') if one is present, so the new exe never needs the manual
+    Properties > Unblock step before Windows will run it.
+
+    Best-effort by design: alternate data streams only exist on NTFS, so this is
+    a silent no-op on FAT32/exFAT/network shares — which cannot carry a MOTW tag
+    in the first place."""
+    try:
+        os.remove(f"{path}:Zone.Identifier")
+    except OSError:
+        pass
+
+
+def _looks_like_windows_exe(path: Path) -> bool:
+    """True if `path` is a plausible Windows executable: an 'MZ' DOS header whose
+    e_lfanew offset lands on a 'PE\\0\\0' signature.
+
+    Catches a truncated download, and — more usefully — a captive-portal or
+    proxy error page served with a 200 status, which would otherwise be swapped
+    in as the application."""
+    try:
+        with open(path, "rb") as f:
+            if f.read(2) != b"MZ":
+                return False
+            f.seek(0x3C)
+            raw = f.read(4)
+            if len(raw) != 4:
+                return False
+            f.seek(int.from_bytes(raw, "little"))
+            return f.read(4) == b"PE\0\0"
+    except OSError:
+        return False
+
+
+def _sha256_file(path: Path) -> str:
+    """Streaming SHA-256 of a file (the exe is ~120 MB — never read it whole)."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+# Folder names that mean "this directory is continuously synced by a cloud
+# client". Matched against whole path components, so "OneDrive - Contoso"
+# hits via its prefix while an ordinary folder called "Boxes" does not.
+_CLOUD_SYNC_FOLDERS = {
+    "onedrive":       "OneDrive",
+    "dropbox":        "Dropbox",
+    "google drive":   "Google Drive",
+    "googledrive":    "Google Drive",
+    "box":            "Box",
+    "icloud drive":   "iCloud Drive",
+    "icloudrive":     "iCloud Drive",
+}
+
+
+def _cloud_sync_provider(path: Path):
+    """Name the cloud-sync service whose folder `path` sits in, or None.
+
+    Consults OneDrive's own environment variables first (authoritative, and it
+    catches a sync root the user has renamed), then falls back to matching
+    well-known folder names. Drives the pre-update warning and justifies the
+    retry loop in `_replace_with_retry`: a sync client can hold a short-lived
+    lock on a file it is uploading, which would otherwise fail the swap."""
+    try:
+        resolved = str(path.resolve())
+    except OSError:
+        resolved = str(path)
+    low = resolved.lower()
+    for var in ("OneDrive", "OneDriveCommercial", "OneDriveConsumer"):
+        root = os.environ.get(var, "").strip().rstrip("\\/")
+        if root and (low == root.lower() or low.startswith(root.lower() + os.sep)):
+            return "OneDrive"
+    for part in Path(resolved).parts:
+        # "OneDrive - Contoso" and "Google Drive" both reduce to their brand.
+        base = part.split(" - ")[0].strip().lower()
+        if base in _CLOUD_SYNC_FOLDERS:
+            return _CLOUD_SYNC_FOLDERS[base]
+    return None
+
+
+def _dir_is_writable(directory: Path) -> bool:
+    """True if we can create and delete a file in `directory`.
+
+    Checked *before* a ~120 MB download so an install sitting under Program
+    Files fails immediately with useful advice, instead of after a long download
+    and only at the moment of the swap."""
+    try:
+        fd, probe = tempfile.mkstemp(prefix=".bos-wtest-", dir=str(directory))
+        os.close(fd)
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _has_room_for_update(directory: Path, need_bytes: int) -> bool:
+    """True if `directory`'s volume can hold the download plus the backup copy
+    the swap keeps until the next launch."""
+    try:
+        return shutil.disk_usage(str(directory)).free >= need_bytes
+    except OSError:
+        return True     # can't measure — let the write itself be the judge
+
+
+def _replace_with_retry(src, dst, attempts: int = 8, delay: float = 0.25) -> None:
+    """os.replace with a short backoff on PermissionError.
+
+    A cloud-sync client or an antivirus scanner routinely holds a sub-second
+    lock on a file it has just watched change; without a retry that surfaces as
+    a spurious 'access denied' mid-swap. Roughly 9 seconds of total patience,
+    then the original error is re-raised so the caller can roll back."""
+    last = None
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as e:
+            last = e
+            time.sleep(delay * (i + 1))
+    raise last
+
+
+def _stage_beside(src: Path, target: Path) -> Path:
+    """Put the downloaded exe on the same volume as `target`, ready to be
+    renamed into place, and return its path.
+
+    os.replace cannot rename across volumes, and the download lives in the
+    system temp folder (which may be on a different drive) — so this is a cheap
+    rename when they match and a copy when they don't."""
+    staged = target.with_name("." + target.stem + ".new.tmp")
+    try:
+        os.remove(staged)
+    except OSError:
+        pass
+    try:
+        os.replace(src, staged)
+    except OSError:
+        shutil.copy2(src, staged)      # different volume: copy instead
+    return staged
+
+
+def _swap_in_new_exe(staged: Path, target: Path) -> Path:
+    """Replace the running .exe with `staged`; return the backup path.
+
+    Windows will not let a running image be deleted or overwritten, but it does
+    allow it to be RENAMED — the open handle follows the file, only its
+    directory entry moves. So the swap is two renames and needs no helper
+    process:
+
+        target -> target.old     (move the running exe out of the way)
+        staged -> target         (new build takes its place)
+
+    If the second rename fails the first is undone, so a failed update always
+    leaves a working application behind. `staged` must already be on `target`'s
+    volume (see `_stage_beside`)."""
+    backup = target.with_name(target.name + UPDATE_BACKUP_SUFFIX)
+    try:
+        os.remove(backup)          # clear a leftover we couldn't delete earlier
+    except OSError:
+        pass
+    _replace_with_retry(target, backup)
+    try:
+        _replace_with_retry(staged, target)
+    except Exception:
+        try:                       # roll back: put the working exe back
+            _replace_with_retry(backup, target)
+        except Exception:
+            pass
+        raise
+    return backup
+
+
+def _cleanup_previous_update(exe: Path) -> None:
+    """Delete what a previous update left behind: the backup of the old exe and
+    any abandoned staging file.
+
+    Runs once at startup because the backup cannot be removed during the update
+    that created it — at that moment it is still the running image. Entirely
+    best-effort: a leftover that is briefly locked (a sync client is uploading
+    it) is harmless and gets cleaned up on a later launch."""
+    for leftover in (exe.with_name(exe.name + UPDATE_BACKUP_SUFFIX),
+                     exe.with_name("." + exe.stem + ".new.tmp")):
+        try:
+            if leftover.exists():
+                os.remove(leftover)
+        except OSError:
+            pass
+
+
+def _download_release_asset(url: str, dest: Path, expected_size: int = 0,
+                            progress_cb=None, cancel_event=None,
+                            timeout: int = UPDATE_DL_TIMEOUT) -> int:
+    """Stream a release asset to `dest`, reporting progress and honouring Cancel.
+
+    Fetching this ourselves rather than handing the URL to a browser is what
+    keeps the downloaded exe free of the Mark-of-the-Web tag (see the module
+    header). Returns the byte count actually written."""
+    import urllib.request
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", UPDATE_USER_AGENT)
+    req.add_header("Accept", "application/octet-stream")
+    got = 0
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            total = expected_size or int(r.headers.get("Content-Length") or 0)
+            with open(dest, "wb") as f:
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise _UpdateCancelled()
+                    chunk = r.read(UPDATE_CHUNK)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if progress_cb is not None:
+                        progress_cb(got, total)
+    except _UpdateCancelled:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Download failed: {e}")
+    if expected_size and got != expected_size:
+        raise RuntimeError(
+            f"The download is incomplete — {got:,} of {expected_size:,} bytes "
+            "arrived. The connection dropped part-way; please try again.")
+    return got
+
+
+def _relaunch(exe: Path) -> None:
+    """Start the freshly-installed exe, detached so it outlives this process."""
+    import subprocess
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    subprocess.Popen(
+        [str(exe)], cwd=str(exe.parent), close_fds=True,
+        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+
+
+def _relaunch_as_admin(exe: Path) -> bool:
+    """Restart the app behind a UAC prompt, for installs in a location only an
+    administrator can write (Program Files), where the rename swap would fail
+    with access denied. Returns True if the elevation prompt was accepted."""
+    try:
+        import ctypes
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", str(exe), None, str(exe.parent), 1)
+        return int(rc) > 32        # ShellExecuteW's success threshold
+    except Exception:
+        return False
+
+
+def _open_releases_page() -> None:
+    """Fall back to the browser when an in-app update can't proceed."""
+    try:
+        import webbrowser
+        webbrowser.open(RELEASES_PAGE_URL)
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────
 # GUI
 # ─────────────────────────────────────────────
 
@@ -2279,6 +2692,12 @@ SIDEBAR_BG  = "#1e2d3d"
 SIDEBAR_FG  = "#c9d8e8"
 SIDEBAR_SEL = "#0078d4"
 SIDEBAR_W   = 190
+# The informational footer entry (About & Updates) is deliberately quieter than
+# the tool list above it: dimmer text and a muted slate selection instead of the
+# accent blue, so it reads as "about the app" rather than a seventh feature.
+SIDEBAR_INFO_FG   = "#7e93ab"
+SIDEBAR_INFO_SEL  = "#33475e"
+SIDEBAR_RULE      = "#3a5068"
 
 # Toggle-switch palette
 TOGGLE_ON       = "#0078d4"    # filled track when on (accent)
@@ -3114,9 +3533,26 @@ class ConverterApp:
         self._ds_date     = tk.BooleanVar(value=False)
         self._ds_organize = tk.BooleanVar(value=True)
 
+        # Updates page state
+        self._upd_release   = None    # the newer release dict, once one is found
+        self._upd_asset     = None    # its BoxOfScraps.exe asset
+        self._upd_busy      = False   # guards against two update runs at once
+        self._upd_last_pct  = 0.0     # throttles download progress UI updates
+        self._cancel_update = threading.Event()
+        self._upd_cooldown_until = 0.0    # monotonic deadline; see _upd_begin_cooldown
+        self._upd_cooldown_after = None   # pending countdown tick, so none stack
+
+        # Clear what a previous self-update left behind. The old exe can't be
+        # deleted by the update that replaced it — at that moment it is still
+        # the running image — so it is cleaned up on the next launch instead.
+        _exe = _current_exe_path()
+        if _exe is not None:
+            _cleanup_previous_update(_exe)
+
         # Navigation state
         self._page_frames = {}
         self._nav_buttons = {}
+        self._nav_rest_fg = {}   # per-entry unselected fg (tools vs. info footer)
 
         self._build_shell()
         self._show_page("pdf")
@@ -3239,8 +3675,9 @@ class ConverterApp:
             justify="center", pady=20,
         ).pack(fill="x")
 
-        tk.Frame(self._sidebar, bg="#3a5068", height=1).pack(fill="x", padx=12, pady=(0, 8))
+        tk.Frame(self._sidebar, bg=SIDEBAR_RULE, height=1).pack(fill="x", padx=12, pady=(0, 8))
 
+        # The tools — the things the app actually does.
         for page_key, label in [("pdf", "  PDF Conversion"),
                                 ("unzip", "  Folder Unzipping"),
                                 ("aiprep", "  Markdown Conversion"),
@@ -3262,12 +3699,48 @@ class ConverterApp:
             )
             btn.pack(fill="x")
             self._nav_buttons[page_key] = btn
+            self._nav_rest_fg[page_key] = SIDEBAR_FG
+
+        # Informational footer, pinned to the bottom of the sidebar and set apart
+        # from the tool list above: this page is about the app itself, not another
+        # feature. Packed bottom-up, so the order here is version line first (it
+        # ends up lowest), then the nav entry, then the rule that separates the
+        # whole footer from the tools.
+        tk.Label(
+            self._sidebar, text=f"Version {APP_VERSION}",
+            bg=SIDEBAR_BG, fg=SIDEBAR_INFO_FG, font=("Segoe UI", 8),
+            anchor="w", padx=22,   # aligns under the nav entry's text above it
+        ).pack(side="bottom", fill="x", pady=(4, 12))
+
+        info_btn = tk.Button(
+            self._sidebar,
+            text="  About & Updates",
+            bg=SIDEBAR_BG, fg=SIDEBAR_INFO_FG,
+            font=("Segoe UI", 9),
+            relief="flat", anchor="w",
+            padx=12, pady=8,
+            cursor="hand2",
+            activebackground=SIDEBAR_INFO_SEL,
+            activeforeground="#ffffff",
+            bd=0,
+            command=lambda: self._show_page("update"),
+        )
+        info_btn.pack(side="bottom", fill="x")
+        self._nav_buttons["update"] = info_btn
+        self._nav_rest_fg["update"] = SIDEBAR_INFO_FG
+
+        tk.Frame(self._sidebar, bg=SIDEBAR_RULE, height=1).pack(
+            side="bottom", fill="x", padx=12, pady=(8, 8))
 
     def _show_page(self, key: str):
         """Switch the visible content page, building it lazily on first visit."""
-        for btn in self._nav_buttons.values():
-            btn.config(bg=SIDEBAR_BG, fg=SIDEBAR_FG)
-        self._nav_buttons[key].config(bg=SIDEBAR_SEL, fg="#ffffff")
+        # Each entry returns to its OWN resting colour — the tools sit brighter
+        # than the informational footer entry, so they can't share one value.
+        for nav_key, btn in self._nav_buttons.items():
+            btn.config(bg=SIDEBAR_BG, fg=self._nav_rest_fg[nav_key])
+        self._nav_buttons[key].config(
+            bg=(SIDEBAR_INFO_SEL if key == "update" else SIDEBAR_SEL),
+            fg="#ffffff")
 
         for frame in self._page_frames.values():
             frame.pack_forget()
@@ -3287,6 +3760,8 @@ class ConverterApp:
                 self._build_pwd_page(frame)
             elif key == "structure":
                 self._build_structure_page(frame)
+            elif key == "update":
+                self._build_update_page(frame)
             # Give this page's flat grey utility buttons a themed press-in effect.
             self._enhance_page_buttons(frame)
 
@@ -5235,6 +5710,491 @@ class ConverterApp:
                 f"{saved} saved, {len(failed)} failed:{extra}\n\n{err_lines}"
                 f"\n\nTotal time elapsed: {elapsed}",
             )
+
+    # ── About & Updates ──────────────────────
+    def _build_update_page(self, parent):
+        tk.Label(
+            parent, text="About & Updates",
+            bg=APP_BG, fg="#1a1a1a", font=("Segoe UI", 14, "bold"),
+            anchor="w", padx=18,
+        ).pack(fill="x", pady=(14, 4))
+
+        tk.Label(
+            parent,
+            text=("See which version you're running and check whether a newer one is "
+                  "available. Updates download from the project's GitHub page and "
+                  "install themselves — Box of Scraps closes and reopens on the new "
+                  "version when it's done."),
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+            anchor="w", padx=18, justify="left", wraplength=620,
+        ).pack(fill="x", pady=(0, 6))
+
+        # Installed-version card
+        card = tk.Frame(parent, bg=DROP_BG, highlightbackground=DROP_BD,
+                        highlightthickness=2, relief="flat")
+        card.pack(fill="x", padx=18, pady=(6, 8))
+        row = tk.Frame(card, bg=DROP_BG)
+        row.pack(fill="x", padx=14, pady=(10, 2))
+        tk.Label(row, text="Installed version", bg=DROP_BG, fg="#4a6fa5",
+                 font=("Segoe UI", 9)).pack(side="left")
+        tk.Label(row, text=APP_VERSION, bg=DROP_BG, fg="#1a1a1a",
+                 font=("Segoe UI", 11, "bold")).pack(side="left", padx=(8, 0))
+
+        exe = _current_exe_path()
+        if exe is None:
+            where = ("Running from source (File.py) — in-app updating applies to the "
+                     "packaged .exe only.")
+        else:
+            where = str(exe)
+            provider = _cloud_sync_provider(exe.parent)
+            if provider:
+                where += f"\nStored in {provider} — updating still works normally."
+        tk.Label(card, text=where, bg=DROP_BG, fg="#6b7f96", font=("Segoe UI", 8),
+                 anchor="w", justify="left", wraplength=620,
+                 ).pack(fill="x", padx=14, pady=(0, 10))
+
+        # Release notes for whatever the check turns up
+        notes_frame = tk.Frame(parent, bg=DROP_BG, highlightbackground=DROP_BD,
+                               highlightthickness=2, relief="flat")
+        notes_frame.pack(fill="both", expand=True, padx=18, pady=(0, 6))
+        self._upd_notes_title = tk.Label(
+            notes_frame, text="Press “Check for Updates” to see what's available.",
+            bg=DROP_BG, fg="#4a6fa5", font=("Segoe UI", 9, "bold"),
+            anchor="w", justify="left")
+        self._upd_notes_title.pack(fill="x", padx=10, pady=(8, 4))
+        inner = tk.Frame(notes_frame, bg=DROP_BG)
+        inner.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        nscroll = tk.Scrollbar(inner, orient="vertical")
+        self._upd_notes = tk.Text(
+            inner, yscrollcommand=nscroll.set, wrap="word", height=6,
+            bg="#ffffff", fg="#1a1a1a", font=("Segoe UI", 9),
+            relief="flat", bd=1, highlightthickness=0, state="disabled")
+        nscroll.config(command=self._upd_notes.yview)
+        nscroll.pack(side="right", fill="y")
+        self._upd_notes.pack(fill="both", expand=True)
+
+        # Progress + status
+        self._upd_progress = ttk.Progressbar(parent, mode="determinate", maximum=1000)
+        self._upd_progress.pack(fill="x", padx=18, pady=(6, 2))
+        self._upd_status_var = tk.StringVar(value="Ready — check GitHub for a newer version.")
+        tk.Label(parent, textvariable=self._upd_status_var, bg=APP_BG, fg="#555",
+                 font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=20, pady=(0, 4))
+        self._upd_timer = self._build_timer(parent)
+
+        # Run + Cancel. One accent button that flips between checking and
+        # installing, so there is never a dead "Install" button on screen.
+        upd_btn_row = tk.Frame(parent, bg=APP_BG)
+        upd_btn_row.pack(pady=(4, 14))
+        self._upd_btn = tk.Button(
+            upd_btn_row, text="Check for Updates", command=self._start_update_check,
+            bg=ACCENT, fg=BTN_FG, font=("Segoe UI", 12, "bold"),
+            relief="flat", padx=30, pady=8, cursor="hand2",
+            activebackground="#005a9e", activeforeground=BTN_FG,
+        )
+        self._upd_btn.pack(side="left")
+        self._upd_cancel_btn = tk.Button(
+            upd_btn_row, text="Cancel", command=self._cancel_update_op,
+            font=("Segoe UI", 10, "bold"), relief="flat", padx=16, pady=6,
+            activebackground=CANCEL_BG_ACTIVE, activeforeground=BTN_FG,
+        )
+        self._upd_cancel_btn.pack(side="left", padx=(10, 0))
+        self._set_cancel_state(self._upd_cancel_btn, False)
+
+    def _set_upd_status(self, msg):
+        self.root.after(0, lambda: self._upd_status_var.set(msg))
+
+    def _upd_show_notes(self, title, body):
+        """Fill the release-notes panel (Tk thread)."""
+        self._upd_notes_title.config(text=title)
+        self._upd_notes.config(state="normal")
+        self._upd_notes.delete("1.0", "end")
+        self._upd_notes.insert("1.0", body or "(No release notes were published.)")
+        self._upd_notes.config(state="disabled")
+
+    def _upd_set_mode(self, mode):
+        """Point the accent button at checking or installing (Tk thread).
+
+        This is the one button on the page: finding an update turns it into the
+        install action in place, so there is never a dead 'Install' sitting on
+        screen with nothing to install."""
+        if mode == "install":
+            self._upd_cancel_cooldown()     # installing is never rate-limited
+            label = (self._upd_release.get("tag_name") or "").lstrip("vV")
+            self._upd_btn.config(text=f"Download & Install {label}",
+                                 command=self._start_update_install,
+                                 state="normal", cursor="hand2")
+        else:
+            # Every route back to 'check' mode has just spent a GitHub request,
+            # so the cooldown starts here — it also owns the button's label and
+            # state until it expires.
+            self._upd_btn.config(command=self._start_update_check)
+            self._upd_begin_cooldown()
+
+    def _upd_set_busy(self, busy, cancellable=True):
+        """Lock the page while an update operation is in flight (Tk thread)."""
+        self._upd_busy = busy
+        if busy:
+            self._upd_btn.config(state="disabled", cursor="arrow")
+        elif time.monotonic() < self._upd_cooldown_until:
+            self._upd_tick_cooldown()      # still cooling down — keep it locked
+        else:
+            self._upd_btn.config(state="normal", cursor="hand2")
+        self._set_cancel_state(self._upd_cancel_btn, busy and cancellable)
+
+    def _cancel_update_op(self):
+        # Stops the download at its next chunk boundary; the version check is a
+        # single short request, so there it just takes effect on return.
+        self._cancel_update.set()
+        self._set_cancel_state(self._upd_cancel_btn, False)
+        self._upd_status_var.set("Stopping…")
+
+    def _other_operation_running(self) -> bool:
+        """True if any other tool page has an operation in flight.
+
+        Every page enables its Cancel button for exactly the duration of its
+        operation (`_set_cancel_state`), so an enabled Cancel is an existing,
+        reliable busy signal — no new bookkeeping needed. Used to refuse an
+        update that would otherwise close the app mid-conversion."""
+        for attr in ("cancel_btn", "_uz_cancel_btn", "_ai_cancel_btn",
+                     "_office_cancel_btn", "_pwd_cancel_btn", "_ds_cancel_btn"):
+            btn = getattr(self, attr, None)
+            if btn is None:
+                continue
+            try:
+                if str(btn.cget("state")) == "normal":
+                    return True
+            except Exception:
+                pass
+        return False
+
+    # ── update: check ────────────────────────
+    def _upd_begin_cooldown(self):
+        """Lock the Check button for UPDATE_CHECK_COOLDOWN seconds after a check
+        (successful or not — a failed one still spent a request).
+
+        Only ever applies while the button is in 'check' mode: once an update has
+        been found the same button becomes Download & Install, which must stay
+        clickable immediately."""
+        self._upd_cooldown_until = time.monotonic() + UPDATE_CHECK_COOLDOWN
+        self._upd_tick_cooldown()
+
+    def _upd_tick_cooldown(self):
+        """Count the cooldown down in the button's own label, so the wait is
+        visible rather than the button just being mysteriously dead."""
+        self._upd_cooldown_after = None
+        if self._upd_busy:
+            return                    # an operation took the button over
+        remaining = self._upd_cooldown_until - time.monotonic()
+        if remaining <= 0:
+            self._upd_btn.config(text="Check for Updates", state="normal",
+                                 cursor="hand2")
+            return
+        self._upd_btn.config(text=f"Check again in {int(remaining) + 1}s",
+                             state="disabled", cursor="arrow")
+        self._upd_cooldown_after = self.root.after(250, self._upd_tick_cooldown)
+
+    def _upd_cancel_cooldown(self):
+        """Drop a pending countdown tick (the install path takes the button)."""
+        if self._upd_cooldown_after is not None:
+            try:
+                self.root.after_cancel(self._upd_cooldown_after)
+            except Exception:
+                pass
+            self._upd_cooldown_after = None
+
+    def _start_update_check(self):
+        if self._upd_busy or time.monotonic() < self._upd_cooldown_until:
+            return
+        self._cancel_update.clear()
+        self._upd_release = None
+        self._upd_asset = None
+        self._upd_set_busy(True)
+        self._upd_progress["value"] = 0
+        self._upd_status_var.set("Checking GitHub for a newer version…")
+        threading.Thread(target=self._upd_check_worker, daemon=True).start()
+
+    def _upd_check_worker(self):
+        try:
+            release = _fetch_latest_release()
+        except RuntimeError as e:
+            self.root.after(0, self._upd_check_failed, str(e))
+            return
+        if self._cancel_update.is_set():
+            self.root.after(0, self._upd_cancelled)
+            return
+        self.root.after(0, self._upd_check_done, release)
+
+    def _upd_check_done(self, release):
+        self._upd_set_busy(False)
+        tag = (release.get("tag_name") or "").strip()
+        latest = tag.lstrip("vV") or "unknown"
+        notes = (release.get("body") or "").strip()
+
+        if _parse_version(tag) <= _parse_version(APP_VERSION):
+            self._upd_status_var.set(f"You're up to date — {APP_VERSION} is the latest version.")
+            self._upd_show_notes(
+                f"Up to date — latest release is {latest}",
+                notes)
+            self._upd_set_mode("check")
+            return
+
+        asset = _find_release_asset(release, UPDATE_ASSET_NAME)
+        if asset is None:
+            self._upd_status_var.set(
+                f"Version {latest} is available, but it has no "
+                f"{UPDATE_ASSET_NAME} download attached.")
+            self._upd_show_notes(f"Version {latest} is available", notes)
+            self._upd_set_mode("check")
+            return
+
+        self._upd_release = release
+        self._upd_asset = asset
+        size_mb = int(asset.get("size") or 0) / 1048576
+        self._upd_status_var.set(
+            f"Version {latest} is available ({size_mb:,.0f} MB) — "
+            f"you have {APP_VERSION}.")
+        self._upd_show_notes(f"What's new in {latest}", notes)
+        self._upd_set_mode("install")
+
+    def _upd_check_failed(self, msg):
+        self._upd_set_busy(False)
+        self._upd_set_mode("check")
+        self._upd_status_var.set("Couldn't check for updates.")
+        self._upd_show_notes("Update check failed", msg)
+        if messagebox.askyesno(
+                "Update Check Failed",
+                f"{msg}\n\nOpen the releases page in your browser instead?"):
+            _open_releases_page()
+
+    def _upd_cancelled(self):
+        self._upd_set_busy(False)
+        self._upd_timer.stop()
+        self._upd_progress["value"] = 0
+        self._upd_status_var.set("Update cancelled.")
+        if self._upd_release is None:
+            # A cancelled *check* still spent a GitHub request; a cancelled
+            # download did not, and leaves the install button live.
+            self._upd_begin_cooldown()
+
+    # ── update: install ──────────────────────
+    def _start_update_install(self):
+        """Run every precheck that can fail cheaply *before* committing to a
+        ~120 MB download, then confirm and hand off to the worker."""
+        if self._upd_busy or not self._upd_release or not self._upd_asset:
+            return
+
+        exe = _current_exe_path()
+        if exe is None:
+            messagebox.showinfo(
+                "Not Available in Development",
+                "In-app updating only works in the packaged Box of Scraps .exe.\n\n"
+                "You're running from source, where the running program is "
+                "python.exe — replacing that is not something this tool will do.")
+            return
+
+        if self._other_operation_running():
+            messagebox.showwarning(
+                "Operation in Progress",
+                "Another tool is still running.\n\nInstalling an update closes and "
+                "reopens the app, which would interrupt it. Please wait for it to "
+                "finish (or cancel it) and try again.")
+            return
+
+        # Writability decides whether this can work at all — check it before the
+        # download rather than discovering it at the moment of the swap.
+        if not _dir_is_writable(exe.parent):
+            if messagebox.askyesno(
+                    "Administrator Rights Needed",
+                    f"Box of Scraps can't write to its own folder:\n\n{exe.parent}\n\n"
+                    "That usually means it's installed somewhere only an "
+                    "administrator can change, such as Program Files.\n\n"
+                    "Restart Box of Scraps as an administrator and try the update "
+                    "again?"):
+                if _relaunch_as_admin(exe):
+                    self.root.destroy()
+                else:
+                    messagebox.showerror(
+                        "Couldn't Restart",
+                        "The elevation prompt was declined or failed.\n\n"
+                        "You can also update by downloading the new version "
+                        "manually from the releases page.")
+            return
+
+        size = int(self._upd_asset.get("size") or 0)
+        # Room for the download plus the backup copy kept until the next launch.
+        if size and not _has_room_for_update(exe.parent, size * 2 + 64 * 1024 * 1024):
+            messagebox.showerror(
+                "Not Enough Disk Space",
+                f"Updating needs about {(size * 2) / 1048576:,.0f} MB free on "
+                f"{exe.drive or exe.parent} — the new version plus a backup of the "
+                "current one.\n\nFree up some space and try again.")
+            return
+
+        latest = (self._upd_release.get("tag_name") or "").lstrip("vV")
+        detail = (f"Update from {APP_VERSION} to {latest}?\n\n"
+                  f"Download size: {size / 1048576:,.0f} MB\n\n"
+                  "Box of Scraps will close and reopen on the new version when the "
+                  "update finishes. Your current version is kept until the next "
+                  "launch in case anything goes wrong.")
+        provider = _cloud_sync_provider(exe.parent)
+        if provider:
+            detail += (f"\n\nNote: this app lives in a {provider} folder. The update "
+                       f"works normally — just let {provider} finish syncing "
+                       "afterwards before copying it elsewhere.")
+        if not messagebox.askokcancel("Install Update", detail):
+            return
+
+        self._cancel_update.clear()
+        self._upd_last_pct = 0.0
+        self._upd_set_busy(True)
+        self._upd_progress["value"] = 0
+        self._upd_status_var.set("Starting download…")
+        self._upd_timer.start()
+        self._upd_timer.set_file(UPDATE_ASSET_NAME)
+        threading.Thread(target=self._upd_install_worker, args=(exe,),
+                         daemon=True).start()
+
+    def _upd_on_progress(self, got, total):
+        """Download progress, called from the worker thread."""
+        pct = (got / total) if total else 0.0
+        # Throttle to ~one UI update per half-percent: a 120 MB download would
+        # otherwise queue thousands of `after` callbacks onto the Tk thread.
+        if total and (pct - self._upd_last_pct) < 0.005 and got < total:
+            return
+        self._upd_last_pct = pct
+        self.root.after(0, self._upd_render_progress, pct,
+                        got / 1048576, (total or 0) / 1048576)
+
+    def _upd_render_progress(self, pct, got_mb, total_mb):
+        self._upd_progress["value"] = pct * 1000
+        if total_mb:
+            self._upd_status_var.set(
+                f"Downloading… {got_mb:,.0f} MB of {total_mb:,.0f} MB  "
+                f"({pct * 100:.0f}%)")
+        else:
+            self._upd_status_var.set(f"Downloading… {got_mb:,.0f} MB")
+
+    def _upd_install_worker(self, exe: Path):
+        """Download, validate, and swap in the new exe, then relaunch.
+
+        Nothing touches the installed application until the download has been
+        fully verified, so a failure during the slow, failure-prone part leaves
+        the current version completely untouched."""
+        release, asset = self._upd_release, self._upd_asset
+        latest = (release.get("tag_name") or "").lstrip("vV")
+        size = int(asset.get("size") or 0)
+        tmpdir = None
+        staged = None
+        try:
+            # Download into the system temp folder, NOT next to the exe: if the
+            # app lives in a synced folder, staging ~120 MB there would push the
+            # whole download up to the cloud and then delete it again.
+            tmpdir = Path(tempfile.mkdtemp(prefix="BoxOfScraps-update-"))
+            download = tmpdir / UPDATE_ASSET_NAME
+            _download_release_asset(
+                asset.get("browser_download_url"), download,
+                expected_size=size, progress_cb=self._upd_on_progress,
+                cancel_event=self._cancel_update)
+
+            self._set_upd_status("Verifying the download…")
+            if download.stat().st_size < UPDATE_MIN_EXE_BYTES:
+                raise RuntimeError(
+                    "The downloaded file is far too small to be a real build — "
+                    "the download was probably intercepted or truncated.")
+            if not _looks_like_windows_exe(download):
+                raise RuntimeError(
+                    "The downloaded file isn't a Windows program. A network "
+                    "filter or sign-in page may have replaced it.")
+
+            # Verify against a published checksum when the release carries one.
+            # Releases without it still install — the PE check above is the floor.
+            checksum_asset = _find_release_asset(
+                release, UPDATE_ASSET_NAME + ".sha256")
+            if checksum_asset is not None:
+                sums = tmpdir / "expected.sha256"
+                try:
+                    _download_release_asset(
+                        checksum_asset.get("browser_download_url"), sums,
+                        cancel_event=self._cancel_update)
+                    expected = sums.read_text(
+                        encoding="utf-8", errors="ignore").split()[0].strip().lower()
+                except _UpdateCancelled:
+                    raise
+                except Exception:
+                    expected = ""
+                if expected:
+                    if _sha256_file(download).lower() != expected:
+                        raise RuntimeError(
+                            "The download doesn't match the checksum published "
+                            "with the release, so it was not installed. Try "
+                            "again; if it keeps failing, download the new "
+                            "version manually.")
+
+            if self._cancel_update.is_set():
+                raise _UpdateCancelled()
+
+            # Belt-and-braces: urllib doesn't apply the Mark-of-the-Web tag, so
+            # there is normally nothing here to remove — do it anyway so the
+            # no-Unblock guarantee doesn't depend on that.
+            _strip_mark_of_the_web(download)
+
+            self._set_upd_status("Installing the new version…")
+            staged = _stage_beside(download, exe)
+            _strip_mark_of_the_web(staged)
+            _swap_in_new_exe(staged, exe)
+            staged = None                      # consumed by the swap
+            _strip_mark_of_the_web(exe)
+
+            self._set_upd_status(f"Restarting on {latest}…")
+            _relaunch(exe)
+        except _UpdateCancelled:
+            self.root.after(0, self._upd_cancelled)
+            return
+        except PermissionError as e:
+            self.root.after(
+                0, self._upd_install_failed,
+                "Windows wouldn't let the new version take the place of the "
+                f"running one:\n\n{e}\n\nThis is usually a cloud-sync client or "
+                "an antivirus scanner holding the file open. Your current "
+                "version is untouched — please try again in a moment.")
+            return
+        except Exception as e:
+            self.root.after(0, self._upd_install_failed,
+                            f"{type(e).__name__}: {e}")
+            return
+        finally:
+            for leftover in (staged,):
+                if leftover is not None:
+                    try:
+                        os.remove(leftover)
+                    except OSError:
+                        pass
+            if tmpdir is not None:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+        self.root.after(0, self._upd_restart, latest)
+
+    def _upd_install_failed(self, msg):
+        self._upd_set_busy(False)
+        self._upd_timer.stop()
+        self._upd_progress["value"] = 0
+        self._upd_status_var.set("The update didn't install — your current version is unchanged.")
+        self._upd_show_notes("Update failed", msg)
+        if messagebox.askyesno(
+                "Update Failed",
+                f"{msg}\n\nYour current version is unchanged and still works.\n\n"
+                "Open the releases page to download the update manually?"):
+            _open_releases_page()
+
+    def _upd_restart(self, version):
+        """The swap succeeded and the new exe is already starting — close this
+        one. The old build is left on disk as BoxOfScraps.exe.old and the new
+        process deletes it at startup."""
+        self._upd_timer.stop()
+        self._upd_progress["value"] = 1000
+        self._upd_status_var.set(f"Updated to {version} — restarting…")
+        self.root.update_idletasks()
+        self.root.after(700, self.root.destroy)
 
     def _allowed_extensions(self):
         m = self._mode.get()
