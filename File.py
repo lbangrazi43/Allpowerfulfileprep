@@ -6556,7 +6556,55 @@ class ConverterApp:
 
 
 # ─────────────────────────────────────────────
+def _emit_version_and_exit(argv) -> bool:
+    """Handle --version / --version-file, returning True if we should exit now.
+
+    The packaged build is windowed (`console=False` in the spec), so `print`
+    reaches nobody: `sys.stdout` is None and fd 1 isn't a console. Hence two
+    mechanisms —
+
+      --version-file PATH   writes APP_VERSION to a file. Machine-readable and
+                            bulletproof, this is how release.py confirms a freshly
+                            built exe reports the version it was built from
+                            (rather than trusting that the build picked up the
+                            bump).
+      --version             additionally attaches to the parent console via
+                            AttachConsole so a person running it from a terminal
+                            actually sees the answer.
+
+    Checked before any Tk or splash work so neither flag flashes a window."""
+    if "--version-file" in argv:
+        i = argv.index("--version-file")
+        if i + 1 < len(argv):
+            try:
+                Path(argv[i + 1]).write_text(APP_VERSION, encoding="utf-8")
+            except OSError:
+                pass
+            return True
+    if "--version" in argv or "-V" in argv:
+        text = f"Box of Scraps {APP_VERSION}\n"
+        try:
+            import ctypes
+            ATTACH_PARENT_PROCESS, STD_OUTPUT_HANDLE = -1, -11
+            k32 = ctypes.windll.kernel32
+            k32.AttachConsole(ATTACH_PARENT_PROCESS)
+            handle = k32.GetStdHandle(STD_OUTPUT_HANDLE)
+            written = ctypes.c_ulong(0)
+            k32.WriteConsoleW(handle, ctypes.c_wchar_p(text), len(text),
+                              ctypes.byref(written), None)
+        except Exception:
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except Exception:
+                pass
+        return True
+    return False
+
+
 def main():
+    if _emit_version_and_exit(sys.argv[1:]):
+        return
     app = ConverterApp()
     app.run()
 

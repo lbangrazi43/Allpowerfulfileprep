@@ -28,6 +28,13 @@ py -3.12 -m PyInstaller --noconfirm BoxOfScraps.spec
 
 # Regenerate icon.ico from owl_source.png (rarely needed)
 python make_icon.py
+
+# Cut a release (build + tag + push + publish + archive). See Releases below.
+python release.py 1.7.2 --notes notes.md
+
+# Ask a built exe what version it is (the build is windowed, so it answers
+# through a file; --version writes to an attached parent console instead)
+dist\BoxOfScraps.exe --version-file v.txt
 ```
 
 Runtime dependencies (import-time or lazily imported): `tkinterdnd2`, `pywin32`
@@ -43,7 +50,26 @@ their whole run and avoid `CoUninitialize()` between Office launches.
 
 ## Releases
 
-Releases are published manually (not via CI):
+**Use `release.py` — it performs every step below in order, so none can be
+skipped:**
+
+```powershell
+python release.py 1.7.2 --notes notes.md              # cut a stable release
+python release.py 1.8.0-beta.1 --notes notes.md --prerelease
+python release.py 1.7.2 --notes notes.md --dry-run    # preflight only, no changes
+```
+
+It refuses to run unless it is on `main` with a clean tree, the version is
+well-formed and newer than the current `APP_VERSION`, and the tag is unused both
+locally and on the remote. After building it runs the new exe with
+`--version-file` and aborts unless the binary reports the version it was just
+built from — catching a build that silently didn't pick up the bump. Nothing is
+pushed or published until you confirm, and declining reverts the `APP_VERSION`
+edit. It then uploads both assets and archives the previous stable release,
+finishing by printing what is publicly visible and what `/releases/latest`
+returns.
+
+The steps it automates, for when it has to be done by hand:
 1. **Bump `APP_VERSION` in `File.py` first.** It is the single source of truth
    for the in-app updater, which compares it against the newest release tag.
    Ship a stale value and the new exe still believes it is the old version, so
