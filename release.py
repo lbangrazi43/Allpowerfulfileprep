@@ -12,8 +12,9 @@ update forever) and uploading the .sha256 the updater verifies against.
 
 What it does:
     1. Preflight   — repo root, on main, clean tree, version sane and newer,
-                     tag unused locally and on the remote, notes present,
-                     GitHub credentials work.
+                     tag unused locally and on the remote, notes present, a
+                     CHANGELOG.md section for this version, GitHub credentials
+                     work.
     2. Bump+build  — writes APP_VERSION, syntax-checks, builds the one-file exe,
                      then runs the exe with --version-file to confirm the binary
                      really reports the new version.
@@ -195,6 +196,33 @@ def confirm(prompt, assume_yes):
         return False
 
 
+def changelog_entry(version: str) -> str:
+    """Return this version's CHANGELOG.md section, or fail the release.
+
+    The app reads CHANGELOG.md from the repo to tell a user what changed across
+    every version they skipped, so a release with no section here is invisible
+    in exactly the place users look. It is checked in preflight because the only
+    cheap moment to notice is before the build — afterwards the fix means
+    another commit and another ten minutes."""
+    path = ROOT / "CHANGELOG.md"
+    if not path.is_file():
+        fail(f"CHANGELOG.md not found at {path}")
+    text = path.read_text(encoding="utf-8")
+    m = re.search(rf"^##[ \t]+v?{re.escape(version)}[ \t]*(.*)$",
+                  text, re.MULTILINE)
+    if not m:
+        fail(f"CHANGELOG.md has no '## {version}' section.\n"
+             f"      Add one (newest first) so the in-app update screen can "
+             f"tell users what changed in {version}.")
+    body = text[m.end():]
+    nxt = re.search(r"^##[ \t]+v?\d", body, re.MULTILINE)
+    body = (body[:nxt.start()] if nxt else body).strip()
+    if not body:
+        fail(f"CHANGELOG.md's '## {version}' section is empty")
+    ok(f"changelog entry: '## {version}{m.group(1)}' ({len(body)} chars)")
+    return body
+
+
 # ─────────────────────────────────────────────
 def main():
     p = argparse.ArgumentParser(
@@ -254,6 +282,8 @@ def main():
     if not notes:
         fail(f"notes file is empty: {notes_path}")
     ok(f"release notes: {notes_path} ({len(notes)} chars)")
+
+    changelog_entry(new)
 
     token, token_src = github_token()
     who = api("https://api.github.com/user", token)

@@ -59,6 +59,11 @@ python release.py 1.8.0-beta.1 --notes notes.md --prerelease
 python release.py 1.7.2 --notes notes.md --dry-run    # preflight only, no changes
 ```
 
+**Add the `CHANGELOG.md` section before running it** — preflight fails without a
+`## <version>` entry, since that file is what the in-app update screen shows.
+Keep it to one terse line per change; `--notes` still carries the long-form
+write-up that becomes the GitHub release body.
+
 It refuses to run unless it is on `main` with a clean tree, the version is
 well-formed and newer than the current `APP_VERSION`, the tag is unused both
 locally and on the remote, and the token can actually push to the repo — checked
@@ -248,8 +253,8 @@ dead Install button on screen. After each check the button locks for
 60 calls an hour *per IP*, shared by everyone behind one office connection, so a
 spammed button could exhaust it for the whole building. If the quota is hit anyway,
 the error names the local time it resets, read from the `X-RateLimit-Reset` header
-(a 403 only counts as a quota error when `X-RateLimit-Remaining` is 0). Two design
-points carry the whole feature:
+(a 403 only counts as a quota error when `X-RateLimit-Remaining` is 0). Three
+design points carry the whole feature:
 
 - **No "Unblock" step.** The Properties → Unblock checkbox exists because the
   *downloading application* writes the Mark-of-the-Web alternate data stream
@@ -266,7 +271,10 @@ points carry the whole feature:
   rename fails the first is undone, so a failed update always leaves a working
   app. The `.old` backup can't be deleted by the update that created it (it's
   still the running image), so `_cleanup_previous_update` clears it at the next
-  startup.
+  startup — on a background thread with ~11s of retries, because that next
+  startup is *launched by the outgoing app* and routinely gets there while the
+  `.old` image is still running and undeletable. One try was not enough; the
+  symptom was a `.old` that never went away.
   **The new build MUST land at the same path under the same filename** — taskbar
   pins, desktop and Start Menu shortcuts are `.lnk` files that resolve by path, so
   keeping the path identical is what lets a pinned copy survive an update and
@@ -275,6 +283,47 @@ points carry the whole feature:
   engages when the stored path fails to resolve, and here it always resolves.
   Anything that installs to a versioned folder or renamed exe would silently break
   every pin and shortcut the user has.
+- **The restart must not inherit PyInstaller's one-file environment.** The
+  bootloader unpacks the bundle to `%TEMP%\_MEInnnnnn` and tells the Python
+  process it starts where that is via `_PYI_APPLICATION_HOME_DIR`,
+  `_PYI_ARCHIVE_FILE`, `_PYI_PARENT_PROCESS_LEVEL`, `_PYI_SPLASH_IPC`
+  (`PYI_ONEFILE_ENV_VARS`; `_MEIPASS2` pre-6.0) — and *that* process passes them
+  to everything it spawns. A bare `Popen([exe])` therefore starts an app that
+  believes it is already unpacked, skips extraction, and runs out of the outgoing
+  app's temp folder, which the outgoing app deletes on its way out. The restart
+  then dies mid-startup on whichever bundled file it needed next (seen in the
+  wild: `pyi_rth_pkgres` → `pkg_resources` → `setuptools/_vendor/jaraco/text/`
+  `Lorem ipsum.txt`, a real bundled file that had been deleted underneath it),
+  and the exiting app shows "Failed to remove temporary directory" because the
+  new one still holds the DLLs open. It is a race, so it passed on the build
+  machine and failed elsewhere. `_clean_child_env()` strips the variables and
+  `_relaunch` passes it as `env=`; `_relaunch_as_admin` takes them out of
+  `os.environ` around the call instead, since `ShellExecuteW` has no `env`
+  parameter. **Any future code that launches the app, or any other one-file
+  exe, must go through `_clean_child_env`.** (Reproduced and verified with a
+  throwaway one-file probe: without the scrub the child reports the parent's
+  `sys._MEIPASS` and watches its bundled files vanish; with it the child gets
+  its own `_MEI` directory and a complete bundle.)
+
+**Cumulative update notes come from `CHANGELOG.md`, not the releases API.** The
+update page shows every version between the one running and the one on offer, so
+a user who skipped 1.7.1 and 1.7.2 sees all three entries rather than only
+1.7.3's. It cannot read those from the API: auto-archive drafts each previous
+stable release, and GitHub hides drafts from clients without push access — to an
+ordinary user, only the newest release exists. So the notes live in the repo and
+are fetched from `CHANGELOG_RAW_URL` (raw.githubusercontent.com, allowed by the
+existing `.githubusercontent.com` suffix rule, and not the REST API — so it costs
+nothing against the shared 60-calls-an-hour quota). Fetched only when an update
+actually exists, and only from `_upd_check_worker`'s background thread.
+
+`_changelog_since` bounds the selection at both ends (above the installed
+version, no higher than the tag being installed) and drops prereleases, which the
+updater never offers. `_fetch_changelog` returns `""` on *any* failure and
+`_upd_check_done` falls back to the release's own body — enriching the page must
+never break a working update check. **Entries are deliberately terse**, one line
+per change: the long-form write-up stays in the GitHub release body, and this
+file is the quick read shown in the app. `release.py` fails preflight when the
+version being cut has no section, before the ~10-minute build.
 
 Safeguards, in the order they fire: `_current_exe_path()` returns None unless
 `sys.frozen` — from source `sys.executable` is python.exe, and every disk-touching

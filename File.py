@@ -2274,8 +2274,8 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
 # ─────────────────────────────────────────────
 #
 # The app updates itself in place: it downloads the newest BoxOfScraps.exe from
-# the repo's latest release and swaps it over the running one. Two details make
-# that safe and painless, and both are load-bearing:
+# the repo's latest release and swaps it over the running one. Three details
+# make that safe and painless, and all three are load-bearing:
 #
 #  * NO "Unblock" STEP. The Properties > Unblock checkbox exists because the
 #    *downloading application* tags a file with the Mark-of-the-Web alternate
@@ -2290,6 +2290,13 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
 #    in-process (see `_swap_in_new_exe`) rather than a .bat that has to outlive
 #    the process, poll for it to exit, and then move files. That avoids a
 #    flashing console window and a second artifact for antivirus to distrust.
+#
+#  * A SCRUBBED ENVIRONMENT FOR THE RESTART. The one-file bootloader tells the
+#    Python process it starts where it unpacked the bundle, using environment
+#    variables that are then inherited by anything that process spawns. The new
+#    app must not inherit them or it runs out of the outgoing app's unpack
+#    folder and is gutted when that app exits. `_clean_child_env` has the full
+#    story; `_relaunch` and `_relaunch_as_admin` are the only two ways out.
 
 GITHUB_OWNER      = "lbangrazi43"
 GITHUB_REPO       = "Allpowerfulfileprep"
@@ -2297,6 +2304,15 @@ UPDATE_ASSET_NAME = "BoxOfScraps.exe"
 GITHUB_API_LATEST = (f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
                      f"/releases/latest")
 RELEASES_PAGE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+# The short per-version notes shown on the update page, read straight from the
+# repo. It has to come from here rather than from the releases API: the runbook
+# drafts each previous stable release as the next one ships, and the API hides
+# drafts from anyone without push access — so a user who skipped versions cannot
+# be shown those releases' notes, because to them those releases do not exist.
+# raw.githubusercontent.com is also not the REST API, so reading it costs
+# nothing against the 60-calls-an-hour quota the version check lives on.
+CHANGELOG_RAW_URL = (f"https://raw.githubusercontent.com/{GITHUB_OWNER}/"
+                     f"{GITHUB_REPO}/main/CHANGELOG.md")
 
 UPDATE_USER_AGENT     = f"BoxOfScraps/{APP_VERSION}"   # GitHub rejects UA-less calls
 UPDATE_NET_TIMEOUT    = 30                  # seconds, version check
@@ -2309,6 +2325,15 @@ UPDATE_CHUNK          = 256 * 1024
 # that streams without end from filling the user's drive.
 UPDATE_MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
 UPDATE_MAX_CHECKSUM_BYTES = 4096            # a sha256 line is ~80 bytes
+UPDATE_MAX_CHANGELOG_BYTES = 512 * 1024     # the whole history is ~10 KB
+# Everything the PyInstaller one-file bootloader puts in the environment to tell
+# the Python process it starts where the bundle was unpacked. Any process we
+# launch must NOT inherit them; `_clean_child_env` explains what happens when it
+# does. `_MEIPASS2` is the pre-6.0 name for the first one, listed so the rule
+# holds if the build ever moves to an older PyInstaller.
+PYI_ONEFILE_ENV_VARS = ("_PYI_APPLICATION_HOME_DIR", "_PYI_ARCHIVE_FILE",
+                        "_PYI_PARENT_PROCESS_LEVEL", "_PYI_SPLASH_IPC",
+                        "_MEIPASS2")
 # Update traffic may only go to GitHub, over HTTPS. Release assets are served
 # from a *.githubusercontent.com CDN host that GitHub redirects to and renames
 # from time to time, so that whole domain is allowed by suffix while everything
@@ -2453,6 +2478,71 @@ def _fetch_latest_release(timeout: int = UPDATE_NET_TIMEOUT) -> dict:
         raise RuntimeError(
             "Couldn't reach GitHub. Check your internet connection — a company "
             f"firewall or proxy may also be blocking it.\n\nDetail: {e}")
+
+
+# A changelog section starts at a level-2 heading whose first word is a version:
+# "## 1.7.3 — 2026-08-04". Requiring the version is what lets the bodies use
+# their own "## What's new" headings without being mistaken for a new section
+# ("###" can't match either, since a space has to follow the "##").
+_CHANGELOG_HEADING_RE = re.compile(
+    r"^##[ \t]+v?(\d+(?:\.\d+)*(?:-[0-9A-Za-z.\-]+)?)[ \t]*(.*)$", re.MULTILINE)
+
+
+def _fetch_changelog(timeout: int = UPDATE_NET_TIMEOUT) -> str:
+    """Fetch CHANGELOG.md from the repo, or return "" if anything goes wrong.
+
+    Deliberately silent on failure. This only enriches what the update page
+    shows — the release's own notes are the fallback — so a changelog that is
+    unreachable, oversized, or malformed must never turn a working update check
+    into an error the user has to read."""
+    import urllib.request
+    if not _is_allowed_update_url(CHANGELOG_RAW_URL):
+        return ""
+    req = urllib.request.Request(CHANGELOG_RAW_URL)
+    req.add_header("User-Agent", UPDATE_USER_AGENT)
+    req.add_header("Accept", "text/plain")
+    try:
+        with _update_opener().open(req, timeout=timeout) as r:
+            raw = r.read(UPDATE_MAX_CHANGELOG_BYTES + 1)
+        if len(raw) > UPDATE_MAX_CHANGELOG_BYTES:
+            return ""              # not a changelog; don't try to parse it
+        return raw.decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _parse_changelog(text: str) -> list:
+    """Split a changelog into [(version, heading, body), …] as it appears."""
+    matches = list(_CHANGELOG_HEADING_RE.finditer(text or ""))
+    sections = []
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        sections.append((m.group(1),
+                         m.group(0).lstrip("#").strip(),
+                         text[m.end():end].strip()))
+    return sections
+
+
+def _changelog_since(text: str, installed: str, latest: str) -> list:
+    """The sections a user on `installed` has not seen yet, newest first.
+
+    Bounded at both ends on purpose. Anything at or below `installed` is already
+    running, and anything above `latest` isn't part of what this update
+    installs — a changelog can legitimately describe an unreleased version,
+    and promising it here would be a lie. Prereleases are dropped because the
+    updater only ever offers stable releases, so their notes describe changes
+    the user is not about to receive (they arrive folded into the next stable)."""
+    lo, hi = _parse_version(installed), _parse_version(latest)
+    picked = [s for s in _parse_changelog(text)
+              if _parse_version(s[0])[3] and lo < _parse_version(s[0]) <= hi]
+    picked.sort(key=lambda s: _parse_version(s[0]), reverse=True)
+    return picked
+
+
+def _format_changelog_sections(sections: list) -> str:
+    """Render selected changelog sections for the plain-text notes panel."""
+    return "\n\n".join(f"{heading}\n{'─' * max(len(heading), 12)}\n{body}"
+                       for _v, heading, body in sections)
 
 
 def _find_release_asset(release: dict, name: str):
@@ -2658,17 +2748,36 @@ def _cleanup_previous_update(exe: Path) -> None:
     """Delete what a previous update left behind: the backup of the old exe and
     any abandoned staging file.
 
-    Runs once at startup because the backup cannot be removed during the update
-    that created it — at that moment it is still the running image. Entirely
-    best-effort: a leftover that is briefly locked (a sync client is uploading
-    it) is harmless and gets cleaned up on a later launch."""
-    for leftover in (exe.with_name(exe.name + UPDATE_BACKUP_SUFFIX),
-                     exe.with_name("." + exe.stem + ".new.tmp")):
-        try:
-            if leftover.exists():
-                os.remove(leftover)
-        except OSError:
-            pass
+    Runs at startup because the backup cannot be removed during the update that
+    created it — at that moment it is still the running image. It may still be
+    that image *here*: this launch was started by the outgoing app, which then
+    takes about a second to close, and a warm start can easily reach this line
+    first. So a failure on the first try is the expected case rather than the
+    exceptional one, and the retries happen on a background thread where the
+    waiting costs no startup time. (Windows itself refuses to delete a running
+    image, so there is no way for this to remove an exe still in use.)
+
+    Still entirely best-effort: a leftover that stays locked — a sync client is
+    uploading it — is harmless and gets cleaned up on a later launch."""
+    leftovers = [exe.with_name(exe.name + UPDATE_BACKUP_SUFFIX),
+                 exe.with_name("." + exe.stem + ".new.tmp")]
+
+    def _sweep(paths):
+        for delay in (0, 1, 2, 3, 5):      # ~11s of patience, off the main thread
+            if delay:
+                time.sleep(delay)
+            locked = []
+            for leftover in paths:
+                try:
+                    if leftover.exists():
+                        os.remove(leftover)
+                except OSError:
+                    locked.append(leftover)
+            if not locked:
+                return
+            paths = locked
+
+    threading.Thread(target=_sweep, args=(leftovers,), daemon=True).start()
 
 
 def _download_release_asset(url: str, dest: Path, expected_size: int = 0,
@@ -2744,27 +2853,66 @@ def _download_release_asset(url: str, dest: Path, expected_size: int = 0,
     return got
 
 
+def _clean_child_env() -> dict:
+    """This process's environment with PyInstaller's one-file bookkeeping
+    removed, for use when launching another copy of the app.
+
+    Stripping these is not a nicety — without it the relaunch after an update
+    destroys itself. A one-file exe unpacks its bundle into %TEMP%\\_MEInnnnnn
+    and passes the location to the Python process it starts through these
+    variables; that process inherits them to everything it spawns. So a plain
+    Popen([exe]) starts an app that reads them, concludes it is *already*
+    unpacked, skips extraction entirely and runs out of the outgoing app's temp
+    folder — which the outgoing app deletes as it exits, pulling bundled files
+    out from under the new one mid-startup. It dies on whichever file it needed
+    next (observed: a PyInstaller runtime hook importing pkg_resources, which
+    reads a data file out of vendored setuptools), and the exiting app reports
+    'Failed to remove temporary directory' because the new one still holds the
+    DLLs open. Whether it crashes at all is a race, which is why this survived
+    testing on one machine and failed on another.
+
+    Removing the variables makes the new process an independent one that
+    unpacks its own copy."""
+    env = dict(os.environ)
+    for var in PYI_ONEFILE_ENV_VARS:
+        env.pop(var, None)
+    return env
+
+
 def _relaunch(exe: Path) -> None:
-    """Start the freshly-installed exe, detached so it outlives this process."""
+    """Start the freshly-installed exe, detached so it outlives this process.
+
+    Passing `env` is required, not an optimisation — see `_clean_child_env`."""
     import subprocess
     DETACHED_PROCESS = 0x00000008
     CREATE_NEW_PROCESS_GROUP = 0x00000200
     subprocess.Popen(
         [str(exe)], cwd=str(exe.parent), close_fds=True,
+        env=_clean_child_env(),
         creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
 
 
 def _relaunch_as_admin(exe: Path) -> bool:
     """Restart the app behind a UAC prompt, for installs in a location only an
     administrator can write (Program Files), where the rename swap would fail
-    with access denied. Returns True if the elevation prompt was accepted."""
+    with access denied. Returns True if the elevation prompt was accepted.
+
+    ShellExecuteW takes no environment, so the one-file variables come out of
+    *this* process's environment for the duration of the call — the elevated
+    copy must not inherit them, for the reason in `_clean_child_env`. They go
+    back if the prompt is declined, since then this app carries on running and
+    should be left as it was found."""
+    saved = {v: os.environ.pop(v) for v in PYI_ONEFILE_ENV_VARS if v in os.environ}
     try:
         import ctypes
         rc = ctypes.windll.shell32.ShellExecuteW(
             None, "runas", str(exe), None, str(exe.parent), 1)
-        return int(rc) > 32        # ShellExecuteW's success threshold
+        ok = int(rc) > 32          # ShellExecuteW's success threshold
     except Exception:
-        return False
+        ok = False
+    if not ok:
+        os.environ.update(saved)
+    return ok
 
 
 def _open_releases_page() -> None:
@@ -6020,16 +6168,33 @@ class ConverterApp:
         except RuntimeError as e:
             self.root.after(0, self._upd_check_failed, str(e))
             return
+        # Only worth a second request when there is actually something to
+        # install: the changelog exists to describe an upgrade, and fetching it
+        # to tell someone up-to-date nothing is wasted network.
+        changelog = ""
+        if _parse_version(release.get("tag_name") or "") > _parse_version(APP_VERSION):
+            changelog = _fetch_changelog()
         if self._cancel_update.is_set():
             self.root.after(0, self._upd_cancelled)
             return
-        self.root.after(0, self._upd_check_done, release)
+        self.root.after(0, self._upd_check_done, release, changelog)
 
-    def _upd_check_done(self, release):
+    def _upd_check_done(self, release, changelog=""):
         self._upd_set_busy(False)
         tag = (release.get("tag_name") or "").strip()
         latest = tag.lstrip("vV") or "unknown"
         notes = (release.get("body") or "").strip()
+
+        # Everything between the running version and the one on offer, so
+        # skipping releases doesn't mean never hearing what they changed. Falls
+        # back to the release's own notes when the changelog can't be read.
+        skipped = _changelog_since(changelog, APP_VERSION, tag)
+        notes_title = f"What's new in {latest}"
+        if skipped:
+            notes = _format_changelog_sections(skipped)
+            if len(skipped) > 1:
+                notes_title = (f"What's new in {latest} — {len(skipped)} versions "
+                               f"since {APP_VERSION}")
 
         if _parse_version(tag) <= _parse_version(APP_VERSION):
             self._upd_status_var.set(f"You're up to date — {APP_VERSION} is the latest version.")
@@ -6054,7 +6219,7 @@ class ConverterApp:
         self._upd_status_var.set(
             f"Version {latest} is available ({size_mb:,.0f} MB) — "
             f"you have {APP_VERSION}.")
-        self._upd_show_notes(f"What's new in {latest}", notes)
+        self._upd_show_notes(notes_title, notes)
         self._upd_set_mode("install")
 
     def _upd_check_failed(self, msg):
