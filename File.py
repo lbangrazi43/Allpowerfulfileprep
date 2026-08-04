@@ -26,7 +26,7 @@ import zipfile
 # decide whether an update exists. MUST be bumped before every release build —
 # leaving it stale makes the freshly-installed exe still believe it is the old
 # version, so it offers the same update forever.
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.7.2"
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
