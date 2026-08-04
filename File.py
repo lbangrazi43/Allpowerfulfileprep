@@ -2304,6 +2304,19 @@ UPDATE_DL_TIMEOUT     = 120                 # seconds, per read on the download
 UPDATE_MIN_EXE_BYTES  = 5 * 1024 * 1024     # sanity floor for a real build
 UPDATE_BACKUP_SUFFIX  = ".old"
 UPDATE_CHUNK          = 256 * 1024
+# Hard ceiling on anything we will write to disk from the network. The real
+# asset is ~120 MB; this only has to stop a server (or a proxy in the middle)
+# that streams without end from filling the user's drive.
+UPDATE_MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
+UPDATE_MAX_CHECKSUM_BYTES = 4096            # a sha256 line is ~80 bytes
+# Update traffic may only go to GitHub, over HTTPS. Release assets are served
+# from a *.githubusercontent.com CDN host that GitHub redirects to and renames
+# from time to time, so that whole domain is allowed by suffix while everything
+# else is matched exactly. The leading dot matters: it stops a lookalike domain
+# like "notgithubusercontent.com" from satisfying the suffix test.
+UPDATE_ALLOWED_HOSTS       = frozenset({"github.com", "api.github.com",
+                                        "codeload.github.com"})
+UPDATE_ALLOWED_HOST_SUFFIX = ".githubusercontent.com"
 # Minimum gap between version checks. GitHub allows 60 unauthenticated API calls
 # an hour per *IP address* — which everyone behind one office connection shares —
 # so a user leaning on the button could burn the quota for their whole building.
@@ -2329,6 +2342,57 @@ def _parse_version(tag: str) -> tuple:
     while len(parts) < 3:
         parts.append(0)
     return tuple(parts) + (0 if pre else 1,)
+
+
+def _is_allowed_update_url(url: str) -> bool:
+    """True only for an HTTPS URL on a GitHub host we're willing to fetch from.
+
+    Two things this defends against. The update *check* returns a JSON document
+    naming the address to download from; nothing forces that address to be a
+    GitHub one, or even encrypted, so it is checked rather than trusted. And a
+    redirect can send the request somewhere else entirely — see `_update_opener`.
+
+    `urlsplit().hostname` is the safe accessor: it lowercases, strips the port,
+    and — the part that matters — ignores any `user@` prefix, so a crafted URL
+    like `https://github.com@evil.example/x` correctly reports `evil.example`."""
+    import urllib.parse
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme.lower() != "https":
+        return False
+    host = (parts.hostname or "").lower()
+    return host in UPDATE_ALLOWED_HOSTS or host.endswith(UPDATE_ALLOWED_HOST_SUFFIX)
+
+
+def _update_opener():
+    """URL opener used for every update request, enforcing the HTTPS+GitHub rule
+    on redirects and not merely on the first address.
+
+    urllib's stock redirect handler will follow a redirect from `https://` to
+    plain `http://`, and to any host at all. That means checking only the URL we
+    start with proves nothing: the response could bounce the download onto an
+    unencrypted connection, or off GitHub entirely. This refuses the redirect
+    instead, so the whole chain stays encrypted and on GitHub.
+
+    Certificate verification is untouched — it comes from urllib's default HTTPS
+    handler, which validates against the system trust store."""
+    import urllib.request
+    import urllib.error
+
+    class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if not _is_allowed_update_url(newurl):
+                raise urllib.error.HTTPError(
+                    newurl, code,
+                    "refused a redirect to an address that is not an encrypted "
+                    "GitHub one — the update was not downloaded",
+                    headers, fp)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    # build_opener replaces the default redirect handler with our subclass.
+    return urllib.request.build_opener(_SafeRedirect)
 
 
 def _rate_limit_reset_text(err) -> str:
@@ -2362,7 +2426,9 @@ def _fetch_latest_release(timeout: int = UPDATE_NET_TIMEOUT) -> dict:
     req.add_header("User-Agent", UPDATE_USER_AGENT)
     req.add_header("Accept", "application/vnd.github+json")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        # Same opener as the download, so the check can't be redirected off
+        # GitHub or onto an unencrypted connection either.
+        with _update_opener().open(req, timeout=timeout) as r:
             return json.load(r)
     except urllib.error.HTTPError as e:
         # A 403 is only a quota problem when the remaining-calls header says 0;
@@ -2607,19 +2673,46 @@ def _cleanup_previous_update(exe: Path) -> None:
 
 def _download_release_asset(url: str, dest: Path, expected_size: int = 0,
                             progress_cb=None, cancel_event=None,
-                            timeout: int = UPDATE_DL_TIMEOUT) -> int:
+                            timeout: int = UPDATE_DL_TIMEOUT,
+                            max_bytes: int = None) -> int:
     """Stream a release asset to `dest`, reporting progress and honouring Cancel.
 
     Fetching this ourselves rather than handing the URL to a browser is what
     keeps the downloaded exe free of the Mark-of-the-Web tag (see the module
-    header). Returns the byte count actually written."""
+    header). Returns the byte count actually written.
+
+    Three limits bound what the network can do to this machine:
+      * the address must be an encrypted GitHub one, before a byte is requested;
+      * so must every address it is redirected to (`_update_opener`);
+      * writing stops the instant the response exceeds the size GitHub declared,
+        so a server that streams without end cannot fill the disk. Checking only
+        after the stream finished — as this used to — is too late, because by
+        then the data is already on disk."""
     import urllib.request
+    if not _is_allowed_update_url(url):
+        raise RuntimeError(
+            "Refusing to download the update: the address given is not an "
+            "encrypted GitHub one.")
+
+    # Decide the byte ceiling BEFORE connecting. A declared size larger than the
+    # ceiling is itself a reason to stop — it can't be a real build.
+    cap = UPDATE_MAX_DOWNLOAD_BYTES if max_bytes is None else max_bytes
+    if expected_size:
+        if expected_size > cap:
+            raise RuntimeError(
+                f"The update claims to be {expected_size:,} bytes, beyond the "
+                f"{cap:,}-byte limit this app will download.")
+        limit = expected_size
+    else:
+        limit = cap
+
     req = urllib.request.Request(url)
     req.add_header("User-Agent", UPDATE_USER_AGENT)
     req.add_header("Accept", "application/octet-stream")
+    opener = _update_opener()
     got = 0
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with opener.open(req, timeout=timeout) as r:
             total = expected_size or int(r.headers.get("Content-Length") or 0)
             with open(dest, "wb") as f:
                 while True:
@@ -2628,12 +2721,20 @@ def _download_release_asset(url: str, dest: Path, expected_size: int = 0,
                     chunk = r.read(UPDATE_CHUNK)
                     if not chunk:
                         break
+                    # Refuse the chunk that would take us past the ceiling, so
+                    # at most `limit` bytes ever reach the disk.
+                    if got + len(chunk) > limit:
+                        raise RuntimeError(
+                            f"The download is bigger than the {limit:,} bytes it "
+                            "was supposed to be, so it was stopped and discarded.")
                     f.write(chunk)
                     got += len(chunk)
                     if progress_cb is not None:
                         progress_cb(got, total)
     except _UpdateCancelled:
         raise
+    except RuntimeError:
+        raise                      # our own refusals already read clearly
     except Exception as e:
         raise RuntimeError(f"Download failed: {e}")
     if expected_size and got != expected_size:
@@ -6115,7 +6216,8 @@ class ConverterApp:
                 try:
                     _download_release_asset(
                         checksum_asset.get("browser_download_url"), sums,
-                        cancel_event=self._cancel_update)
+                        cancel_event=self._cancel_update,
+                        max_bytes=UPDATE_MAX_CHECKSUM_BYTES)
                     expected = sums.read_text(
                         encoding="utf-8", errors="ignore").split()[0].strip().lower()
                 except _UpdateCancelled:

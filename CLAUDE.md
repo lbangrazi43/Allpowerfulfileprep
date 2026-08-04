@@ -275,7 +275,19 @@ fails fast and offers `_relaunch_as_admin` instead of dying at the swap;
 `_has_room_for_update` checks for the download plus the backup. Nothing touches
 the installed app until the download passes `_looks_like_windows_exe` (MZ + PE
 signature — catches a captive-portal page served with a 200) plus a size floor and
-the optional published SHA-256. The download lands in the *system* temp dir, never
+the optional published SHA-256. **The published SHA-256 is an integrity check, not
+an authenticity one** — it is served from the same release as the binary, so it
+catches corruption and truncation but not an attacker who can alter both. Nothing
+in the updater verifies *who* built the exe; a signing key would be needed for
+that. Network traffic is confined by `_is_allowed_update_url` (HTTPS only, on a
+GitHub host, via `urlsplit().hostname` so `https://github.com@evil.example` is
+correctly read as `evil.example`) and by `_update_opener`, whose redirect handler
+re-applies that rule to *every* hop — urllib's stock handler will otherwise follow
+an https→http downgrade to any host, so checking only the first URL proves
+nothing. Writing stops the moment a response exceeds the size GitHub declared
+(`UPDATE_MAX_DOWNLOAD_BYTES` when it declares none), because comparing sizes after
+the stream ends is too late: the disk is already full. The download lands in the
+*system* temp dir, never
 beside the exe, so a synced install doesn't push 120 MB through OneDrive and back;
 `_stage_beside` then moves it onto the exe's own volume because `os.replace`
 cannot rename across volumes. `_replace_with_retry` absorbs the transient locks a
