@@ -60,8 +60,19 @@ python release.py 1.7.2 --notes notes.md --dry-run    # preflight only, no chang
 ```
 
 It refuses to run unless it is on `main` with a clean tree, the version is
-well-formed and newer than the current `APP_VERSION`, and the tag is unused both
-locally and on the remote. After building it runs the new exe with
+well-formed and newer than the current `APP_VERSION`, the tag is unused both
+locally and on the remote, and the token can actually push to the repo — checked
+in preflight so a permissions problem surfaces before the ~10-minute build rather
+than at the upload, with a commit already pushed.
+
+**Release credentials.** Set `APFP_RELEASE_TOKEN` to a fine-grained GitHub token
+limited to this repository with *Contents: read and write*; `GITHUB_TOKEN` is
+honoured next, and `git credential fill` is the last resort. That fallback is
+normally an OAuth token carrying the classic `repo` scope — read and write over
+*every* repository on the account — so preflight prints which source it used and
+warns when the broad one is in play, since a silent fallback defeats the point.
+Tokens bypass 2FA regardless (that is what makes them scriptable), so narrowing
+the token is what limits the blast radius of a leak, not the account's 2FA. After building it runs the new exe with
 `--version-file` and aborts unless the binary reports the version it was just
 built from — catching a build that silently didn't pick up the bump. Nothing is
 pushed or published until you confirm, and declining reverts the `APP_VERSION`

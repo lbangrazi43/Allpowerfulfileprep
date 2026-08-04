@@ -24,10 +24,19 @@ What it does:
 
 Everything before step 3 is reversible; you are asked to confirm before anything
 is pushed or published.
+
+Credentials: set APFP_RELEASE_TOKEN to a fine-grained GitHub token limited to
+this repository with "Contents: read and write". Without it this falls back to
+whatever Git has stored, which is normally an OAuth token holding the classic
+`repo` scope — write access to every repository on the account. Preflight prints
+which token it used and warns when the broad one is in play, because a silent
+fallback is the failure worth catching. Tokens bypass 2FA either way, so the
+narrower one limits what a leak is worth.
 """
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -111,15 +120,54 @@ def set_version(new):
 
 
 def github_token():
-    """Ask git's credential helper for a GitHub token (`gh` isn't installed)."""
+    """Return (token, where_it_came_from), preferring one dedicated to releasing.
+
+    Order of preference:
+      APFP_RELEASE_TOKEN  a fine-grained token scoped to THIS repository alone
+      GITHUB_TOKEN        the usual CI convention
+      git credential fill whatever Git uses day to day
+
+    That last one is the fallback, not the goal. Git's stored credential is
+    typically an OAuth token carrying the classic `repo` scope, which grants
+    read and write over *every* repository on the account — far more reach than
+    publishing one release needs, and exempt from 2FA because tokens always are.
+    The source is returned so preflight can print it: silently falling back to
+    the everyday credential is precisely the mistake worth surfacing.
+
+    `gh` is not installed in this environment, hence the REST API throughout."""
+    for var in ("APFP_RELEASE_TOKEN", "GITHUB_TOKEN"):
+        value = os.environ.get(var, "").strip()
+        if value:
+            return value, var
     r = subprocess.run(["git", "credential", "fill"], cwd=str(ROOT), text=True,
                        input="protocol=https\nhost=github.com\n\n",
                        capture_output=True)
     for line in (r.stdout or "").splitlines():
         if line.startswith("password="):
-            return line.split("=", 1)[1].strip()
-    fail("No GitHub token from `git credential fill`. Run a `git push` first so "
-         "the credential helper has something stored.")
+            return line.split("=", 1)[1].strip(), "git credential fill"
+    fail("No GitHub token. Set APFP_RELEASE_TOKEN to a fine-grained token with "
+         "Contents: read and write on this repository, or run a `git push` "
+         "first so the credential helper has something stored.")
+
+
+def repo_access(token):
+    """Return (oauth_scopes, permissions) for this repository.
+
+    A classic or OAuth token advertises its account-wide reach in the
+    X-OAuth-Scopes header. A fine-grained token sends no such header — its reach
+    shows up only as the repository's own permissions block — so an empty scopes
+    string is the good outcome, not a missing answer."""
+    req = urllib.request.Request(API)
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("User-Agent", "box-of-scraps-release")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            scopes = (r.headers.get("X-OAuth-Scopes") or "").strip()
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        fail(f"this token can't read {OWNER}/{REPO} -> HTTP {e.code} ({e.reason})")
+    return scopes, (data.get("permissions") or {})
 
 
 def api(url, token, data=None, method=None, ctype="application/json"):
@@ -207,9 +255,29 @@ def main():
         fail(f"notes file is empty: {notes_path}")
     ok(f"release notes: {notes_path} ({len(notes)} chars)")
 
-    token = github_token()
+    token, token_src = github_token()
     who = api("https://api.github.com/user", token)
-    ok(f"GitHub auth: {who['login']}")
+    ok(f"GitHub auth: {who['login']}  (token from {token_src})")
+
+    # Confirm write access HERE, before the ~10-minute build and before anything
+    # is pushed — otherwise a token without it fails at the upload, having
+    # already committed and pushed the version bump.
+    scopes, perms = repo_access(token)
+    if not perms.get("push"):
+        fail(f"this token cannot push to {OWNER}/{REPO} "
+             f"(permissions: {perms or 'none'})")
+    ok(f"write access to {OWNER}/{REPO}: yes")
+    if scopes:
+        listed = [s.strip() for s in scopes.split(",") if s.strip()]
+        ok(f"token scopes: {', '.join(listed)}")
+        if "repo" in listed:
+            warn("this token carries the classic 'repo' scope — it can read and "
+                 "write EVERY repository on the account, not just this one.")
+            warn("safer: create a fine-grained token limited to this repository "
+                 "with Contents: read and write, and put it in "
+                 "APFP_RELEASE_TOKEN.")
+    else:
+        ok("fine-grained token — no account-wide scopes")
 
     prev = None
     if not args.prerelease:
