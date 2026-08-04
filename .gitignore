@@ -1,15 +1,118 @@
-# PyInstaller build output
+# ─────────────────────────────────────────────
+# Box of Scraps — .gitignore
+#
+# This repository is PUBLIC and its working folder sits inside a synced OneDrive
+# tree, so these rules lean towards keeping things out. The negations at the
+# bottom are what guarantee a fresh clone can still build and run.
+# ─────────────────────────────────────────────
+
+# ── Build output ─────────────────────────────
+# dist/ holds the ~120 MB one-file exe; it ships as a release asset, never here.
 build/
 dist/
-*.spec
+*.egg-info/
+*.manifest
 
-# Python cache
+# ── Python ───────────────────────────────────
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# Virtual environment
+# ── Virtual environments ─────────────────────
 .venv/
+venv/
+env/
+ENV/
 
-# Temporary probe artifacts
+# ── Secrets — nothing here may ever be committed ──
+# The update-signing private key is meant to live outside this folder entirely;
+# these patterns are the safety net for the day one gets saved here by mistake.
+# The signing PUBLIC key belongs in the source and is deliberately not matched.
+*.key
+*.pem
+*.pfx
+*.p12
+*.jks
+*.keystore
+*.asc
+*.gpg
+id_rsa*
+id_ecdsa*
+id_ed25519*
+*.ppk
+signing*
+*private*
+.env
+.env.*
+*.env
+secrets.*
+credentials.*
+*.token
+token.txt
+.netrc
+_netrc
+
+# ── Executables and updater leftovers ────────
+# The app renames itself during a self-update, so a built exe run from this
+# folder drops these beside itself.
+*.exe
+*.exe.old
+*.exe.sha256
+*.old
+.*.new.tmp
+
+# ── Editors / tooling ────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.claude/settings.local.json
+
+# ── Windows / OneDrive litter ────────────────
+# OneDrive writes desktop.ini into synced folders and forks a "conflicted copy"
+# when the same file is edited on two machines — neither belongs in git.
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*conflicted copy*
+*-DESKTOP-*
+.DS_Store
+
+# ── Scratch / throwaway ──────────────────────
+# Verification scripts get written, run, and deleted (see CLAUDE.md); these
+# catch the ones that outlive their session.
 _md_probe.py
+*_probe.py
+scratch/
+tmp/
+*.tmp
+*.log
+v.txt
+
+# ─────────────────────────────────────────────
+# REQUIRED FOR A WORKING CLONE — these stay tracked no matter what lands above.
+#
+# BoxOfScraps.spec is the build recipe and was previously swallowed by the
+# "*.spec" rule. It survived only because it was already tracked, so removing it
+# once would have silently broken every future build from a clean clone. The
+# PNGs are bundled into the exe by that spec, and icon.ico is the app icon and
+# its dev-mode window icon.
+# ─────────────────────────────────────────────
+!BoxOfScraps.spec
+!owl_source.png
+!logo_b.png
+!splash_static.png
+!icon.ico
+!File.py
+!make_icon.py
+!release.py
+!CLAUDE.md
+!.gitignore

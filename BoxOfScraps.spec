@@ -2,7 +2,10 @@
 from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 datas = [
-    ('C:\\Users\\user\\Downloads\\files\\icon.ico', '.'),
+    # All build inputs are repo-relative on purpose: an absolute path here (this
+    # used to point into a Downloads folder) builds fine on one machine and
+    # fails on every other one, including a fresh clone.
+    ('icon.ico', '.'),
     ('owl_source.png', '.'),   # splash: owl sprite
     ('logo_b.png', '.'),       # splash: 'b' logo sprite
 ]
@@ -82,5 +85,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:\\Users\\user\\Downloads\\files\\icon.ico'],
+    icon=['icon.ico'],
 )
