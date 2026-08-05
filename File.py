@@ -3693,6 +3693,23 @@ def _format_changelog_sections(sections: list) -> str:
                        for _v, heading, body in sections)
 
 
+def _release_published_date(release: dict) -> str:
+    """When a release was published, formatted for display, or '' if unknown.
+
+    Comes straight out of the release JSON already in hand, so showing it costs
+    nothing against the shared 60-calls-an-hour quota. `published_at` is an ISO
+    8601 timestamp and only the date part is shown; `created_at` covers the rare
+    release that reports no publish time. Returns '' rather than a placeholder
+    so callers can leave the phrase out entirely instead of printing "released
+    unknown".
+    """
+    for key in ("published_at", "created_at"):
+        stamp = (release.get(key) or "").strip()
+        if stamp:
+            return _format_release_date(stamp.split("T")[0])
+    return ""
+
+
 def _find_release_asset(release: dict, name: str):
     """Find a named file attached to a release, or None."""
     for asset in release.get("assets") or []:
@@ -7446,18 +7463,24 @@ class ConverterApp:
         # Everything between the running version and the one on offer, so
         # skipping releases doesn't mean never hearing what they changed. Falls
         # back to the release's own notes when the changelog can't be read.
+        # When the offered version was released, shown wherever that version is
+        # named. Left out entirely when GitHub didn't say, rather than printed
+        # as a placeholder.
+        published = _release_published_date(release)
+        when = f" (released {published})" if published else ""
+
         skipped = _changelog_since(changelog, APP_VERSION, tag)
-        notes_title = f"What's new in {latest}"
+        notes_title = f"What's new in {latest}{when}"
         if skipped:
             notes = _format_changelog_sections(skipped)
             if len(skipped) > 1:
-                notes_title = (f"What's new in {latest} — {len(skipped)} versions "
-                               f"since {APP_VERSION}")
+                notes_title = (f"What's new in {latest}{when} — {len(skipped)} "
+                               f"versions since {APP_VERSION}")
 
         if _parse_version(tag) <= _parse_version(APP_VERSION):
             self._upd_status_var.set(f"You're up to date — {APP_VERSION} is the latest version.")
             self._upd_show_notes(
-                f"Up to date — latest release is {latest}",
+                f"Up to date — latest release is {latest}{when}",
                 notes)
             self._upd_set_mode("check")
             return
@@ -7467,7 +7490,7 @@ class ConverterApp:
             self._upd_status_var.set(
                 f"Version {latest} is available, but it has no "
                 f"{UPDATE_ASSET_NAME} download attached.")
-            self._upd_show_notes(f"Version {latest} is available", notes)
+            self._upd_show_notes(f"Version {latest} is available{when}", notes)
             self._upd_set_mode("check")
             return
 
