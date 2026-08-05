@@ -20,6 +20,7 @@ import html as htmllib
 import re
 import json
 import zipfile
+from collections import deque, namedtuple
 
 # The running app's version, and the single source of truth for the "Check for
 # Updates" feature: it is compared against the newest GitHub release tag to
@@ -65,6 +66,19 @@ def _ensure_outlook():
         )
 
 
+def _inches(value: float) -> float:
+    """Inches → points (72 to the inch), which is the unit Office measures in.
+
+    Deliberately NOT Application.InchesToPoints. On a hidden, automated Word
+    instance that COM helper raises "Unspecified error" — and because every call
+    site wrapped it in a try/except, the failure was silent: the margins it was
+    there to compute were simply never applied, and page-fitting maths that
+    assumed them was wrong. The conversion is exact, so doing it in Python is
+    both more reliable and one less COM round trip.
+    """
+    return value * 72.0
+
+
 def _safe_filename(name: str) -> str:
     """Strip characters that are illegal in Windows filenames."""
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip() or "attachment"
@@ -75,10 +89,13 @@ def _attachments_dir(out_path: Path) -> Path:
     return out_path.parent / out_path.stem
 
 
-def _save_eml_attachments(src_path: Path, out_path: Path):
+def _save_eml_attachments(src_path: Path, out_path: Path) -> list:
     """
     Extract real (non-inline) attachments from a .eml file and save them
-    into a subfolder named after the PDF. Returns the number saved.
+    into a subfolder named after the PDF. Returns the list of files written.
+
+    The caller gets paths rather than a count so auto-PDF can feed them back
+    into its own conversion queue — see _auto_pdf_scan_and_convert.
     """
     import email as emaillib
     import email.policy
@@ -95,7 +112,7 @@ def _save_eml_attachments(src_path: Path, out_path: Path):
     with open(src_path, "rb") as f:
         msg = emaillib.message_from_binary_file(f, policy=emaillib.policy.compat32)
 
-    saved = 0
+    saved = []
     att_dir = None
 
     for part in msg.walk():
@@ -119,7 +136,7 @@ def _save_eml_attachments(src_path: Path, out_path: Path):
         if not fname:
             # Build a sensible name from content-type
             ext = ct.split("/")[-1].split(";")[0].strip()
-            fname = f"attachment_{saved + 1}.{ext}"
+            fname = f"attachment_{len(saved) + 1}.{ext}"
 
         if att_dir is None:
             att_dir = _attachments_dir(out_path)
@@ -128,37 +145,44 @@ def _save_eml_attachments(src_path: Path, out_path: Path):
         dest = att_dir / _safe_filename(fname)
         # Avoid overwriting if two attachments share a name
         if dest.exists():
-            dest = att_dir / f"{dest.stem}_{saved + 1}{dest.suffix}"
+            dest = att_dir / f"{dest.stem}_{len(saved) + 1}{dest.suffix}"
         dest.write_bytes(payload)
-        saved += 1
+        saved.append(dest)
 
     return saved
 
 
-def _save_msg_attachments(mail, out_path: Path) -> int:
+def _save_msg_attachments(mail, out_path: Path) -> list:
     """
     Extract attachments from an open Outlook COM mail item and save them
-    into a subfolder named after the PDF. Returns the number saved.
+    into a subfolder named after the PDF. Returns the list of files written.
+
+    The caller gets paths rather than a count so auto-PDF can feed them back
+    into its own conversion queue — see _auto_pdf_scan_and_convert.
     """
     try:
         attachments = mail.Attachments
         count = attachments.Count
     except Exception:
-        return 0
+        return []
 
     if count == 0:
-        return 0
+        return []
 
     att_dir = _attachments_dir(out_path)
     att_dir.mkdir(parents=True, exist_ok=True)
-    saved = 0
+    saved = []
 
     for i in range(1, count + 1):   # COM collections are 1-indexed
         try:
             att = attachments.Item(i)
 
-            # Attachment type 5 = OLE object, 6 = embedded message.
-            # Rarely useful as standalone files; skip them.
+            # OlAttachmentType: 1 olByValue, 4 olByReference,
+            # 5 olEmbeddeditem, 6 olOLE.
+            # 5 is an attached Outlook item (an email or appointment inside this
+            # one) and 6 is an embedded OLE object; neither reliably saves as a
+            # standalone file, so both are skipped. A consequence worth knowing:
+            # an email attached to an email is NOT extracted.
             try:
                 att_type = att.Type
                 if att_type in (5, 6):
@@ -172,12 +196,12 @@ def _save_msg_attachments(mail, out_path: Path) -> int:
                 dest = att_dir / f"{dest.stem}_{i}{dest.suffix}"
 
             att.SaveAsFile(str(dest.resolve()))
-            saved += 1
+            saved.append(dest)
         except Exception:
             pass   # skip attachments that can't be saved
 
     # Remove the folder if nothing was actually saved
-    if saved == 0:
+    if not saved:
         try:
             att_dir.rmdir()
         except Exception:
@@ -234,10 +258,10 @@ def _fit_word_doc_to_page(doc, word):
     try:
         for section in doc.Sections:
             ps = section.PageSetup
-            ps.LeftMargin   = word.InchesToPoints(0.5)
-            ps.RightMargin  = word.InchesToPoints(0.5)
-            ps.TopMargin    = word.InchesToPoints(0.5)
-            ps.BottomMargin = word.InchesToPoints(0.5)
+            ps.LeftMargin   = _inches(0.5)
+            ps.RightMargin  = _inches(0.5)
+            ps.TopMargin    = _inches(0.5)
+            ps.BottomMargin = _inches(0.5)
     except Exception:
         pass
 
@@ -294,12 +318,18 @@ def _fit_word_doc_to_page(doc, word):
             pass
 
 
-def _msg_to_pdf(src_path: Path, out_path: Path, outlook, word):
-    """Convert a .msg file to PDF and extract attachments via Outlook COM."""
+def _msg_to_pdf(src_path: Path, out_path: Path, outlook, word, attachments_out=None):
+    """Convert a .msg file to PDF and extract attachments via Outlook COM.
+
+    attachments_out: optional list; the paths of every saved attachment are
+    appended to it, so a caller can act on them (auto-PDF converts them too).
+    """
     mail = outlook.Session.OpenSharedItem(str(src_path.resolve()))
     try:
         _print_mail_to_pdf(mail, out_path, word)
-        _save_msg_attachments(mail, out_path)
+        saved = _save_msg_attachments(mail, out_path)
+        if attachments_out is not None:
+            attachments_out.extend(saved)
     finally:
         mail.Close(0)   # 0 = olDiscard
 
@@ -424,11 +454,14 @@ def _parse_eml_to_html(src_path: Path) -> str:
     return _inject_print_css(full_html)
 
 
-def _eml_to_pdf(src_path: Path, out_path: Path, word):
+def _eml_to_pdf(src_path: Path, out_path: Path, word, attachments_out=None):
     """
     Convert a .eml file to PDF and extract attachments.
     Parses the .eml directly in Python (no Outlook involvement) then
     exports via Word — avoids the 'Invalid path or URL' COM error entirely.
+
+    attachments_out: optional list; the paths of every saved attachment are
+    appended to it, so a caller can act on them (auto-PDF converts them too).
     """
     if word is None:
         raise RuntimeError(
@@ -474,7 +507,9 @@ def _eml_to_pdf(src_path: Path, out_path: Path, word):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # Extract attachments into a subfolder alongside the PDF
-    _save_eml_attachments(src_path, out_path)
+    saved = _save_eml_attachments(src_path, out_path)
+    if attachments_out is not None:
+        attachments_out.extend(saved)
 
 
 
@@ -738,11 +773,9 @@ def _fit_excel_sheets_to_page(wb, excel):
             pass
         # Narrow margins so more of the table fits at a larger scale.
         try:
-            m = excel.InchesToPoints(0.25)
-            hm = excel.InchesToPoints(0.1)
-            ps.LeftMargin = ps.RightMargin = m
-            ps.TopMargin = ps.BottomMargin = m
-            ps.HeaderMargin = ps.FooterMargin = hm
+            ps.LeftMargin = ps.RightMargin = _inches(0.25)
+            ps.TopMargin = ps.BottomMargin = _inches(0.25)
+            ps.HeaderMargin = ps.FooterMargin = _inches(0.1)
         except Exception:
             pass
 
@@ -834,19 +867,88 @@ def _word_to_pdf(src_path: Path, out_path: Path, word):
                 pass
 
 
-# Plain-text report dumps produced by legacy / ERP / mainframe systems. Word
-# picks an importer by extension and has none registered for these, so they go
-# through a temp .txt copy (see _text_report_to_pdf).
-TEXT_REPORT_EXTS = (".rep", ".rpt", ".prn", ".lst")
+# Plain-text dumps that Word has no importer for. Word picks an importer by
+# extension and has none registered for any of these, so they go through a temp
+# .txt copy (see _text_report_to_pdf).
+#
+# Two groups, handled identically: report dumps from legacy / ERP / mainframe
+# systems, and the structured-text and log formats that come out of the same
+# systems. Both want the monospace, fit-to-widest-line layout _fit_report_to_page
+# applies — Word's Normal style would reflow a fixed-width report or a JSON blob
+# into proportional prose and destroy its alignment.
+#
+# Anything here that turns out to be binary (a compiled Crystal Reports .rpt, a
+# .dat that isn't text) is rejected up front by _read_report_text rather than
+# emitted as mojibake, so listing a sometimes-binary extension is safe.
+TEXT_REPORT_EXTS = (
+    # Report dumps
+    ".rep", ".rpt", ".prn", ".lst",
+    # Logs, traces and program output
+    ".log", ".out", ".err", ".dat", ".trace",
+    # Structured text and data dumps
+    ".json", ".jsonl", ".ndjson", ".yaml", ".yml", ".sql",
+    ".tsv", ".psv", ".tab",
+    # Config files
+    ".ini", ".cfg", ".conf", ".toml", ".properties", ".env",
+    # Plain prose / notes formats Word has no importer for
+    ".md", ".text", ".nfo", ".asc", ".rst",
+    # Diffs
+    ".diff", ".patch",
+    # Scripts and source, which turn up as evidence in IT/controls work and
+    # are only ever wanted verbatim, in a fixed-width font
+    ".bat", ".cmd", ".ps1", ".sh", ".py", ".js", ".vbs", ".css",
+)
+
+# Extensions this mode will take when the user picks it by hand, but does NOT
+# own for automatic routing — another mode is the better default for each.
+# `.txt` and `.xml` are Word's (its importers wrap prose properly, where the
+# fixed-width layout below would shrink a long unwrapped paragraph to 5pt), and
+# `.csv` is Excel's. Choosing "Basic Text" is how you say you want the raw text
+# instead — useful for a malformed CSV or an XML you want to read as-is.
+TEXT_REPORT_ALSO_ACCEPTS = (".txt", ".xml", ".csv")
+
+# Image formats, split by whether Word's own picture filter can read them.
+# Declared here — well above _image_to_pdf, which uses them — because the
+# extension tables further down (FILETYPE_FOLDERS, AUTO_PDF_EXTS, PDF_MODES) are
+# built from IMAGE_EXTS at import time.
+_WORD_NATIVE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif"}
+# Formats Word has no filter for at all. Pillow rewrites these to a temp PNG
+# first; .heic/.heif additionally need the pillow-heif plugin registered. HEIC
+# matters because it is what an iPhone saves photos as by default.
+_PILLOW_IMAGE_EXTS = {".webp", ".heic", ".heif", ".ico"}
+IMAGE_EXTS = tuple(sorted(_WORD_NATIVE_IMAGE_EXTS | _PILLOW_IMAGE_EXTS))
+
+# Points held back from an image's height budget for the line box it sits in.
+# See _insert_picture_fitted.
+_IMAGE_LINE_RESERVE = 4.0
 
 # Consolas' advance width is ~0.55 em, so N characters at F points occupy about
-# N * 0.55 * F points. Used to pick a font size that fits the widest line.
+# N * 0.55 * F points. Used to pick a font size that fits the target width.
 _MONO_ADVANCE     = 0.55
-_REPORT_FONT_MIN  = 5.0
 _REPORT_FONT_MAX  = 11.0
+# The smallest type we will shrink to in order to keep lines unwrapped. Below
+# this, shrinking stops buying readability, so the layout wraps instead — see
+# _report_layout.
+_REPORT_FONT_MIN  = 7.0
+# Size used once wrapping is unavoidable. Comfortable to read; there is no
+# alignment left to protect at that point, so there is nothing to shrink for.
+_REPORT_FONT_WRAP = 9.0
+# Width is taken from this percentile of line lengths rather than the maximum.
+# One 300-character stack trace in a log of 80-character lines would otherwise
+# shrink the whole document to fit that single line. Content that really is
+# column-aligned is unaffected: there the percentile *is* the maximum.
+_REPORT_FIT_PERCENTILE = 0.95
 # Wider than this many columns and the report gets a landscape page before we
 # start shrinking type — a readable landscape report beats a 6pt portrait one.
 _REPORT_LANDSCAPE_COLS = 96
+# Tabs are expanded to spaces at this interval before anything is measured or
+# rendered. Word's default tab stops are half-inch, which neither matches the
+# monospace grid nor matches the one-character-per-tab the width estimate would
+# otherwise assume — so a .tsv would be mis-measured and mis-aligned.
+_REPORT_TAB_WIDTH = 8
+# Hanging indent, in characters, applied only when lines wrap: it makes a
+# continuation visibly subordinate to the line it belongs to.
+_REPORT_WRAP_INDENT_CHARS = 4
 
 
 def _looks_binary(raw: bytes) -> bool:
@@ -882,16 +984,70 @@ def _read_report_text(src_path: Path) -> str:
     return raw.decode("latin-1", errors="replace")
 
 
-def _fit_report_to_page(doc, word, longest_line):
-    """Lay an imported report out so no line wraps.
+def _report_fit_columns(text: str) -> int:
+    """How many columns the layout should be sized for.
+
+    Deliberately NOT the longest line. One 300-character stack trace in a log of
+    80-character lines, or one minified record in a file of short ones, would
+    otherwise shrink every page to fit that single outlier — the whole document
+    rendered at 5pt to protect alignment on one line that has none. Taking a high
+    percentile instead lets those few lines wrap and keeps the rest readable.
+
+    Content that genuinely is column-aligned loses nothing: when every line is a
+    similar width, the percentile and the maximum are the same number.
+    """
+    widths = sorted(len(ln) for ln in text.split("\n") if ln.strip())
+    if not widths:
+        return 0
+    idx = min(len(widths) - 1, int(len(widths) * _REPORT_FIT_PERCENTILE))
+    return widths[idx]
+
+
+def _report_layout(fit_cols: int, page_w: float, page_h: float, margin: float):
+    """Decide orientation and type size for `fit_cols` columns of monospace.
+
+    Returns (landscape, font_size, wrapping). Three cases:
+
+      • It fits portrait          → portrait, sized to fill the width.
+      • It only fits landscape    → landscape, same idea. A readable landscape
+                                    report beats a cramped portrait one.
+      • It fits neither, even at  → portrait at a comfortable fixed size, and let
+        _REPORT_FONT_MIN            it wrap. This is the important case: once
+                                    lines must wrap, the column alignment this
+                                    whole layout exists to protect is already
+                                    gone, so there is nothing left to shrink for
+                                    — and short lines read better than a wide
+                                    wall of tiny text.
+    """
+    if fit_cols <= 0:
+        return False, _REPORT_FONT_MAX, False
+
+    def size_for(width):
+        return (width - 2 * margin) / (_MONO_ADVANCE * fit_cols)
+
+    landscape = fit_cols > _REPORT_LANDSCAPE_COLS
+    size = size_for(page_h if landscape else page_w)
+    if size >= _REPORT_FONT_MIN:
+        return landscape, min(_REPORT_FONT_MAX, size), False
+    return False, _REPORT_FONT_WRAP, True
+
+
+def _fit_report_to_page(doc, word, fit_cols, max_cols=0):
+    """Lay imported text out so it is readable and fills the page sensibly.
 
     Word imports plain text in the Normal style — a proportional font with
     paragraph spacing — which destroys the column alignment a fixed-width
     report depends on. This forces monospace, removes the inter-line spacing
-    that would otherwise double-space the whole report, and sizes the page and
-    type to the widest line.
+    that would otherwise double-space everything, and sizes the page and type
+    per _report_layout.
+
+    `fit_cols` comes from _report_fit_columns, not from the longest line.
+    `max_cols` is the genuine longest line: when it exceeds `fit_cols` some
+    lines will wrap even though the layout "fits", and those continuations get
+    the hanging indent too.
     """
     wdOrientLandscape = 1
+    wdOrientPortrait = 0
     wdLineSpaceSingle = 0
 
     try:
@@ -899,8 +1055,8 @@ def _fit_report_to_page(doc, word, longest_line):
     except Exception:
         pass
 
-    # Word's Normal style adds space between paragraphs; every report line is
-    # its own paragraph, so without this the output is double-spaced.
+    # Word's Normal style adds space between paragraphs; every line of the input
+    # is its own paragraph, so without this the output is double-spaced.
     try:
         pf = doc.Content.ParagraphFormat
         pf.SpaceBefore = 0
@@ -909,26 +1065,41 @@ def _fit_report_to_page(doc, word, longest_line):
     except Exception:
         pass
 
+    margin = _inches(0.4)
+    try:
+        ps = doc.Sections(1).PageSetup
+        # Read the paper's own dimensions before any orientation change, so the
+        # decision doesn't depend on how the page happens to be set up already.
+        page_w, page_h = sorted((ps.PageWidth, ps.PageHeight))
+    except Exception:
+        page_w, page_h = 612.0, 792.0          # Letter portrait, as a fallback
+
+    landscape, size, wrapping = _report_layout(fit_cols, page_w, page_h, margin)
+
     try:
         for section in doc.Sections:
-            ps = section.PageSetup
-            if longest_line > _REPORT_LANDSCAPE_COLS:
-                ps.Orientation = wdOrientLandscape
-            ps.LeftMargin = ps.RightMargin = word.InchesToPoints(0.4)
-            ps.TopMargin = ps.BottomMargin = word.InchesToPoints(0.4)
+            sps = section.PageSetup
+            sps.Orientation = wdOrientLandscape if landscape else wdOrientPortrait
+            sps.LeftMargin = sps.RightMargin = margin
+            sps.TopMargin = sps.BottomMargin = margin
     except Exception:
         pass
 
-    if longest_line <= 0:
-        return
     try:
-        ps = doc.Sections(1).PageSetup
-        printable = ps.PageWidth - ps.LeftMargin - ps.RightMargin
-        size = printable / (_MONO_ADVANCE * longest_line)
-        doc.Content.Font.Size = round(
-            max(_REPORT_FONT_MIN, min(_REPORT_FONT_MAX, size)), 1)
+        doc.Content.Font.Size = round(size, 1)
     except Exception:
         pass
+
+    if wrapping or max_cols > fit_cols:
+        # Give continuations a hanging indent so a wrapped line reads as part of
+        # the line above rather than as a new record.
+        try:
+            indent = _REPORT_WRAP_INDENT_CHARS * _MONO_ADVANCE * size
+            pf = doc.Content.ParagraphFormat
+            pf.LeftIndent = indent
+            pf.FirstLineIndent = -indent
+        except Exception:
+            pass
 
 
 def _text_report_to_pdf(src_path: Path, out_path: Path, word):
@@ -947,7 +1118,15 @@ def _text_report_to_pdf(src_path: Path, out_path: Path, word):
         )
 
     text = _read_report_text(src_path)
-    longest = max((len(ln.rstrip("\r")) for ln in text.split("\n")), default=0)
+    # Expand tabs before anything measures or renders the text. Word's default
+    # tab stops are half-inch, so a .tsv would neither line up on the monospace
+    # grid nor match a width estimate that counts a tab as one character —
+    # columns would drift and the page would be sized too narrow. Doing it here
+    # means the temp file Word opens and the width we compute agree exactly.
+    text = "\n".join(ln.rstrip("\r").expandtabs(_REPORT_TAB_WIDTH)
+                     for ln in text.split("\n"))
+    fit_cols = _report_fit_columns(text)
+    max_cols = max((len(ln) for ln in text.split("\n")), default=0)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(prefix="apfp_report_"))
@@ -962,7 +1141,7 @@ def _text_report_to_pdf(src_path: Path, out_path: Path, word):
             ReadOnly=True,
             AddToRecentFiles=False,
         )
-        _fit_report_to_page(doc, word, longest)
+        _fit_report_to_page(doc, word, fit_cols, max_cols)
         doc.ExportAsFixedFormat(
             OutputFileName=str(out_path.resolve()),
             ExportFormat=17,        # wdExportFormatPDF
@@ -1032,6 +1211,222 @@ def _ppt_to_pdf(src_path: Path, out_path: Path, powerpoint):
         if prs is not None:
             try:
                 prs.Close()
+            except Exception:
+                pass
+
+
+# Jet/ACE bookkeeping tables. Access hides these in its own UI and they hold
+# internal object IDs rather than user data, so exporting them is pure noise.
+_ACCESS_SYSTEM_PREFIXES = ("MSys", "~TMPCLP", "f_")
+
+
+def _access_table_names(access) -> list:
+    """User table names in the currently-open database, in the order Access
+    lists them. System and temporary tables are filtered out. AccessObject
+    collections are 0-indexed, unlike most of Office's COM collections."""
+    names = []
+    try:
+        tables = access.CurrentData.AllTables
+        count = tables.Count
+    except Exception as e:
+        raise RuntimeError(f"could not read the table list: {e}")
+    for i in range(count):
+        try:
+            name = str(tables(i).Name)
+        except Exception:
+            continue
+        if not name.startswith(_ACCESS_SYSTEM_PREFIXES):
+            names.append(name)
+    return names
+
+
+def _access_to_pdf(src_path: Path, out_path: Path, access, excel):
+    """Convert every user table in a .accdb / .mdb database to a single PDF.
+
+    Access can print a table straight to PDF with DoCmd.OutputTo, but that
+    renders the datasheet at 100% — a wide table is sliced across pages
+    column-wise — and writes one file per table, which does not fit the app's
+    one-input-one-PDF model. So each table is exported onto its own sheet of a
+    single temp workbook (TransferSpreadsheet appends a sheet per call when the
+    file name is reused) and that workbook goes through _excel_to_pdf, which
+    already fits every sheet to one page wide and turns wide sheets landscape.
+
+    This is a readable dump of the *data*. Queries, forms, reports, macros and
+    relationships are not exported, and the database itself is opened
+    non-exclusively and never modified.
+
+    A database locked with a database password would put up Access's own
+    interactive prompt; nothing here can pre-answer it, so that case is left to
+    the per-file watchdog, which kills the instance and records a timeout.
+    """
+    if access is None:
+        raise RuntimeError(
+            "Microsoft Access is required to convert database files.\n"
+            "Please ensure Access is installed."
+        )
+    if excel is None:
+        raise RuntimeError(
+            "Microsoft Excel is required to convert database files "
+            "(tables are laid out as sheets before export).\n"
+            "Please ensure Excel is installed."
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="apfp_access_"))
+    tmp_xlsx = tmp_dir / ((src_path.stem or "database") + ".xlsx")
+    try:
+        opened = False
+        try:
+            access.OpenCurrentDatabase(str(src_path.resolve()), False)   # non-exclusive
+            opened = True
+
+            names = _access_table_names(access)
+            if not names:
+                raise RuntimeError("the database contains no user tables")
+
+            exported = []
+            for name in names:
+                try:
+                    access.DoCmd.TransferSpreadsheet(
+                        1,                  # acExport
+                        10,                 # acSpreadsheetTypeExcel12Xml (.xlsx)
+                        name,
+                        str(tmp_xlsx),
+                        True,               # HasFieldNames — header row
+                    )
+                    exported.append(name)
+                except Exception:
+                    # A linked table whose source is gone, or a name Excel can't
+                    # take as a sheet. Skip it rather than lose the whole database.
+                    continue
+            if not exported:
+                raise RuntimeError(
+                    "no tables could be exported (linked tables whose source is "
+                    "unavailable are skipped)")
+        except Exception as e:
+            raise RuntimeError(f"Access to PDF conversion failed: {e}")
+        finally:
+            if opened:
+                try:
+                    access.CloseCurrentDatabase()
+                except Exception:
+                    pass
+
+        # Outside the wrapper above so Excel's own error text isn't double-prefixed.
+        _excel_to_pdf(tmp_xlsx, out_path, excel)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _first_com_str(value) -> str:
+    """Pull the string out of a COM call that may have returned it directly or
+    packed alongside other out-parameters. Returns '' when there isn't one."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            if isinstance(item, str) and item:
+                return item
+    return ""
+
+
+def _onenote_section_id(onenote, src_path: Path) -> str:
+    """Find the object ID OneNote assigned to an opened section file.
+
+    Fallback for when OpenHierarchy's [out] parameter doesn't come back through
+    COM late binding: ask for the section-level hierarchy XML and match on the
+    file path OneNote records for each section.
+    """
+    try:
+        xml = _first_com_str(onenote.GetHierarchy("", 3, ""))   # hsSections
+    except Exception:
+        return ""
+    if not xml:
+        return ""
+    target = str(src_path.resolve()).lower()
+    for element in re.findall(r"<(?:\w+:)?Section\b[^>]*>", xml):
+        path_m = re.search(r'\bpath="([^"]*)"', element)
+        id_m = re.search(r'\bID="([^"]*)"', element)
+        if path_m and id_m and htmllib.unescape(path_m.group(1)).lower() == target:
+            return id_m.group(1)
+    return ""
+
+
+# HRESULTs meaning "this application is registered, but Windows could not start
+# or reach its automation server":
+#   0x80080005  CO_E_SERVER_EXEC_FAILURE — "Server execution failed"
+#   0x800706BE  RPC_S_CALL_FAILED        — "The remote procedure call failed"
+#   0x800706BA  RPC_S_SERVER_UNAVAILABLE — "The RPC server is unavailable"
+#
+# Telling these apart from "not installed" matters, because they are what a
+# damaged or partial Office registration produces — OneNote has been seen to
+# launch and work perfectly by hand while every one of these fires on a COM
+# activation. Reporting that as "please install OneNote" sends the user to fix
+# something that isn't broken.
+COM_SERVER_UNREACHABLE_HRESULTS = (-2146959355, -2147023170, -2147023174)
+
+COM_SERVER_REPAIR_HINT = (
+    "A Quick Repair of Office (Settings > Apps > Microsoft Office > Modify) "
+    "normally restores it.")
+
+
+def _com_hresult(exc):
+    """The HRESULT from a pywin32 com_error, or None. com_error carries it as
+    the first element of args."""
+    args = getattr(exc, "args", ())
+    if args and isinstance(args[0], int):
+        return args[0]
+    return None
+
+
+def _onenote_to_pdf(src_path: Path, out_path: Path, onenote):
+    """Convert a OneNote section (.one) to PDF via the OneNote COM API.
+
+    A .one file is a section, not a self-contained document, so it has to be
+    opened into the OneNote hierarchy before anything can render it:
+    OpenHierarchy returns the section's object ID and Publish renders that ID
+    to a fixed format (pfPDF = 3).
+
+    Only the desktop OneNote — 2016 and the Microsoft 365 build — exposes this
+    API. The Store "OneNote for Windows 10" app does not, so on a machine with
+    only that installed the dispatch fails and the caller reports it.
+
+    The section is closed again afterwards so converting a loose .one file does
+    not leave it parked in the user's notebook list. Note that OneNote is
+    single-instance and is the user's own app: like Outlook, it is driven but
+    never force-killed or quit.
+    """
+    if onenote is None:
+        raise RuntimeError(
+            "Microsoft OneNote is required to convert .one files.\n"
+            "The desktop version of OneNote (2016 or Microsoft 365) must be "
+            "installed — the Store 'OneNote for Windows 10' app cannot be "
+            "automated."
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    section_id = ""
+    try:
+        # cftNone = 0: open the existing file, don't create anything.
+        section_id = _first_com_str(
+            onenote.OpenHierarchy(str(src_path.resolve()), "", "", 0))
+        if not section_id:
+            section_id = _onenote_section_id(onenote, src_path)
+        if not section_id:
+            raise RuntimeError("OneNote did not report an ID for this section")
+
+        onenote.Publish(section_id, str(out_path.resolve()), 3, "")   # pfPDF
+    except Exception as e:
+        if _com_hresult(e) in COM_SERVER_UNREACHABLE_HRESULTS:
+            raise RuntimeError(
+                "OneNote's automation interface could not be reached. OneNote "
+                "appears to be installed, but Windows could not start its COM "
+                f"server. {COM_SERVER_REPAIR_HINT}")
+        raise RuntimeError(f"OneNote to PDF conversion failed: {e}")
+    finally:
+        if section_id:
+            try:
+                onenote.CloseNotebook(section_id, True)
             except Exception:
                 pass
 
@@ -1121,13 +1516,77 @@ LEGACY_OFFICE = {
 }
 
 
-# Executable name + COM ProgID for each Office family.
+# Executable name + the COM ProgIDs to try, in order, for each Office family.
+#
+# Nearly every family needs only its one version-independent ProgID. OneNote is
+# the exception and lists three: on a 64-bit Python driving a 32-bit Office the
+# type library behind `OneNote.Application` is registered only in the 32-bit
+# registry view, so the object dispatches but every method lookup on it fails
+# with "Library not registered" — the older ProgID resolves against a type
+# library that does load. _launch_office_isolated therefore takes the first
+# ProgID whose automation API actually answers, not just the first that
+# dispatches. (Observed on Office 16 32-bit under 64-bit Python: the default
+# ProgID returns a hollow object, `OneNote.Application.12` a working one.)
+#
+# OneNote is also single-instance: DispatchEx attaches to the user's running
+# onenote.exe rather than starting a second one, so no new PID appears and
+# _launch_office_isolated correctly returns an empty PID set — which is what
+# stops the watchdog and Cancel from killing the user's own OneNote. Same
+# situation PowerPoint can be in.
 OFFICE_INFO = {
-    "word":       ("winword.exe", "Word.Application"),
-    "excel":      ("excel.exe",   "Excel.Application"),
-    "powerpoint": ("powerpnt.exe", "PowerPoint.Application"),
-    "visio":      ("visio.exe",   "Visio.Application"),
+    "word":       ("winword.exe",  ("Word.Application",)),
+    "excel":      ("excel.exe",    ("Excel.Application",)),
+    "powerpoint": ("powerpnt.exe", ("PowerPoint.Application",)),
+    "visio":      ("visio.exe",    ("Visio.Application",)),
+    "access":     ("msaccess.exe", ("Access.Application",)),
+    "onenote":    ("onenote.exe",  ("OneNote.Application",
+                                    "OneNote.Application.15",
+                                    "OneNote.Application.12")),
 }
+
+# Members each family's converter actually calls, checked right after dispatch.
+#
+# A successful DispatchEx is NOT proof the application can be driven: Office
+# leaves ProgIDs and CLSIDs registered for components that aren't usable from
+# this process, and the resulting object only fails on first use. Without this
+# check the user gets an AttributeError per file for a whole batch instead of
+# one clear "Microsoft X is required" dialog before it starts.
+#
+# Only the families where that has been seen are listed; the rest fall through
+# to a plain "is it None" test, exactly as before.
+OFFICE_REQUIRED_MEMBERS = {
+    "onenote": ("OpenHierarchy", "Publish"),
+    "access":  ("OpenCurrentDatabase", "DoCmd"),
+}
+
+
+def _office_app_usable(family: str, app) -> bool:
+    """True if `app` is an Office object whose automation API actually answers.
+
+    See OFFICE_REQUIRED_MEMBERS for why dispatching successfully isn't enough.
+    """
+    if app is None:
+        return False
+    for attr in OFFICE_REQUIRED_MEMBERS.get(family, ()):
+        try:
+            getattr(app, attr)
+        except Exception:
+            return False
+    return True
+
+# Human-readable app name per family, for "Microsoft X is required" messages.
+OFFICE_APP_NAMES = {
+    "word": "Word", "excel": "Excel", "powerpoint": "PowerPoint",
+    "visio": "Visio", "access": "Access", "onenote": "OneNote",
+}
+
+# Families we drive but never shut down. OneNote is single-instance and holds
+# the user's synced notebooks, so the object we get is their running app rather
+# than one we own — the same reasoning that keeps Outlook off-limits. (It
+# exposes no Quit method either, so this is belt and braces.) Killing a process
+# is still governed separately, by whether _launch_office_isolated saw a NEW pid
+# appear: attach to an existing instance and there is nothing to kill.
+NEVER_QUIT_FAMILIES = {"onenote"}
 
 
 def _office_pids(exe_name: str) -> set:
@@ -1238,10 +1697,29 @@ def _launch_office_isolated(family: str):
 
     If no new process appears (e.g. PowerPoint attached to the user's existing
     instance), `pids` is empty and that instance is deliberately never killed.
+
+    Raises if none of the family's ProgIDs yields a usable object, so callers
+    can report "Microsoft X is required" once rather than failing per file.
     """
-    exe, progid = OFFICE_INFO[family]
+    exe, progids = OFFICE_INFO[family]
     before = _office_pids(exe)
-    app = win32com.client.DispatchEx(progid)
+
+    app = None
+    last_err = None
+    for progid in progids:
+        try:
+            candidate = win32com.client.DispatchEx(progid)
+        except Exception as e:
+            last_err = e
+            continue
+        if _office_app_usable(family, candidate):
+            app = candidate
+            break
+        last_err = RuntimeError(
+            f"{progid} dispatched but its automation API is not available")
+    if app is None:
+        raise last_err or RuntimeError(
+            f"Could not start {OFFICE_APP_NAMES.get(family, family)}.")
     try:
         if family == "powerpoint":
             app.WindowState = 2          # ppWindowMinimized (PP can't be fully hidden)
@@ -1287,6 +1765,14 @@ def _launch_office_isolated(family: str):
                           ("EnableEvents", False)):
             try:
                 setattr(app, prop, val)
+            except Exception:
+                pass
+    elif family == "access":
+        # Access has no DisplayAlerts; warnings are suppressed through DoCmd,
+        # and Echo off is its equivalent of ScreenUpdating.
+        for meth, val in (("SetWarnings", False), ("Echo", False)):
+            try:
+                getattr(app.DoCmd, meth)(val)
             except Exception:
                 pass
     # Nothing is on screen in a hidden instance, so painting is wasted time.
@@ -1353,6 +1839,177 @@ def _modernize_office_file(src_path: Path, out_path: Path, family: str, fmt: int
 
 
 # ─────────────────────────────────────────────
+# Archive extraction
+#
+# Folder Unzipping accepts three container formats, and nested-archive expansion
+# looks for all three at any depth. Each needs a different reader:
+#
+#   .zip  stdlib zipfile.
+#   .7z   py7zr — pure Python, so it bundles into the exe with no extra binary.
+#   .rar  rarfile, which is only a *parser*: RAR's decompression algorithm is
+#         proprietary and there is no pure-Python implementation of it, so
+#         something external has to do the actual work. See _extract_rar for how
+#         that is arranged without shipping a third-party binary.
+# ─────────────────────────────────────────────
+
+ARCHIVE_EXTS = (".zip", ".7z", ".rar")
+
+# A stuck external extractor shouldn't hang a batch the way a stuck Office
+# instance would; unlike COM there is a process to wait on, so it gets a bound.
+ARCHIVE_TOOL_TIMEOUT = 600      # seconds
+
+# Hide the console window an external extractor would otherwise flash on screen:
+# the app is built windowed, so any child console is a visible pop-up.
+_CREATE_NO_WINDOW = 0x08000000
+
+
+class _ArchiveProtected(Exception):
+    """Raised when an archive is encrypted and so can't be extracted here. Kept
+    distinct so the caller can list it under 'password-protected' rather than
+    reporting it as a corrupt file."""
+
+
+def _extract_with_bsdtar(src: Path, dest: Path) -> bool:
+    """Try to extract `src` with Windows' own bsdtar. Returns True on success.
+
+    Windows has shipped tar.exe — bsdtar on libarchive — since Windows 10 1803,
+    and libarchive reads both RAR4 and RAR5. That makes it the one extractor
+    guaranteed to already be on the machine, which is what lets .rar work on a
+    stock install with nothing to download and no third-party binary bundled
+    into the exe.
+    """
+    import subprocess
+    tar = shutil.which("tar")
+    if not tar:
+        return False
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.run(
+            [tar, "-xf", str(src.resolve()), "-C", str(dest.resolve())],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=_CREATE_NO_WINDOW,
+            timeout=ARCHIVE_TOOL_TIMEOUT,
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0
+
+
+def _extract_7z(src: Path, dest: Path):
+    """Extract a .7z archive with py7zr."""
+    try:
+        import py7zr
+    except ImportError as e:
+        raise RuntimeError(
+            "The 'py7zr' package is required to extract .7z archives.\n"
+            "Install it with:  pip install py7zr"
+        ) from e
+    try:
+        with py7zr.SevenZipFile(str(src), mode="r") as z:
+            if z.needs_password():
+                raise _ArchiveProtected()
+            z.extractall(path=str(dest))
+    except _ArchiveProtected:
+        raise
+    except Exception as e:
+        # A 7z with an encrypted *header* can't even be listed without the
+        # password, so it fails at open rather than at needs_password().
+        if type(e).__name__ == "PasswordRequired" or "password" in str(e).lower():
+            raise _ArchiveProtected()
+        raise
+
+
+def _extract_rar(src: Path, dest: Path):
+    """Extract a .rar archive, trying each available extractor in turn.
+
+    1. rarfile, which locates an installed unrar/unar/bsdtar for itself. This is
+       the best option when the user has WinRAR or unrar, and it is also the
+       only one that can report encryption cleanly.
+    2. Windows' bundled bsdtar, invoked directly. This is the path that works on
+       a machine with nothing extra installed.
+
+    Only if both fail does this raise, and the message says what to install
+    rather than just reporting a failure.
+    """
+    last_err = None
+    try:
+        import rarfile
+    except ImportError as e:
+        last_err = e
+    else:
+        try:
+            with rarfile.RarFile(str(src)) as rf:
+                if rf.needs_password():
+                    raise _ArchiveProtected()
+                dest.mkdir(parents=True, exist_ok=True)
+                rf.extractall(path=str(dest))
+            return
+        except _ArchiveProtected:
+            raise
+        except Exception as e:
+            last_err = e
+
+    if _extract_with_bsdtar(src, dest):
+        return
+
+    raise RuntimeError(
+        "Could not extract this .rar archive. RAR compression is proprietary, "
+        "so an external extractor is needed: install WinRAR or unrar, or use "
+        "Windows 10 1803 or newer (which includes one). "
+        f"Last error: {last_err}"
+    )
+
+
+def _extract_archive(src: Path, dest: Path):
+    """Extract any archive in ARCHIVE_EXTS into `dest`.
+
+    Raises _ArchiveProtected when the archive is encrypted, and RuntimeError
+    with actionable text for anything else.
+    """
+    ext = src.suffix.lower()
+    dest.mkdir(parents=True, exist_ok=True)
+    if ext == ".zip":
+        with zipfile.ZipFile(src, "r") as zf:
+            zf.extractall(dest)
+    elif ext == ".7z":
+        _extract_7z(src, dest)
+    elif ext == ".rar":
+        _extract_rar(src, dest)
+    else:
+        raise RuntimeError(
+            f"Unsupported archive type: {ext or '(no extension)'}. "
+            f"Supported: {', '.join(ARCHIVE_EXTS)}")
+
+
+def _archive_needs_password(src_path: Path) -> bool:
+    """True if a .7z or .rar archive is encrypted.
+
+    Best-effort and never raises. An archive that can't be inspected — because
+    no extractor for it is available — reads as not-protected, so it goes on to
+    fail with the real "install X" message instead of a misleading
+    "password-protected" one.
+    """
+    ext = src_path.suffix.lower()
+    try:
+        if ext == ".7z":
+            import py7zr
+            try:
+                with py7zr.SevenZipFile(str(src_path), mode="r") as z:
+                    return bool(z.needs_password())
+            except Exception as e:
+                return (type(e).__name__ == "PasswordRequired"
+                        or "password" in str(e).lower())
+        if ext == ".rar":
+            import rarfile
+            with rarfile.RarFile(str(src_path)) as rf:
+                return bool(rf.needs_password())
+    except Exception:
+        pass
+    return False
+
+
+# ─────────────────────────────────────────────
 # Password Removal — strip the open-password (encryption) from Office files.
 #
 # Office's "Encrypt with Password" wraps the document in a standard encrypted
@@ -1368,7 +2025,8 @@ def _modernize_office_file(src_path: Path, out_path: Path, family: str, fmt: int
 PWD_EXTS = {
     ".doc", ".docx", ".docm", ".dot", ".dotx", ".dotm", ".rtf",
     ".xls", ".xlsx", ".xlsm", ".xlsb", ".xlt", ".xltx", ".xltm",
-    ".ppt", ".pptx", ".pptm", ".pps", ".ppsx", ".pot", ".potx",
+    ".ppt", ".pptx", ".pptm", ".pps", ".ppsx", ".ppsm",
+    ".pot", ".potx", ".potm",
 }
 
 
@@ -1396,25 +2054,28 @@ def _office_is_encrypted(src_path: Path) -> bool:
 
 
 # The only formats that can carry open-password encryption: the Office
-# containers msoffcrypto understands, plus ZIP archives. Checking anything else
-# means opening and parsing a file that can never be protected, which is pure
-# overhead on batches of images, text, or email.
-ENCRYPTABLE_EXTS = PWD_EXTS | {".zip"}
+# containers msoffcrypto understands, plus the archive formats. Checking
+# anything else means opening and parsing a file that can never be protected,
+# which is pure overhead on batches of images, text, or email.
+ENCRYPTABLE_EXTS = PWD_EXTS | set(ARCHIVE_EXTS)
 
 
 def _is_password_protected(src_path: Path) -> bool:
     """True if `src_path` is locked with a password and therefore can't be
     processed by the other tools. Covers password-encrypted Office files
-    (.docx/.xlsx/.pptx and legacy .doc/.xls/.ppt) and password-encrypted ZIPs.
-    Best-effort and never raises — anything unrecognized is treated as not
-    protected. Used by every tool EXCEPT Password Removal to skip such files and
-    point the user at the Password Removal tool.
+    (.docx/.xlsx/.pptx and legacy .doc/.xls/.ppt) and encrypted .zip/.7z/.rar
+    archives. Best-effort and never raises — anything unrecognized is treated as
+    not protected. Used by every tool EXCEPT Password Removal to skip such files
+    and point the user at the Password Removal tool.
 
     Judged by extension first, so a protected file given a misleading extension
     (an encrypted .docx renamed to .txt) reads as unprotected — it would fail
     later in conversion anyway, and every tool already filters by extension."""
-    if src_path.suffix.lower() not in ENCRYPTABLE_EXTS:
+    ext = src_path.suffix.lower()
+    if ext not in ENCRYPTABLE_EXTS:
         return False
+    if ext in (".7z", ".rar"):
+        return _archive_needs_password(src_path)
     try:
         if _office_is_encrypted(src_path):
             return True
@@ -1823,18 +2484,30 @@ def _ai_infer_date(text: str, cfg: dict, timeout: int = 30):
 FILETYPE_FOLDERS = {
     ".pdf": "PDF",
     ".doc": "Word Documents", ".docx": "Word Documents", ".docm": "Word Documents",
-    ".dot": "Word Documents", ".dotx": "Word Documents", ".rtf": "Word Documents",
+    ".dot": "Word Documents", ".dotx": "Word Documents", ".dotm": "Word Documents",
+    ".rtf": "Word Documents", ".odt": "Word Documents",
     ".txt": "Text Files", ".md": "Text Files",
     ".xls": "Excel Spreadsheets", ".xlsx": "Excel Spreadsheets", ".xlsm": "Excel Spreadsheets",
     ".xlsb": "Excel Spreadsheets", ".csv": "Excel Spreadsheets",
-    ".ppt": "PowerPoint", ".pptx": "PowerPoint", ".pps": "PowerPoint", ".ppsx": "PowerPoint",
-    ".jpg": "Images", ".jpeg": "Images", ".png": "Images", ".gif": "Images",
-    ".bmp": "Images", ".tiff": "Images", ".tif": "Images", ".webp": "Images",
+    ".xlt": "Excel Spreadsheets", ".xltx": "Excel Spreadsheets", ".xltm": "Excel Spreadsheets",
+    ".ods": "Excel Spreadsheets",
+    ".ppt": "PowerPoint", ".pptx": "PowerPoint", ".pptm": "PowerPoint",
+    ".pps": "PowerPoint", ".ppsx": "PowerPoint", ".ppsm": "PowerPoint",
+    ".pot": "PowerPoint", ".potx": "PowerPoint", ".potm": "PowerPoint",
+    ".odp": "PowerPoint",
+    ".accdb": "Databases", ".mdb": "Databases",
+    ".one": "OneNote",
     ".msg": "Emails", ".eml": "Emails",
     ".html": "Web Pages", ".htm": "Web Pages", ".mht": "Web Pages", ".mhtml": "Web Pages",
-    ".zip": "Archives",
-    ".vsd": "Visio", ".vsdx": "Visio",
+    ".zip": "Archives", ".7z": "Archives", ".rar": "Archives",
+    ".tar": "Archives", ".gz": "Archives", ".tgz": "Archives",
+    ".vsd": "Visio", ".vsdx": "Visio", ".vsdm": "Visio",
+    ".vst": "Visio", ".vstx": "Visio", ".vstm": "Visio",
 }
+# Every image format the app understands lands in one Images folder.
+FILETYPE_FOLDERS.update({ext: "Images" for ext in IMAGE_EXTS})
+# Report dumps, logs and structured text sit with the other text files.
+FILETYPE_FOLDERS.update({ext: "Text Files" for ext in TEXT_REPORT_EXTS})
 
 
 def _filetype_folder(ext: str) -> str:
@@ -1842,37 +2515,56 @@ def _filetype_folder(ext: str) -> str:
     return FILETYPE_FOLDERS.get(ext, ext.lstrip(".").upper() or "Other")
 
 
-def convert_file(src_path: Path, out_dir: Path, outlook, word, visio, excel, powerpoint, mode: str) -> Path:
+def convert_file(src_path: Path, out_dir: Path, mode: str, apps: dict, outlook=None,
+                 attachments_out=None) -> Path:
     """
     Convert a single file to PDF.
-    mode: 'email', 'html', 'visio', 'excel', 'word_doc', 'powerpoint', 'image',
-          'text_report'
+
+    mode: one of the keys in PDF_MODES — 'email', 'html', 'visio', 'excel',
+          'word_doc', 'powerpoint', 'image', 'text_report', 'access', 'onenote'.
+    apps: {family: COM app} holding the isolated Office instances this mode
+          needs, keyed as in OFFICE_INFO. A family that failed to launch maps to
+          None, and the converter raises its own "Microsoft X is required"
+          message — so callers only have to supply what they managed to start.
+          Passing a dict rather than one parameter per application is what keeps
+          this signature from growing every time a new Office app is wired in.
+    outlook: the user's shared Outlook instance, for email mode only. Never one
+          of the isolated instances — Outlook is the user's mail client.
+    attachments_out: optional list. Email mode appends the path of every
+          attachment it saved beside the PDF, so a caller can act on them —
+          auto-PDF queues them for conversion. Ignored by every other mode.
+
     Returns the path of the created PDF. Never overwrites an existing PDF.
     """
     ext = src_path.suffix.lower()
     out_path = _unique_pdf_path(out_dir, src_path.stem)
+    word = apps.get("word")
 
     if mode == "email":
         if ext == ".msg":
-            _msg_to_pdf(src_path, out_path, outlook, word)
+            _msg_to_pdf(src_path, out_path, outlook, word, attachments_out)
         elif ext == ".eml":
-            _eml_to_pdf(src_path, out_path, word)
+            _eml_to_pdf(src_path, out_path, word, attachments_out)
         else:
             raise ValueError(f"Unsupported file type for Email mode: {ext}")
     elif mode == "html":
         _html_to_pdf(src_path, out_path, word)
     elif mode == "visio":
-        _visio_to_pdf(src_path, out_path, visio)
+        _visio_to_pdf(src_path, out_path, apps.get("visio"))
     elif mode == "excel":
-        _excel_to_pdf(src_path, out_path, excel)
+        _excel_to_pdf(src_path, out_path, apps.get("excel"))
     elif mode == "word_doc":
         _word_to_pdf(src_path, out_path, word)
     elif mode == "text_report":
         _text_report_to_pdf(src_path, out_path, word)
     elif mode == "powerpoint":
-        _ppt_to_pdf(src_path, out_path, powerpoint)
+        _ppt_to_pdf(src_path, out_path, apps.get("powerpoint"))
     elif mode == "image":
         _image_to_pdf(src_path, out_path, word)
+    elif mode == "access":
+        _access_to_pdf(src_path, out_path, apps.get("access"), apps.get("excel"))
+    elif mode == "onenote":
+        _onenote_to_pdf(src_path, out_path, apps.get("onenote"))
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -1947,17 +2639,21 @@ def _find_extraction_root(path: Path) -> Path:
 
 
 def _recursive_unzip_in_place(directory: Path):
-    """Find and extract every nested zip anywhere inside directory, repeatedly.
+    """Find and extract every nested archive anywhere inside directory, repeatedly.
 
-    Each zip is extracted into a folder named after the zip file, then the zip
-    is deleted. The loop repeats until no more zips exist in the tree —
-    handling arbitrary nesting depth (zip inside zip inside zip …).
-    Zips that fail to extract (corrupted, encrypted) are tracked so the loop
-    cannot spin forever on an unextractable file.
+    Covers every format in ARCHIVE_EXTS, and mixed nesting between them (a .7z
+    inside a .zip inside a .rar). Each archive is extracted into a folder named
+    after it, then the archive is deleted. The loop repeats until none are left
+    in the tree, handling arbitrary nesting depth.
+    Archives that fail to extract (corrupted, encrypted, or needing a tool that
+    isn't available) are tracked so the loop cannot spin forever on one.
     """
     failed_zips: set = set()
     while True:
-        zips = [p for p in directory.rglob("*.zip") if p not in failed_zips]
+        zips = [p for p in directory.rglob("*")
+                if p.is_file()
+                and p.suffix.lower() in ARCHIVE_EXTS
+                and p not in failed_zips]
         if not zips:
             break
         for zip_path in zips:
@@ -1965,8 +2661,7 @@ def _recursive_unzip_in_place(directory: Path):
                 continue
             tmp = Path(tempfile.mkdtemp())
             try:
-                with zipfile.ZipFile(zip_path, "r") as zf:
-                    zf.extractall(tmp)
+                _extract_archive(zip_path, tmp)
                 content_root = _find_extraction_root(tmp)
                 target_dir = zip_path.parent / zip_path.stem
                 target_dir.mkdir(parents=True, exist_ok=True)
@@ -2011,40 +2706,396 @@ def _collect_and_flatten(src_dir: Path, dest_dir: Path):
     return created
 
 
-def _image_to_pdf(src: Path, out_path: Path, word):
-    """Embed an image in a blank Word document and export as PDF."""
-    doc = word.Documents.Add()
+_HEIF_REGISTERED = False
+
+
+def _register_heif():
+    """Register pillow-heif so Pillow can open .heic/.heif, once per process.
+
+    Kept lazy and separate from the Pillow import: pillow-heif is only needed
+    when such a file actually turns up, so a missing plugin can't stop the rest
+    of the image handling from working.
+    """
+    global _HEIF_REGISTERED
+    if _HEIF_REGISTERED:
+        return
     try:
-        doc.InlineShapes.AddPicture(
-            FileName=str(src.resolve()),
-            LinkToFile=False,
-            SaveWithDocument=True,
+        from pillow_heif import register_heif_opener
+    except ImportError as e:
+        raise RuntimeError(
+            "The 'pillow-heif' package is required to convert .heic / .heif "
+            "images (the format iPhones save photos in).\n"
+            "Install it with:  pip install pillow-heif"
+        ) from e
+    register_heif_opener()
+    _HEIF_REGISTERED = True
+
+
+def _save_frame_png(im, dest: Path) -> Path:
+    """Write one Pillow frame to `dest` as PNG in a mode Word will accept.
+
+    PNG is the interchange format because it is lossless and Word reads it
+    natively. Palette and alpha modes go to RGBA, bilevel/greyscale stay
+    greyscale (a 1-bit fax TIFF would quadruple in size as RGB), everything
+    else — including CMYK, which Word renders wrongly — goes to RGB.
+    """
+    if im.mode in ("RGBA", "LA", "P", "PA"):
+        im = im.convert("RGBA")
+    elif im.mode in ("1", "L", "I;16"):
+        im = im.convert("L")
+    elif im.mode != "RGB":
+        im = im.convert("RGB")
+    dpi = im.info.get("dpi")
+    if dpi:
+        im.save(dest, "PNG", dpi=dpi)
+    else:
+        im.save(dest, "PNG")
+    return dest
+
+
+def _image_pages_for_word(src: Path, tmp_dir: Path):
+    """Return the image files to place in the document, one per output page.
+
+    Two gaps in Word's own picture support are closed here:
+      • formats it has no filter for (.webp/.heic/.heif/.ico) are rewritten as
+        temp PNGs;
+      • a multi-page TIFF — a scanned document, so every page matters — is split
+        into one PNG per page, where AddPicture would silently take only the
+        first.
+    Multi-frame splitting is deliberately limited to TIFF: an animated GIF is
+    one picture, not a 200-page document.
+
+    Returns [src] unchanged whenever Word can read the file as-is, so the common
+    case does no work and never touches Pillow. Temp files are written to
+    `tmp_dir` (the caller's own mkdtemp), never beside the user's file.
+    """
+    ext = src.suffix.lower()
+    if ext in (".heic", ".heif"):
+        _register_heif()
+
+    try:
+        from PIL import Image, ImageSequence
+    except ImportError as e:
+        if ext in _WORD_NATIVE_IMAGE_EXTS:
+            return [src]        # Word can read it; Pillow was only for the page check
+        raise RuntimeError(
+            "The 'Pillow' package is required to convert this image format.\n"
+            "Install it with:  pip install Pillow"
+        ) from e
+
+    with Image.open(src) as im:
+        multipage = ext in (".tif", ".tiff") and getattr(im, "n_frames", 1) > 1
+        if not multipage and ext in _WORD_NATIVE_IMAGE_EXTS:
+            return [src]
+        if not multipage:
+            return [_save_frame_png(im, tmp_dir / "page_0001.png")]
+        return [
+            _save_frame_png(frame, tmp_dir / f"page_{i:04d}.png")
+            for i, frame in enumerate(ImageSequence.Iterator(im), start=1)
+        ]
+
+
+def _flatten_paragraph_spacing(doc):
+    """Strip the spacing Word's Normal style puts around every paragraph.
+
+    Normal adds 8pt after each paragraph and 1.08 line spacing. An inline
+    picture lives inside a paragraph, so on an image scaled to exactly fill the
+    printable area that surplus is what tips it over the bottom margin and emits
+    a blank page after every picture. Applied to the whole document, before
+    insertion and again afterwards, so paragraphs created by a page break get it
+    as well.
+    """
+    try:
+        pf = doc.Content.ParagraphFormat
+        pf.SpaceBefore = 0
+        pf.SpaceAfter = 0
+        pf.LineSpacingRule = 0          # wdLineSpaceSingle
+    except Exception:
+        pass
+
+
+def _insert_picture_fitted(doc, img_path: Path):
+    """Insert one image at the end of `doc`, scaled down to fit the printable area.
+
+    Word inserts a picture at its natural size and does not shrink it, so an
+    unscaled modern photo runs straight off the page — a 4032x3024 phone camera
+    image carries no DPI and lands as 42 inches wide. Only downscaling is ever
+    applied; a small image is left at its own size rather than blown up.
+    """
+    rng = doc.Content
+    rng.Collapse(0)                     # wdCollapseEnd
+    shape = doc.InlineShapes.AddPicture(
+        FileName=str(img_path.resolve()),
+        LinkToFile=False,
+        SaveWithDocument=True,
+        Range=rng,
+    )
+    try:
+        ps = doc.Sections(1).PageSetup
+        max_w = ps.PageWidth - ps.LeftMargin - ps.RightMargin
+        # A line box is always a little taller than the picture it holds (the
+        # font's descent and leading still count), so the height budget keeps a
+        # couple of points back. Without it an image sized to the exact
+        # printable height spills a blank page.
+        max_h = ps.PageHeight - ps.TopMargin - ps.BottomMargin - _IMAGE_LINE_RESERVE
+        if shape.Width > 0 and shape.Height > 0 and max_w > 0 and max_h > 0:
+            scale = min(1.0, max_w / shape.Width, max_h / shape.Height)
+            if scale < 1.0:
+                shape.LockAspectRatio = -1          # msoTrue — height follows width
+                shape.Width = shape.Width * scale
+    except Exception:
+        pass
+    return shape
+
+
+def _image_to_pdf(src: Path, out_path: Path, word):
+    """Place an image in a blank Word document and export it as PDF.
+
+    Handles every extension in IMAGE_EXTS. Formats Word cannot read, and the
+    extra pages of a multi-page TIFF, are bridged by _image_pages_for_word;
+    each resulting page is scaled to the printable area by _insert_picture_fitted.
+    """
+    if word is None:
+        raise RuntimeError(
+            "Microsoft Word is required for image conversion.\n"
+            "Please ensure Word is installed."
         )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="apfp_image_"))
+    doc = None
+    try:
+        pages = _image_pages_for_word(src, tmp_dir)
+        doc = word.Documents.Add()
+        _flatten_paragraph_spacing(doc)
+        for i, img in enumerate(pages):
+            if i:
+                doc.Content.InsertParagraphAfter()
+            shape = _insert_picture_fitted(doc, img)
+            if i:
+                # Start this image on a fresh page by *formatting* its own
+                # paragraph, rather than inserting a page-break character.
+                # InsertBreak puts the break in a paragraph of its own, whose
+                # paragraph mark then claims a line and pushes an extra blank
+                # page out of the end of the document — a 3-page TIFF came out
+                # as a 4-page PDF. PageBreakBefore adds no content at all, so
+                # the PDF has exactly one page per image.
+                try:
+                    shape.Range.ParagraphFormat.PageBreakBefore = True
+                except Exception:
+                    pass
+        _flatten_paragraph_spacing(doc)
         doc.SaveAs2(str(out_path.resolve()), FileFormat=17)  # wdFormatPDF
+    except RuntimeError:
+        raise                               # already a clear "install X" message
+    except Exception as e:
+        raise RuntimeError(f"Image to PDF conversion failed: {e}")
     finally:
-        try:
-            doc.Close(SaveChanges=False)
-        except Exception:
-            pass
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=False)
+            except Exception:
+                pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-# File-extension → conversion mode for the auto-PDF feature.
-# Word handles txt/rtf/csv/xml natively; images are embedded via _image_to_pdf.
-AUTO_PDF_EXTS = {
-    ".eml": "email",      ".msg": "email",
-    ".html": "html",      ".htm": "html",    ".mht": "html",   ".mhtml": "html",
-    ".vsd": "visio",      ".vsdx": "visio",
-    ".xls": "excel",      ".xlsx": "excel",   ".xlsm": "excel",  ".xlsb": "excel",
-    ".csv": "excel",
-    ".doc": "word_doc",   ".docx": "word_doc",
-    ".txt": "word_doc",   ".rtf": "word_doc",  ".xml": "word_doc",
-    ".ppt": "powerpoint", ".pptx": "powerpoint",
-    ".pps": "powerpoint", ".ppsx": "powerpoint",
-    ".rep": "text_report", ".rpt": "text_report",
-    ".prn": "text_report", ".lst": "text_report",
-    ".jpg": "image",      ".jpeg": "image",   ".png": "image",
-    ".bmp": "image",      ".gif": "image",    ".tiff": "image",  ".tif": "image",
+# ─────────────────────────────────────────────
+# Every mode the PDF Conversion page offers, in one table.
+#
+# The page used to branch on the dropdown label in five separate places —
+# _allowed_extensions, _add_files, _update_drop_label, and both the
+# app-launching and mode_key halves of _convert_worker — so adding a file type
+# meant editing all five and hoping they stayed in agreement. They all read from
+# here now, and Folder Unzipping's auto-PDF derives its own table from it below,
+# so a file converts identically whether it was dropped on the page or found
+# inside an archive.
+#
+#   key       the mode string convert_file dispatches on
+#   label     dropdown text, and the value stored in self._mode
+#   noun      how the type is named in file-dialog titles and filters
+#   exts      the extensions this mode OWNS — it is the automatic choice for
+#             each of them, so no two modes may list the same one
+#   shared    extensions it will also accept when picked by hand, but does not
+#             own. Lets a mode offer a second reading of a file type without
+#             making automatic routing ambiguous; see TEXT_REPORT_ALSO_ACCEPTS
+#   families  isolated Office instances the mode needs, keyed as in OFFICE_INFO.
+#             These are what get launched, tracked, killed by the watchdog and
+#             replaced afterwards — so a mode driving two apps just lists two.
+#   outlook   True if the mode also needs the user's shared Outlook instance
+#   hint      the short extension list shown in the empty drop zone
+#   auto      whether auto-PDF may convert this type as well. Auto-PDF DELETES
+#             the original once the PDF is written, which is reasonable for a
+#             document but not for a database or a notebook section: a table dump
+#             loses queries, forms and relationships, and a published section
+#             loses the notebook. Those two stay manual and opt-in.
+_PdfMode = namedtuple(
+    "_PdfMode", "key label noun exts families outlook hint auto shared")
+_PdfMode.__new__.__defaults__ = ((),)      # `shared` is empty for most modes
+
+
+def _mode_accepts(mode) -> tuple:
+    """Every extension `mode` will take from the user: the ones it owns plus the
+    ones it merely accepts. This is what the drop zone and Add Files dialog
+    filter on; automatic routing uses `mode.exts` alone."""
+    return tuple(mode.exts) + tuple(mode.shared)
+
+# The single-type modes. PDF_MODES below prepends the mixed-batch "All Types"
+# entry, which is built from these.
+_PDF_TYPE_MODES = (
+    _PdfMode(
+        key="email", label="Email (.eml, .msg)", noun="Email",
+        exts=(".eml", ".msg"),
+        families=("word",), outlook=True,
+        hint=".eml / .msg", auto=True,
+    ),
+    _PdfMode(
+        # The key stays "text_report" — it is what convert_file dispatches on and
+        # what _text_report_to_pdf is named after; only the wording the user sees
+        # changed, to something that covers logs, config and scripts as fairly as
+        # it covers report dumps.
+        key="text_report", label="Basic Text (.txt, .log, .json, …)",
+        noun="Basic text",
+        exts=TEXT_REPORT_EXTS, shared=TEXT_REPORT_ALSO_ACCEPTS,
+        families=("word",), outlook=False,
+        hint=".txt / .log / .json / .sql / .rpt", auto=True,
+    ),
+    _PdfMode(
+        key="html", label="HTML (.html, .htm, .mht)", noun="HTML",
+        exts=(".html", ".htm", ".mht", ".mhtml"),
+        families=("word",), outlook=False,
+        hint=".html / .htm / .mht", auto=True,
+    ),
+    _PdfMode(
+        key="image", label="Image (.jpg, .png, .heic, …)", noun="Image",
+        exts=IMAGE_EXTS,
+        families=("word",), outlook=False,
+        hint=".jpg / .png / .tiff / .heic / .webp", auto=True,
+    ),
+    _PdfMode(
+        key="word_doc", label="Word (.doc, .docx, .odt, …)", noun="Word / Text",
+        # Word opens the OpenDocument text format natively (2007 SP2 onwards),
+        # and .txt/.rtf/.xml through its own importers.
+        exts=(".doc", ".docx", ".docm", ".dot", ".dotx", ".dotm",
+              ".odt", ".txt", ".rtf", ".xml"),
+        families=("word",), outlook=False,
+        hint=".doc / .docx / .odt / .txt / .rtf", auto=True,
+    ),
+    _PdfMode(
+        key="excel", label="Excel (.xls, .xlsx, .ods, …)", noun="Excel / CSV",
+        exts=(".xls", ".xlsx", ".xlsm", ".xlsb", ".xlt", ".xltx", ".xltm",
+              ".ods", ".csv"),
+        families=("excel",), outlook=False,
+        hint=".xls / .xlsx / .ods / .csv", auto=True,
+    ),
+    _PdfMode(
+        key="powerpoint", label="PowerPoint (.ppt, .pptx, .odp)", noun="PowerPoint",
+        exts=(".ppt", ".pptx", ".pptm", ".pps", ".ppsx", ".ppsm",
+              ".pot", ".potx", ".potm", ".odp"),
+        families=("powerpoint",), outlook=False,
+        hint=".ppt / .pptx / .odp", auto=True,
+    ),
+    _PdfMode(
+        key="visio", label="Visio (.vsd, .vsdx)", noun="Visio",
+        # Drawings and templates. Stencils (.vss/.vssx) are collections of
+        # shapes rather than drawings, so there is nothing to lay out on a page.
+        exts=(".vsd", ".vsdx", ".vsdm", ".vst", ".vstx", ".vstm"),
+        families=("visio",), outlook=False,
+        hint=".vsd / .vsdx", auto=True,
+    ),
+    _PdfMode(
+        key="access", label="Access (.accdb, .mdb)", noun="Access database",
+        exts=(".accdb", ".mdb"),
+        # Access reads the tables; Excel lays them out and does the export.
+        families=("access", "excel"), outlook=False,
+        hint=".accdb / .mdb", auto=False,
+    ),
+    _PdfMode(
+        key="onenote", label="OneNote (.one)", noun="OneNote section",
+        exts=(".one",),
+        families=("onenote",), outlook=False,
+        hint=".one", auto=False,
+    ),
+)
+
+# Extension → the single-type mode that handles it. This is the COMPLETE map,
+# including the modes auto-PDF leaves alone (Access, OneNote), and it is what the
+# mixed-batch mode dispatches on: pick each file's converter from its own
+# extension rather than from the dropdown.
+PDF_MODE_BY_EXT = {
+    ext: mode.key
+    for mode in _PDF_TYPE_MODES
+    for ext in mode.exts
 }
+
+# Everything the page can convert, plus "" for extensionless files — which are
+# real in ERP/mainframe deliveries and are treated as plain text, exactly as
+# auto-PDF already treats them.
+ALL_TYPES_EXTS = ("",) + tuple(sorted(PDF_MODE_BY_EXT))
+
+PDF_MODES = (
+    # Mixed batches, first in the list and therefore the page's default. It owns
+    # no converter of its own: _convert_worker looks each file up in
+    # PDF_MODE_BY_EXT and runs that mode's converter, so one upload can hold
+    # emails, spreadsheets, images and reports together.
+    #
+    # `families` is empty and `outlook` is False on purpose. Which applications a
+    # batch needs isn't knowable until the files have been seen, so the worker
+    # launches them lazily per file instead of starting Word, Excel, PowerPoint,
+    # Visio, Access and OneNote up front — most of which a given batch won't
+    # touch, and some of which may not be installed at all. A missing application
+    # then fails only the files that actually needed it, rather than aborting the
+    # whole run.
+    _PdfMode(
+        key="all", label="All Types (mixed batch)", noun="supported",
+        exts=ALL_TYPES_EXTS,
+        families=(), outlook=False,
+        hint="any supported", auto=False,
+    ),
+) + _PDF_TYPE_MODES
+
+PDF_MODE_BY_LABEL = {m.label: m for m in PDF_MODES}
+PDF_MODE_BY_KEY = {m.key: m for m in PDF_MODES}
+PDF_MODE_LABELS = [m.label for m in PDF_MODES]
+
+# File-extension → conversion mode for the auto-PDF feature, derived from the
+# same table so the two can't drift apart. Modes flagged auto=False are left
+# out, because auto-PDF deletes what it converts — which also excludes the
+# mixed-batch entry, whose key is not a converter.
+AUTO_PDF_EXTS = {
+    ext: mode.key
+    for mode in PDF_MODES if mode.auto
+    for ext in mode.exts
+}
+
+
+# How far auto-PDF will follow containers it finds inside what it converts:
+# an archive attached to an email, an email attached to that. The `seen` set
+# already stops any one file being processed twice, so this only bounds a
+# pathologically deep chain.
+AUTO_PDF_MAX_CONTAINER_DEPTH = 4
+
+
+def _expand_attached_archive(src: Path) -> list:
+    """Unpack an archive auto-PDF found inside something it converted, and
+    return the files to queue. Returns [] if it can't be opened.
+
+    Extracted into a new sibling folder rather than in place, and the archive
+    itself is KEPT — everything here was written by the app, not supplied by the
+    user, and keeping the container is what makes the operation lossless (see
+    _auto_pdf_scan_and_convert on why attachments are never deleted). Archives
+    nested inside are expanded too, by the shared recursive helper.
+    """
+    dest = _unique_dir(src.parent, src.stem + "_extracted")
+    try:
+        _extract_archive(src, dest)
+    except Exception:
+        shutil.rmtree(dest, ignore_errors=True)
+        return []
+    try:
+        _recursive_unzip_in_place(dest)
+    except Exception:
+        pass
+    return [p for p in dest.rglob("*") if p.is_file()]
 
 
 def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
@@ -2058,6 +3109,23 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
     Existing .pdf files are always skipped and never deleted.
     The original is deleted ONLY if the output PDF exists and has non-zero size.
     Returns a list of filenames that could not be converted.
+
+    **Work is a queue, not a fixed list.** Converting an email writes its
+    attachments to disk, and those get appended so they are converted too.
+    Without that the one thing the user actually wanted out of the email — the
+    spreadsheet, the signed contract — is the one thing left unconverted in a
+    feature whose whole promise is "everything in here becomes a PDF". An
+    attachment that is itself an archive is unpacked and its contents queued as
+    well, down to AUTO_PDF_MAX_CONTAINER_DEPTH.
+
+    **Deletion is deliberately NOT extended to any of that.** `originals` is
+    still built only from candidate_files, so the only files that can ever be
+    deleted are the ones that came out of the upload. Attachments, and anything
+    unpacked from them, are written by this function and always kept: the email
+    they came from is deleted once its PDF exists, so keeping them is what stops
+    a bulk run from being the only copy of a spreadsheet becoming a picture of
+    one. It also leaves the hard safeguard in _delete_original_file untouched
+    rather than widening it.
 
     Office applications are launched lazily as DEDICATED, isolated instances and
     only those are quit at the end — the user's own open Office windows are
@@ -2092,38 +3160,86 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
     try:
         # Hard safeguard: auto-PDF may only ever delete files that were actually
         # extracted from the upload (the explicit candidate list) — never any
-        # other file that happens to share the output folder.
+        # other file that happens to share the output folder, and never anything
+        # this function itself wrote (attachments, unpacked archive contents).
         originals = _resolved_set(candidate_files)
-        files = [
-            f for f in candidate_files
-            if f.is_file()
-            and f.suffix.lower() != ".pdf"          # never touch existing PDFs
-            and (f.suffix == "" or f.suffix.lower() in AUTO_PDF_EXTS)
-        ]
-        if not files:
+
+        queue = deque()      # (path, depth) still to process
+        seen = set()         # resolved paths already queued — nothing runs twice
+        total = 0            # grows as containers reveal more work
+
+        def _remember(path: Path) -> bool:
+            """Record `path` as queued; False if it already was."""
+            try:
+                key = path.resolve()
+            except Exception:
+                return False
+            if key in seen:
+                return False
+            seen.add(key)
+            return True
+
+        def _enqueue(paths, depth: int) -> int:
+            """Queue every file worth processing, returning how many were added."""
+            added = 0
+            for path in paths:
+                path = Path(path)
+                if not path.is_file() or not _remember(path):
+                    continue
+                ext = path.suffix.lower()
+                if ext == ".pdf":
+                    continue                     # never touch existing PDFs
+                # Archives are only unpacked when WE produced them — a container
+                # at depth 0 came from the upload, where nested-archive expansion
+                # has already run.
+                unpackable = depth > 0 and ext in ARCHIVE_EXTS
+                if unpackable or ext == "" or ext in AUTO_PDF_EXTS:
+                    queue.append((path, depth))
+                    added += 1
+            return added
+
+        total = _enqueue(candidate_files, 0)
+        if not queue:
             status_cb("Auto-PDF: no convertible files found.")
         else:
-            total = len(files)
             converted = 0
+            attempted = 0
 
-            for i, src in enumerate(files):
+            while queue:
                 if cancel_event is not None and cancel_event.is_set():
                     break
+                src, depth = queue.popleft()
                 if not src.exists():
                     continue
                 ext = src.suffix.lower()
 
+                # A container we unpacked or extracted ourselves: open it and
+                # queue what's inside instead of converting the container.
+                if depth > 0 and ext in ARCHIVE_EXTS:
+                    status_cb(f"Auto-PDF: unpacking {src.name}")
+                    found = _expand_attached_archive(src)
+                    if found:
+                        total += _enqueue(found, depth + 1)
+                    else:
+                        pdf_failed.append(src.name)
+                    continue
+
+                attempted += 1
                 extensionless = (ext == "")
                 if extensionless:
                     # No extension — treat as a plain-text report. The converter
                     # makes its own temp .txt copy so Word opens it without a
                     # format-detection dialog, and rejects binaries cleanly.
                     mode = "text_report"
-                    status_cb(f"Auto-PDF ({i + 1}/{total}): {src.name}  (no extension, treating as text)")
+                    status_cb(f"Auto-PDF ({attempted}/{total}): {src.name}  (no extension, treating as text)")
                 else:
                     mode = AUTO_PDF_EXTS[ext]
-                    status_cb(f"Auto-PDF ({i + 1}/{total}): {src.name}")
+                    status_cb(f"Auto-PDF ({attempted}/{total}): {src.name}")
                 out_path = None
+                # Attachments this file turns out to contain. Collected even when
+                # the conversion fails — they were still written to disk, and
+                # they are usually the part that matters.
+                attachments = []
 
                 # Bound each file so one stuck conversion can't hang the batch.
                 wd = _FileWatchdog(app_pids)
@@ -2135,20 +3251,15 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
                             # no stem to name it after.
                             out_path = _unique_pdf_path(src.parent, src.name)
                             _text_report_to_pdf(src, out_path, _app("word"))
-                        elif mode == "image":
-                            out_path = _unique_pdf_path(src.parent, src.stem)
-                            _image_to_pdf(src, out_path, _app("word"))
                         else:
-                            if mode == "email" and outlook is None:
+                            mode_def = PDF_MODE_BY_KEY[mode]
+                            if mode_def.outlook and outlook is None:
                                 outlook = _ensure_outlook()
                             out_path = convert_file(
-                                src, src.parent, outlook,
-                                _app("word") if mode in ("word_doc", "html",
-                                                         "text_report", "email") else None,
-                                _app("visio") if mode == "visio" else None,
-                                _app("excel") if mode == "excel" else None,
-                                _app("powerpoint") if mode == "powerpoint" else None,
-                                mode,
+                                src, src.parent, mode,
+                                {f: _app(f) for f in mode_def.families},
+                                outlook,
+                                attachments_out=attachments,
                             )
 
                     # Only delete the original if the PDF was actually written
@@ -2160,19 +3271,26 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
                 except Exception:
                     pdf_failed.append(src.name)
 
+                # Anything the email just wrote to disk becomes work of its own.
+                if attachments and depth < AUTO_PDF_MAX_CONTAINER_DEPTH:
+                    added = _enqueue(attachments, depth + 1)
+                    total += added
+                    if added:
+                        status_cb(f"Auto-PDF: queued {added} attachment(s) from {src.name}")
+
                 # The watchdog killed our instances — drop them so the next file
                 # lazily launches fresh, healthy ones.
                 if wd.fired:
                     apps.clear()
                     app_pids.clear()
 
-            status_cb(f"Auto-PDF done: {converted}/{total} file(s) converted.")
+            status_cb(f"Auto-PDF done: {converted}/{attempted} file(s) converted.")
 
     finally:
         # Quit only the instances we launched, then make sure none linger (e.g.
         # after a watchdog kill). Outlook is the user's mail client: never quit.
-        for app in apps.values():
-            if app is not None:
+        for family, app in apps.items():
+            if app is not None and family not in NEVER_QUIT_FAMILIES:
                 try:
                     app.Quit()
                 except Exception:
@@ -2190,9 +3308,10 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
 def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
                   status_cb, progress_cb, finish_cb, cancel_event=None,
                   item_cb=None):
-    """Thread worker: extract zips, handle flat vs structured output, then
+    """Thread worker: extract archives, handle flat vs structured output, then
     optionally auto-convert all non-PDF files to PDF.
 
+    Accepts every format in ARCHIVE_EXTS, mixed freely in one batch.
     cancel_event: optional threading.Event; when set, stop before the next item.
     """
     def cancelled():
@@ -2200,7 +3319,7 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
 
     success, failed = 0, []
     protected = []         # password-protected archives we skipped
-    extracted_files = []   # explicit list of files extracted from the zip(s)
+    extracted_files = []   # explicit list of files extracted from the archive(s)
     total = len(zip_paths)
 
     for i, zip_path in enumerate(zip_paths):
@@ -2216,8 +3335,7 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
             item_cb(zip_path.name)
         tmp = Path(tempfile.mkdtemp())
         try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(tmp)
+            _extract_archive(zip_path, tmp)
 
             if separate_folders:
                 # Preserve structure; expand nested zips in the destination folder.
@@ -2233,7 +3351,7 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
                             shutil.copytree(str(item), str(target))
                     else:
                         shutil.copy2(str(item), str(target))
-                status_cb(f"Expanding nested zips in {zip_path.stem}…")
+                status_cb(f"Expanding nested archives in {zip_path.stem}…")
                 _recursive_unzip_in_place(dest)
                 # Only files under this zip's own destination folder are eligible
                 # for auto-PDF — never siblings already in the output folder.
@@ -2241,7 +3359,7 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
             else:
                 # Flat mode: expand ALL nested zips inside the temp dir first,
                 # then copy every file at any depth into a single master folder.
-                status_cb(f"Expanding all nested zips in {zip_path.stem}…")
+                status_cb(f"Expanding all nested archives in {zip_path.stem}…")
                 _recursive_unzip_in_place(tmp)
                 dest = output_dir
                 dest.mkdir(parents=True, exist_ok=True)
@@ -2251,10 +3369,14 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
                 extracted_files.extend(_collect_and_flatten(tmp, dest))
 
             success += 1
+        except _ArchiveProtected:
+            # Encryption that _is_password_protected couldn't see up front
+            # (a .7z with an encrypted header, say). Same outcome for the user.
+            protected.append(zip_path.name)
         except zipfile.BadZipFile:
             failed.append((zip_path.name, "Not a valid ZIP file or the file is corrupted."))
         except RuntimeError as e:
-            failed.append((zip_path.name, f"Cannot extract (possibly encrypted): {e}"))
+            failed.append((zip_path.name, str(e)))
         except Exception as e:
             failed.append((zip_path.name, str(e)))
         finally:
@@ -3244,6 +4366,10 @@ class _ModernDropdown(tk.Frame):
 
     ROW_H = 28
     FRAMES, FRAME_MS = 7, 12
+    # Never taller than this many rows. A long list would otherwise reach the
+    # bottom of the screen; past this the popup scrolls instead of growing.
+    MAX_VISIBLE_ROWS = 10
+    SCROLL_W = 6                      # width of the scroll thumb, in pixels
 
     def __init__(self, parent, textvariable, values, command=None,
                  width=26, font=("Segoe UI", 9), bg=APP_BG):
@@ -3254,6 +4380,13 @@ class _ModernDropdown(tk.Frame):
         self._font = font
         self._popup = None
         self._anim_id = None
+        # Scroll state, rebuilt on every open (see _open_popup).
+        self._rows = []
+        self._thumb = None
+        self._scroll = 0
+        self._scroll_max = 0
+        self._view_h = 0
+        self._thumb_h = 0
 
         self._box = tk.Frame(self, bg="#ffffff", highlightthickness=1,
                              highlightbackground="#aab4bf", bd=0)
@@ -3283,8 +4416,23 @@ class _ModernDropdown(tk.Frame):
         box_w = self._box.winfo_width()
         fm = tkfont.Font(font=self._font)
         text_w = max((fm.measure(v) for v in self._values), default=0)
-        w = max(box_w, text_w + 28)
-        full_h = self.ROW_H * len(self._values) + 4
+
+        # The popup always drops downward. Instead of growing until it runs off
+        # the bottom of the screen, it shows at most MAX_VISIBLE_ROWS — fewer if
+        # there isn't even room for that — and scrolls for the remainder.
+        count = len(self._values)
+        margin = 8
+        room_below = self.winfo_screenheight() - margin - y
+        fits_below = max(1, (room_below - 4) // self.ROW_H)
+        visible = max(1, min(count, self.MAX_VISIBLE_ROWS, fits_below))
+        scrollable = visible < count
+
+        gutter = (self.SCROLL_W + 4) if scrollable else 0
+        w = max(box_w, text_w + 28 + gutter)
+        x = max(margin, min(x, self.winfo_screenwidth() - w - margin))
+        view_h = visible * self.ROW_H
+        full_h = view_h + 4
+        row_w = w - 4 - gutter
 
         pop = tk.Toplevel(self)
         pop.overrideredirect(True)
@@ -3298,16 +4446,50 @@ class _ModernDropdown(tk.Frame):
         panel = tk.Frame(pop, bg="#ffffff", highlightthickness=1,
                          highlightbackground="#aab4bf")
         panel.place(x=0, y=0, width=w, height=full_h)
+
+        # Every row is placed inside this window, which is exactly the visible
+        # height. Tk clips children to their parent, so scrolling is nothing more
+        # than moving the rows and letting the ones outside disappear.
+        view = tk.Frame(panel, bg="#ffffff")
+        view.place(x=2, y=2, width=row_w, height=view_h)
+
+        self._rows = []
         for i, val in enumerate(self._values):
             sel = (val == self._var.get())
-            row = tk.Label(panel, text=val, bg=("#eaf2fb" if sel else "#ffffff"),
+            row = tk.Label(view, text=val, bg=("#eaf2fb" if sel else "#ffffff"),
                            fg="#1a1a1a", font=self._font, anchor="w", padx=10)
-            row.place(x=2, y=2 + i * self.ROW_H, width=w - 4, height=self.ROW_H)
+            row.place(x=0, y=i * self.ROW_H, width=row_w, height=self.ROW_H)
             row.bind("<Enter>", lambda e, r=row: r.config(bg="#d6e7fa"))
             row.bind("<Leave>", lambda e, r=row, v=val: r.config(
                 bg="#eaf2fb" if v == self._var.get() else "#ffffff"))
             row.bind("<Button-1>", lambda e, v=val: self._choose(v))
             row.config(cursor="hand2")
+            self._rows.append(row)
+
+        self._view_h = view_h
+        self._scroll = 0
+        self._scroll_max = max(0, count * self.ROW_H - view_h)
+        self._thumb = None
+        if scrollable:
+            tk.Frame(panel, bg="#eef2f6").place(
+                x=w - 2 - self.SCROLL_W, y=2, width=self.SCROLL_W, height=view_h)
+            self._thumb_h = max(24, int(view_h * view_h / (count * self.ROW_H)))
+            self._thumb = tk.Frame(panel, bg="#b9c4cf")
+            self._thumb.place(x=w - 2 - self.SCROLL_W, y=2,
+                              width=self.SCROLL_W, height=self._thumb_h)
+            self._thumb.bind("<Button-1>", self._thumb_press)
+            self._thumb.bind("<B1-Motion>", self._thumb_drag)
+            self._thumb.config(cursor="hand2")
+            # Bound on the Toplevel, which sits in the bindtag chain of every
+            # widget inside it — so the wheel works over the rows too.
+            pop.bind("<MouseWheel>", self._on_wheel)
+            # Open with the current selection in view rather than at the top.
+            try:
+                idx = self._values.index(self._var.get())
+            except ValueError:
+                idx = 0
+            self._set_scroll((idx - visible + 1) * self.ROW_H
+                             if idx >= visible else 0)
 
         _apply_round_corners(pop)
 
@@ -3319,6 +4501,42 @@ class _ModernDropdown(tk.Frame):
         except Exception:
             pass
         self._animate_open(x, y, w, full_h, 0)
+
+    def _set_scroll(self, value):
+        """Move the row strip to `value` pixels down, clamped, and follow with
+        the thumb."""
+        self._scroll = max(0, min(self._scroll_max, int(value)))
+        for i, row in enumerate(self._rows):
+            try:
+                row.place_configure(y=i * self.ROW_H - self._scroll)
+            except Exception:
+                return
+        if self._thumb is not None and self._scroll_max > 0:
+            span = max(0, self._view_h - self._thumb_h)
+            try:
+                self._thumb.place_configure(
+                    y=2 + int(span * self._scroll / self._scroll_max))
+            except Exception:
+                pass
+
+    def _on_wheel(self, event):
+        if self._popup is None or self._scroll_max <= 0:
+            return None
+        # One wheel notch is 120 on Windows; move a row per notch.
+        self._set_scroll(self._scroll - (event.delta / 120) * self.ROW_H)
+        return "break"
+
+    def _thumb_press(self, event):
+        self._drag_from_y = event.y_root
+        self._drag_from_scroll = self._scroll
+
+    def _thumb_drag(self, event):
+        span = self._view_h - self._thumb_h
+        if span <= 0 or self._scroll_max <= 0:
+            return
+        moved = event.y_root - self._drag_from_y
+        self._set_scroll(self._drag_from_scroll
+                         + moved * self._scroll_max / span)
 
     def _animate_open(self, x, y, w, full_h, i):
         self._anim_id = None
@@ -3361,6 +4579,12 @@ class _ModernDropdown(tk.Frame):
             self._anim_id = None
         pop = self._popup
         self._popup = None
+        # These reference widgets inside the popup; drop them before it goes so
+        # a stray wheel or drag event can't touch destroyed widgets.
+        self._rows = []
+        self._thumb = None
+        self._scroll = 0
+        self._scroll_max = 0
         if pop is not None:
             try:
                 pop.grab_release()
@@ -3748,7 +4972,7 @@ class ConverterApp:
         # PDF page state
         self.files    = []
         self._out_dir = None
-        self._mode    = tk.StringVar(value="Email (.eml, .msg)")
+        self._mode    = tk.StringVar(value=PDF_MODES[0].label)
         self._cancel_convert = threading.Event()
         self._pdf_app_pids   = []   # PIDs of dedicated Office instances (not Outlook)
 
@@ -4061,8 +5285,9 @@ class ConverterApp:
 
         tk.Label(
             parent,
-            text=("Convert files to PDF. Pick a conversion mode, add the matching files, "
-                  "and each one is saved as a PDF in your chosen folder."),
+            text=("Convert files to PDF. \"All Types\" takes a mixed batch and converts "
+                  "each file according to what it is — or pick a single mode to accept "
+                  "only that kind. Every PDF is saved to your chosen folder."),
             bg=APP_BG, fg="#555", font=("Segoe UI", 9),
             anchor="w", padx=18, justify="left", wraplength=620,
         ).pack(fill="x", pady=(0, 4))
@@ -4077,14 +5302,7 @@ class ConverterApp:
         mode_menu = _ModernDropdown(
             mode_frame,
             textvariable=self._mode,
-            values=["Email (.eml, .msg)",
-                    "Text Report (.rep, .rpt, .prn, .lst)",
-                    "HTML (.html, .htm, .mht)",
-                    "Image (.jpg, .png, .bmp, .gif, .tiff)",
-                    "Word (.doc, .docx, .txt, .rtf, .xml)",
-                    "Excel (.xls, .xlsx, .csv)",
-                    "PowerPoint (.ppt, .pptx)",
-                    "Visio (.vsd, .vsdx)"],
+            values=PDF_MODE_LABELS,
             command=self._on_mode_change,
             width=26,
             font=("Segoe UI", 9),
@@ -4102,7 +5320,7 @@ class ConverterApp:
 
         self.drop_label = tk.Label(
             self.drop_frame,
-            text="Drop .eml / .msg files here\nor click 'Add Files'",
+            text=f"Drop {PDF_MODES[0].hint} files here\nor click 'Add Files'",
             bg=DROP_BG, fg="#4a6fa5",
             font=("Segoe UI", 11),
             justify="center",
@@ -4221,8 +5439,9 @@ class ConverterApp:
 
         tk.Label(
             parent,
-            text=("Extract .zip files to your chosen folder. Nested zips (zips inside "
-                  "zips) are unpacked automatically, all the way down."),
+            text=("Extract .zip, .7z and .rar archives to your chosen folder. Nested "
+                  "archives (archives inside archives, in any mix of the three) are "
+                  "unpacked automatically, all the way down."),
             bg=APP_BG, fg="#555", font=("Segoe UI", 9),
             anchor="w", padx=18, justify="left", wraplength=620,
         ).pack(fill="x", pady=(0, 4))
@@ -4238,7 +5457,7 @@ class ConverterApp:
 
         self._uz_drop_label = tk.Label(
             uz_drop_frame,
-            text="Drop .zip files here\nor click 'Add Zip Files'",
+            text="Drop .zip / .7z / .rar files here\nor click 'Add Archives'",
             bg=DROP_BG, fg="#4a6fa5",
             font=("Segoe UI", 11),
             justify="center",
@@ -4273,7 +5492,7 @@ class ConverterApp:
         uz_btn_frame.pack(fill="x", padx=18, pady=(4, 4))
 
         for label, cmd in [
-            ("Add Zip Files",    self._uz_add_files),
+            ("Add Archives",     self._uz_add_files),
             ("Remove Selected",  self._uz_remove_selected),
             ("Clear All",        self._uz_clear_files),
         ]:
@@ -4343,7 +5562,7 @@ class ConverterApp:
         self._uz_tracker = _ProgressTracker(self.root, self._uz_progress)
 
         # Status label
-        self._uz_status_var = tk.StringVar(value="Ready — add .zip files to get started.")
+        self._uz_status_var = tk.StringVar(value="Ready — add archives to get started.")
         tk.Label(
             parent, textvariable=self._uz_status_var,
             bg=APP_BG, fg="#555", font=("Segoe UI", 8),
@@ -4379,8 +5598,11 @@ class ConverterApp:
 
     def _uz_add_files(self):
         paths = filedialog.askopenfilenames(
-            title="Select ZIP files",
-            filetypes=[("ZIP archives", "*.zip"), ("All files", "*.*")],
+            title="Select archives",
+            filetypes=[
+                ("Archives", " ".join(f"*{e}" for e in ARCHIVE_EXTS)),
+                ("All files", "*.*"),
+            ],
         )
         for p in paths:
             self._uz_add_path(p)
@@ -4391,7 +5613,7 @@ class ConverterApp:
 
     def _uz_add_path(self, p):
         path = Path(p)
-        if path.suffix.lower() != ".zip":
+        if path.suffix.lower() not in ARCHIVE_EXTS:
             return
         if path not in self._zip_files:
             self._zip_files.append(path)
@@ -4409,14 +5631,15 @@ class ConverterApp:
         self._uz_file_list.delete(0, "end")
         self._uz_update_drop_label()
         # Return the page to its ready state (clear any "Done!"/error status).
-        self._uz_status_var.set("Ready — add .zip files to get started.")
+        self._uz_status_var.set("Ready — add archives to get started.")
         self._uz_tracker.reset()
 
     def _uz_update_drop_label(self):
         if self._zip_files:
-            self._uz_drop_label.config(text=f"{len(self._zip_files)} zip file(s) queued")
+            self._uz_drop_label.config(text=f"{len(self._zip_files)} archive(s) queued")
         else:
-            self._uz_drop_label.config(text="Drop .zip files here\nor click 'Add Zip Files'")
+            self._uz_drop_label.config(
+                text="Drop .zip / .7z / .rar files here\nor click 'Add Archives'")
 
     def _uz_choose_output(self):
         d = filedialog.askdirectory(title="Select an empty output folder")
@@ -4445,7 +5668,7 @@ class ConverterApp:
 
     def _start_unzip(self):
         if not self._zip_files:
-            messagebox.showwarning("No Files", "Please add ZIP files first.")
+            messagebox.showwarning("No Files", "Please add archives first.")
             return
         if self._unzip_out_dir is None:
             messagebox.showwarning("No Output Folder", "Please choose an output folder first.")
@@ -4503,13 +5726,13 @@ class ConverterApp:
         self._uz_btn.config(state="normal")
         self._set_cancel_state(self._uz_cancel_btn, False)
         protected = protected or []
-        # ZIP passwords aren't Office encryption, so the Password Removal tool
-        # can't help here — give archive-appropriate guidance instead.
+        # Archive passwords aren't Office encryption, so the Password Removal
+        # tool can't help here — give archive-appropriate guidance instead.
         pw_note = _password_skip_note(
             protected,
             advice=("These archives are password-protected and can't be extracted here. "
                     "Open them with your unzip program using the password. (The Password "
-                    "Removal tool only unlocks Office documents, not ZIP files.)"))
+                    "Removal tool only unlocks Office documents, not archives.)"))
         skip_status = f"  {len(protected)} skipped (password-protected)." if protected else ""
         if self._cancel_unzip.is_set():
             self._uz_status_var.set(f"⏹  Cancelled. {success} archive(s) extracted before stopping.")
@@ -6463,23 +7686,13 @@ class ConverterApp:
         self.root.update_idletasks()
         self.root.after(700, self.root.destroy)
 
+    def _current_mode(self):
+        """The _PdfMode row the dropdown is currently on. Falls back to the
+        first mode so a stale StringVar can never leave the page without one."""
+        return PDF_MODE_BY_LABEL.get(self._mode.get(), PDF_MODES[0])
+
     def _allowed_extensions(self):
-        m = self._mode.get()
-        if m.startswith("HTML"):
-            return (".html", ".htm", ".mht", ".mhtml")
-        if m.startswith("Visio"):
-            return (".vsd", ".vsdx")
-        if m.startswith("Excel"):
-            return (".xls", ".xlsx", ".xlsm", ".xlsb", ".csv")
-        if m.startswith("Word"):
-            return (".doc", ".docx", ".txt", ".rtf", ".xml")
-        if m.startswith("PowerPoint"):
-            return (".ppt", ".pptx", ".pps", ".ppsx")
-        if m.startswith("Image"):
-            return (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif")
-        if m.startswith("Text Report"):
-            return TEXT_REPORT_EXTS
-        return (".eml", ".msg")
+        return _mode_accepts(self._current_mode())
 
     def _on_mode_change(self, event=None):
         # Clear files when mode changes — they may be wrong type
@@ -6488,32 +7701,15 @@ class ConverterApp:
 
     # ── file management ──────────────────────
     def _add_files(self):
-        m = self._mode.get()
-        if m.startswith("HTML"):
-            filetypes = [("HTML files", "*.html *.htm *.mht *.mhtml"), ("All files", "*.*")]
-            title = "Select HTML files"
-        elif m.startswith("Visio"):
-            filetypes = [("Visio files", "*.vsd *.vsdx"), ("All files", "*.*")]
-            title = "Select Visio files"
-        elif m.startswith("Excel"):
-            filetypes = [("Excel / CSV files", "*.xls *.xlsx *.xlsm *.xlsb *.csv"), ("All files", "*.*")]
-            title = "Select Excel / CSV files"
-        elif m.startswith("Word"):
-            filetypes = [("Word / Text files", "*.doc *.docx *.txt *.rtf *.xml"), ("All files", "*.*")]
-            title = "Select Word / Text files"
-        elif m.startswith("PowerPoint"):
-            filetypes = [("PowerPoint files", "*.ppt *.pptx *.pps *.ppsx"), ("All files", "*.*")]
-            title = "Select PowerPoint files"
-        elif m.startswith("Image"):
-            filetypes = [("Image files", "*.jpg *.jpeg *.png *.bmp *.gif *.tiff *.tif"), ("All files", "*.*")]
-            title = "Select image files"
-        elif m.startswith("Text Report"):
-            filetypes = [("Text report files", "*.rep *.rpt *.prn *.lst"), ("All files", "*.*")]
-            title = "Select text report files"
-        else:
-            filetypes = [("Email files", "*.eml *.msg"), ("All files", "*.*")]
-            title = "Select email files"
-        paths = filedialog.askopenfilenames(title=title, filetypes=filetypes)
+        mode = self._current_mode()
+        # "" (extensionless, accepted by the mixed-batch mode) would become a
+        # bare "*" and turn the filter into "show everything". Those files are
+        # still accepted — they're just reached through the All files filter.
+        pattern = " ".join(f"*{e}" for e in _mode_accepts(mode) if e)
+        paths = filedialog.askopenfilenames(
+            title=f"Select {mode.noun} files",
+            filetypes=[(f"{mode.noun} files", pattern), ("All files", "*.*")],
+        )
         for p in paths:
             self._add_path(p)
 
@@ -6547,22 +7743,9 @@ class ConverterApp:
     def _update_drop_label(self):
         if self.files:
             self.drop_label.config(text=f"{len(self.files)} file(s) queued")
-        elif self._mode.get().startswith("HTML"):
-            self.drop_label.config(text="Drop .html / .htm / .mht files here\nor click 'Add Files'")
-        elif self._mode.get().startswith("Visio"):
-            self.drop_label.config(text="Drop .vsd / .vsdx files here\nor click 'Add Files'")
-        elif self._mode.get().startswith("Excel"):
-            self.drop_label.config(text="Drop .xls / .xlsx / .csv files here\nor click 'Add Files'")
-        elif self._mode.get().startswith("Word"):
-            self.drop_label.config(text="Drop .doc / .docx / .txt / .rtf files here\nor click 'Add Files'")
-        elif self._mode.get().startswith("PowerPoint"):
-            self.drop_label.config(text="Drop .ppt / .pptx files here\nor click 'Add Files'")
-        elif self._mode.get().startswith("Image"):
-            self.drop_label.config(text="Drop image files here\nor click 'Add Files'")
-        elif self._mode.get().startswith("Text Report"):
-            self.drop_label.config(text="Drop .rep / .rpt / .prn / .lst files here\nor click 'Add Files'")
         else:
-            self.drop_label.config(text="Drop .eml / .msg files here\nor click 'Add Files'")
+            self.drop_label.config(
+                text=f"Drop {self._current_mode().hint} files here\nor click 'Add Files'")
 
     def _choose_output(self):
         d = filedialog.askdirectory(title="Select output folder")
@@ -6594,16 +7777,9 @@ class ConverterApp:
 
     def _start_convert(self):
         if not self.files:
-            m = self._mode.get()
-            if m.startswith("HTML"):         label = "HTML"
-            elif m.startswith("Visio"):      label = "Visio"
-            elif m.startswith("Excel"):      label = "Excel / CSV"
-            elif m.startswith("Word"):       label = "Word / text"
-            elif m.startswith("PowerPoint"): label = "PowerPoint"
-            elif m.startswith("Image"):      label = "image"
-            elif m.startswith("Text Report"): label = "text report"
-            else:                            label = "email"
-            messagebox.showwarning("No Files", f"Please add {label} files first.")
+            messagebox.showwarning(
+                "No Files",
+                f"Please add {self._current_mode().noun} files first.")
             return
         self._cancel_convert.clear()
         self.convert_btn.config(state="disabled")
@@ -6613,31 +7789,55 @@ class ConverterApp:
         threading.Thread(target=self._convert_worker, daemon=True).start()
 
     def _convert_worker(self):
-        m = self._mode.get()
-        html_mode   = m.startswith("HTML")
-        visio_mode  = m.startswith("Visio")
-        excel_mode  = m.startswith("Excel")
-        word_mode   = m.startswith("Word")
-        ppt_mode    = m.startswith("PowerPoint")
-        image_mode  = m.startswith("Image")
-        report_mode = m.startswith("Text Report")
-        email_mode  = not any([html_mode, visio_mode, excel_mode, word_mode,
-                               ppt_mode, image_mode, report_mode])
+        mode = self._current_mode()
+        # The mixed-batch mode owns no converter: each file is routed by its own
+        # extension, and the applications it needs are started lazily as those
+        # files come up rather than all at once up front.
+        mixed = (mode.key == "all")
 
         pythoncom.CoInitialize()
         self._pdf_app_pids = []
-        outlook = word = visio = excel = powerpoint = None
+        outlook = None
+        # family -> the isolated instance driving it. For a single-type mode
+        # these are exactly the families it declares; for a mixed batch they
+        # accumulate as they turn out to be needed. The watchdog kills and this
+        # loop replaces whatever is in here, so a mode using two apps
+        # (Access + Excel) needs no special handling either way.
+        apps = {}
         success, failed, protected = 0, [], []
+
+        launch_errors = {}
 
         def _launch(family):
             # Dedicated, isolated Office instance + track its PID so Cancel can
             # force-kill only ours (never the user's open Office windows).
             try:
                 app, pids = _launch_office_isolated(family)
-            except Exception:
+            except Exception as e:
+                launch_errors[family] = e
                 app, pids = None, set()
             self._pdf_app_pids.extend(pids)
             return app
+
+        def _app(family):
+            """The instance for `family`, starting it on first use.
+
+            Single-type modes have already populated `apps` before the loop, so
+            this is just a lookup for them; a mixed batch grows the dict as it
+            meets each kind of file.
+            """
+            if family not in apps:
+                apps[family] = _launch(family)
+            return apps[family]
+
+        def _app_missing_reason(family):
+            """Why `family` is unavailable, phrased for the results dialog."""
+            name = OFFICE_APP_NAMES.get(family, family.title())
+            err = launch_errors.get(family)
+            if _com_hresult(err) in COM_SERVER_UNREACHABLE_HRESULTS:
+                return (f"Microsoft {name} is installed but Windows could not "
+                        f"start it for automation")
+            return f"Microsoft {name} is required for this file type"
 
         def _abort(title, msg):
             self.root.after(0, lambda: (
@@ -6648,68 +7848,39 @@ class ConverterApp:
             ))
 
         try:
-            # Outlook — email only. This is the user's email client, so it is
-            # launched shared and NEVER force-killed (email cancel is graceful).
-            if email_mode:
-                try:
-                    outlook = _ensure_outlook()
-                except Exception as exc:
-                    _abort("Outlook Error", str(exc))
-                    return
-
-            # Word — email, HTML, Word doc, image, and text report modes
-            if email_mode or html_mode or word_mode or image_mode or report_mode:
-                word = _launch("word")
-                if word is None and (html_mode or word_mode or image_mode or report_mode):
-                    if html_mode:     label = "HTML"
-                    elif image_mode:  label = "Image"
-                    elif report_mode: label = "text report"
-                    else:             label = "Word document"
-                    _abort("Word Not Found",
-                           f"Microsoft Word is required for {label} conversion.\n"
-                           "Please ensure Word is installed.")
-                    return
-
-            if visio_mode:
-                visio = _launch("visio")
-                if visio is None:
-                    _abort("Visio Not Found",
-                           "Microsoft Visio is required for Visio conversion.\n"
-                           "Please ensure Visio is installed.")
-                    return
-
-            if excel_mode:
-                excel = _launch("excel")
-                if excel is None:
-                    _abort("Excel Not Found",
-                           "Microsoft Excel is required for Excel conversion.\n"
-                           "Please ensure Excel is installed.")
-                    return
-
-            if ppt_mode:
-                powerpoint = _launch("powerpoint")
-                if powerpoint is None:
-                    _abort("PowerPoint Not Found",
-                           "Microsoft PowerPoint is required for PowerPoint conversion.\n"
-                           "Please ensure PowerPoint is installed.")
+            # A single-type batch starts its applications up front, so a missing
+            # one is reported once, before any work, instead of failing every
+            # file. A mixed batch can't do that — see the "all" mode's note.
+            for family in mode.families:
+                apps[family] = _launch(family)
+                if apps[family] is None:
+                    # Email mode can still run on Outlook's own export path, so
+                    # a missing Word there is not fatal. Every other mode needs
+                    # the app it asked for.
+                    if mode.outlook:
+                        continue
+                    name = OFFICE_APP_NAMES.get(family, family.title())
+                    err = launch_errors.get(family)
+                    if _com_hresult(err) in COM_SERVER_UNREACHABLE_HRESULTS:
+                        # Registered, but Windows couldn't start it. Telling the
+                        # user to install what they already have would send them
+                        # off to fix the wrong thing.
+                        _abort(f"{name} Could Not Start",
+                               f"Microsoft {name} appears to be installed, but "
+                               f"Windows could not start it for automation.\n\n"
+                               f"{COM_SERVER_REPAIR_HINT}\n\nDetails: {err}")
+                        return
+                    extra = ""
+                    if mode.key == "onenote":
+                        extra = ("\nThe desktop version is required — the Store "
+                                 "'OneNote for Windows 10' app cannot be automated.")
+                    _abort(f"{name} Not Found",
+                           f"Microsoft {name} is required for "
+                           f"{mode.noun} conversion.\n"
+                           f"Please ensure {name} is installed.{extra}")
                     return
 
             total = len(self.files)
-            if visio_mode:      mode_key = "visio"
-            elif html_mode:     mode_key = "html"
-            elif excel_mode:    mode_key = "excel"
-            elif word_mode:     mode_key = "word_doc"
-            elif ppt_mode:      mode_key = "powerpoint"
-            elif image_mode:    mode_key = "image"
-            elif report_mode:   mode_key = "text_report"
-            else:               mode_key = "email"
-
-            # The one isolated Office app this mode drives — the app the
-            # per-file watchdog may have to kill and replace. (Email mode also
-            # uses Outlook, but that is the user's mail client: shared, never
-            # tracked, never killed.)
-            family = {"visio": "visio", "excel": "excel",
-                      "powerpoint": "powerpoint"}.get(mode_key, "word")
 
             for i, src in enumerate(self.files):
                 if self._cancel_convert.is_set():
@@ -6719,17 +7890,61 @@ class ConverterApp:
                     protected.append(src.name)
                     self._pdf_tracker.complete_item()
                     continue
-                self._set_status(f"Converting: {src.name}  ({i + 1}/{total})")
+
+                # Route this file. A single-type batch uses the chosen mode; a
+                # mixed one picks the converter from the file's own extension,
+                # with extensionless files treated as plain text — the same rule
+                # auto-PDF applies to the files it finds inside an archive.
+                if mixed:
+                    ext = src.suffix.lower()
+                    key = "text_report" if ext == "" else PDF_MODE_BY_EXT.get(ext)
+                    if key is None:
+                        failed.append((src.name, f"no converter for '{ext}' files"))
+                        self._pdf_tracker.complete_item()
+                        continue
+                    file_mode = PDF_MODE_BY_KEY[key]
+                else:
+                    file_mode = mode
+
+                label = f"Converting: {src.name}  ({i + 1}/{total})"
+                if mixed:
+                    label += f"  —  {file_mode.noun}"
+                self._set_status(label)
                 self._pdf_timer.set_file(src.name)
                 self._pdf_tracker.begin_item()
+
+                # Outlook is the user's mail client: shared, started on demand,
+                # and never force-killed. Only .msg needs it — .eml is parsed in
+                # Python and rendered through Word — so acquiring it here rather
+                # than up front means a machine with no Outlook can still convert
+                # .eml, and a missing Outlook costs only the .msg files instead
+                # of aborting the whole batch.
+                if (file_mode.outlook and src.suffix.lower() == ".msg"
+                        and outlook is None):
+                    try:
+                        outlook = _ensure_outlook()
+                    except Exception as exc:
+                        failed.append((src.name, str(exc)))
+                        self._pdf_tracker.complete_item()
+                        continue
+
+                # In a mixed batch a missing application fails only the files
+                # that needed it, leaving the rest of the run to finish.
+                file_apps = {f: _app(f) for f in file_mode.families}
+                missing = [f for f, a in file_apps.items()
+                           if a is None and not file_mode.outlook]
+                if missing:
+                    failed.append((src.name, _app_missing_reason(missing[0])))
+                    self._pdf_tracker.complete_item()
+                    continue
+
                 out_dir = self._out_dir if self._out_dir else src.parent
                 out_path = _unique_pdf_path(out_dir, src.stem)
                 # Bound this file so one stuck conversion can't hang the batch.
                 wd = _FileWatchdog(self._pdf_app_pids)
                 try:
                     with wd:
-                        convert_file(src, out_dir, outlook, word, visio,
-                                     excel, powerpoint, mode_key)
+                        convert_file(src, out_dir, file_mode.key, file_apps, outlook)
                     success += 1
                 except Exception as exc:
                     # Drop any partial PDF a force-kill may have left behind.
@@ -6745,22 +7960,19 @@ class ConverterApp:
                     else:
                         failed.append((src.name, str(exc)))
 
-                # The watchdog killed our instance — stand up a fresh one so the
-                # rest of the batch still has a healthy app to work with.
+                # The watchdog killed our instances — drop them so the next file
+                # lazily starts fresh, healthy ones.
                 if wd.fired and not self._cancel_convert.is_set():
                     self._pdf_app_pids = []
-                    replacement = _launch(family)
-                    if   family == "excel":      excel = replacement
-                    elif family == "visio":      visio = replacement
-                    elif family == "powerpoint": powerpoint = replacement
-                    else:                        word = replacement
+                    apps.clear()
 
                 self._pdf_tracker.complete_item()
         finally:
             # Quit our dedicated Office instances, then make sure none linger
-            # (e.g. after a kill). Outlook is intentionally left alone.
-            for app in (word, visio, excel, powerpoint):
-                if app is not None:
+            # (e.g. after a kill). Outlook is intentionally left alone, as is
+            # anything in NEVER_QUIT_FAMILIES.
+            for family, app in apps.items():
+                if app is not None and family not in NEVER_QUIT_FAMILIES:
                     try:
                         app.Quit()
                     except Exception:

@@ -14,6 +14,45 @@ Format is `## <version> — <YYYY-MM-DD>`, newest first. Prerelease sections are
 kept for the record but never shown in the app, which is only ever offered
 stable releases.
 
+## 1.7.4 — 2026-08-05
+
+- New "All Types" mode on the PDF page, now the default: drop in a mixed pile of
+  files and each one is converted according to what it is, all into your chosen
+  folder. The single-type modes are still there if you want to filter.
+- `.eml` files no longer need Outlook installed to convert.
+- Folder Unzipping now accepts `.7z` and `.rar` archives as well as `.zip`, and
+  unpacks them nested inside each other in any combination.
+- PDF conversion now reads OpenDocument files (`.odt`, `.ods`, `.odp`) — the
+  format Google Docs and LibreOffice export.
+- PDF conversion now covers the macro-enabled and template variants it was
+  missing: `.docm`, `.dotx`, `.pptm`, `.potx`, `.xltx` and the rest.
+- New "Basic Text" mode (was "Text Report") covers a much wider set of plain-text
+  files — logs and traces, JSON/JSONL/YAML/SQL, TSV/PSV, TOML/INI/config, diffs,
+  Markdown, and scripts like `.ps1`, `.bat`, `.py` and `.sh` — all laid out in
+  monospace so columns stay aligned. It also accepts `.txt`, `.xml` and `.csv`
+  when you pick it directly, for when you want the raw text.
+- Text files are much more readable as PDFs. A single very long line — one stack
+  trace in a log, one minified record — no longer shrinks the whole document to
+  unreadable type; that line wraps instead and everything else stays full size.
+- Tab-separated files now line up properly instead of drifting out of alignment.
+- Wrapped lines are indented so you can see they continue the line above.
+- Fixed: page margins were silently never applied on any Word-based conversion,
+  so pages used Word's defaults instead of the intended narrow margins.
+- Images now include `.heic`/`.heif` (the format iPhones save photos in),
+  `.webp` and `.ico`.
+- A multi-page TIFF now becomes a multi-page PDF instead of just its first page.
+- Large photos are scaled to fit the page instead of running off the edge.
+- New: Access databases (`.accdb`, `.mdb`) convert to a PDF with each table on
+  its own sheet, sized to fit the page.
+- New: OneNote sections (`.one`) convert to PDF.
+- Email attachments are now converted to PDF too during a bulk unzip, instead of
+  being extracted and left as-is. A zipped attachment is unpacked and its
+  contents converted as well.
+- Attachments are always kept alongside their PDF, so nothing is lost when the
+  email they came from is converted away.
+- Clearer message when an Office app is installed but Windows can't start it,
+  instead of being told to install something you already have.
+
 ## 1.7.3 — 2026-08-04
 
 - Fixed: reopening after an update could fail with a "Failed to execute script"

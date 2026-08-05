@@ -38,9 +38,10 @@ dist\BoxOfScraps.exe --version-file v.txt
 ```
 
 Runtime dependencies (import-time or lazily imported): `tkinterdnd2`, `pywin32`
-(`win32com`/`pythoncom`), `Pillow`, `markitdown`, `msoffcrypto-tool`. Several are
-imported lazily with a clear "install X" error so the rest of the app still runs
-when one is missing.
+(`win32com`/`pythoncom`), `Pillow`, `markitdown`, `msoffcrypto-tool`, `py7zr`
+(.7z), `rarfile` (.rar), `pillow-heif` (.heic/.heif). Several are imported lazily
+with a clear "install X" error so the rest of the app still runs when one is
+missing.
 
 **There is no automated test suite.** Verification is done by running the app, or
 by writing throwaway COM scripts (load `File.py` via `importlib`, call the target
@@ -132,6 +133,35 @@ blocks the worker on an `Event` until the dialog returns. Such dialogs do **not*
 `grab_set` (that would freeze the main-window Cancel button); instead the open
 dialog is stored on `self` so Cancel can `destroy()` it.
 
+**The PDF page is table-driven — `PDF_MODES`.** One `_PdfMode` row per dropdown
+entry carries the mode key `convert_file` dispatches on, the label, the noun used
+in dialogs, the accepted extensions, the Office `families` the mode needs, whether
+it also needs Outlook, the drop-zone hint, and an `auto` flag. `_allowed_extensions`,
+`_add_files`, `_update_drop_label`, `_start_convert` and `_convert_worker` all read
+from it, and `AUTO_PDF_EXTS` is *derived* from it — so a new file type is one row,
+and the page and Folder Unzipping's auto-PDF cannot drift apart. `families` is a
+tuple because a mode may drive two apps (Access needs Excel to lay the tables out);
+the worker launches, tracks, watchdog-kills and replaces every family in it, and
+`convert_file` takes a `{family: app}` dict rather than one parameter per
+application. `auto=False` keeps a type off auto-PDF — set for Access and OneNote,
+because auto-PDF **deletes the original** once the PDF is written and a table dump
+loses queries, forms and relationships in a way a Word→PDF never does.
+
+The table is built in two pieces. `_PDF_TYPE_MODES` holds the single-type modes;
+`PDF_MODES` prepends the **`"all"` mixed-batch mode**, which is therefore first in
+the dropdown and — since `self._mode` defaults to `PDF_MODES[0].label` — the page's
+default. It owns no converter: `PDF_MODE_BY_EXT` (the *complete* extension map,
+including the Access and OneNote types `AUTO_PDF_EXTS` leaves out) routes each file
+to its own mode, and extensionless files go to `text_report`, the same rule auto-PDF
+uses. Its `families` is empty and `outlook` False deliberately — which applications
+a batch needs isn't knowable until the files are seen, so `_convert_worker`'s `_app`
+helper starts them on first use rather than launching Word, Excel, PowerPoint,
+Visio, Access and OneNote up front. A single-type batch still launches up front and
+aborts with one dialog if its app is missing; in a mixed batch a missing application
+fails only the files that needed it. Outlook is acquired lazily and **only for
+`.msg`** — `.eml` is parsed in Python and rendered through Word, so a machine
+without Outlook can still convert it.
+
 **Office COM automation (the load-bearing, fragile part).** For each Office family
 the tools launch a **dedicated, isolated instance** via
 `_launch_office_isolated(family)` (uses `DispatchEx` and diffs process IDs before
@@ -142,9 +172,28 @@ windows** — a hard requirement throughout. `_launch_office_isolated` also disa
 macros, pre-answers the modal prompts (update-links, convert, overwrite) that
 otherwise hang a hidden instance, and turns off the work that is pointless in an
 invisible app (`ScreenUpdating`, Word background `Pagination`, Excel
-`EnableEvents`). PowerPoint can attach to the user's existing instance (no new
-PID) and is then deliberately never killed; Outlook is the user's mail client and
-is never killed either.
+`EnableEvents`, Access `DoCmd.SetWarnings`/`Echo` — Access has no `DisplayAlerts`).
+PowerPoint can attach to the user's existing instance (no new PID) and is then
+deliberately never killed; Outlook is the user's mail client and is never killed
+either. OneNote is in `NEVER_QUIT_FAMILIES` for the same reason: single-instance,
+holding the user's synced notebooks, so the object we get is *their* app.
+
+**A successful `DispatchEx` is not proof the app can be driven.** Office leaves
+ProgIDs and CLSIDs registered for components that can't actually be activated, so
+the object comes back hollow and only fails on first use — which would be one
+cryptic error *per file* for a whole batch. Two mechanisms handle this:
+`OFFICE_INFO` maps each family to a **tuple of ProgIDs tried in order**, and
+`OFFICE_REQUIRED_MEMBERS` + `_office_app_usable` reject a candidate whose methods
+don't resolve, so `_launch_office_isolated` returns the first ProgID that actually
+answers. OneNote needs all of this: on 64-bit Python against 32-bit Office the
+type library behind `OneNote.Application` is registered only in the 32-bit
+registry view, so every method lookup fails with "Library not registered" while
+the older `OneNote.Application.12` ProgID resolves against a library that loads.
+Separately, `COM_SERVER_UNREACHABLE_HRESULTS` (`0x80080005` server execution
+failed, `0x800706BE` RPC call failed, `0x800706BA` RPC server unavailable) marks
+"installed but Windows can't start it" — reported as a repair suggestion rather
+than "please install X", which would send the user to fix something that isn't
+broken.
 
 **Every worker that drives Office must go through `_launch_office_isolated` —
 never a bare `Dispatch`.** `Dispatch` *attaches to the user's already-open Office
@@ -152,6 +201,33 @@ window*; the worker then hides it, drives it, and quits it at the end with alert
 suppressed, silently discarding their unsaved work. (Auto-PDF did exactly this
 until it was fixed to use isolated instances.) A helper that launches Office
 without returning PIDs to track is a bug, not a shortcut.
+
+**Email attachments, and auto-PDF's work queue.** The email converters have
+always extracted attachments beside the PDF — `_save_msg_attachments` (Outlook
+COM, skipping `olEmbeddeditem`/`olOLE`) and `_save_eml_attachments` (pure Python,
+skipping body parts and inline images by Content-ID) write into
+`_attachments_dir(out_path)`, i.e. a folder named after the PDF. AI Preparation
+has its own parallel pair (`_extract_*_attachments` → `_email_attachments_to_markdown`,
+into `<stem>_attachments`) which uses pure-Python `extract_msg` instead of COM and
+drops image attachments, since images are noise in a text extraction.
+
+What was missing was the loop: `_auto_pdf_scan_and_convert` built its work list
+*once*, so attachments written during the run were never converted — the
+spreadsheet inside the email, which is usually the thing the user actually wanted,
+was the one file left raw. It is now a **queue**: converters report what they
+wrote through `convert_file(..., attachments_out=[])`, those paths are appended,
+and an attachment that is itself an archive is unpacked by
+`_expand_attached_archive` with its contents queued too, bounded by
+`AUTO_PDF_MAX_CONTAINER_DEPTH` and a `seen` set so nothing is processed twice.
+
+**Deletion was deliberately not extended to any of it.** `originals` is still
+built only from `candidate_files`, so `_delete_original_file`'s hard safeguard is
+untouched and only upload files are ever deleted. Attachments and unpacked
+contents are always kept — the email they came from *is* deleted once its PDF
+exists, so keeping them is what stops a bulk run leaving a picture of a
+spreadsheet as the only copy. Known gap: an email attached to an email is still
+not extracted by either backend (`olEmbeddeditem` is skipped, and a
+`message/rfc822` part yields no payload bytes).
 
 **`_FileWatchdog` bounds a single file** so one stuck conversion can't hang a
 batch. Used as a context manager around each file by all three conversion workers
@@ -170,23 +246,129 @@ hidden instance. `msoffcrypto` decrypts the standard encrypted container with no
 Office process, no prompt, and an instant clean error on a bad password. The other
 tools call `_is_password_protected()` to skip locked files and point the user at
 Password Removal. That check short-circuits on extension first
-(`ENCRYPTABLE_EXTS` = `PWD_EXTS` + `.zip`), so batches of images/text/email don't
-pay to open and parse files that can never be encrypted.
+(`ENCRYPTABLE_EXTS` = `PWD_EXTS` + `ARCHIVE_EXTS`), so batches of images/text/email
+don't pay to open and parse files that can never be encrypted.
 
-**Text report conversion (`.rep`/`.rpt`/`.prn`/`.lst`).** Plain-text report dumps
-from legacy/ERP/mainframe systems. Word selects an importer by extension and has
+**Archive extraction (`.zip`/`.7z`/`.rar`).** `ARCHIVE_EXTS` is what Folder
+Unzipping accepts and what `_recursive_unzip_in_place` looks for at any depth, in
+any mix. `_extract_archive` dispatches: stdlib `zipfile`, `py7zr` (pure Python, so
+it bundles cleanly), and `rarfile` for RAR. **RAR needs an external extractor** —
+its decompression is proprietary and `rarfile` is only a parser — so `_extract_rar`
+tries `rarfile` (which finds an installed unrar/unar/bsdtar itself) and then falls
+back to invoking Windows' own `tar.exe` directly. That fallback is the point: bsdtar
+on libarchive has shipped in Windows since 10 1803 and reads RAR4 and RAR5, so
+`.rar` works on a stock machine **without bundling a third-party binary** into the
+exe. The subprocess runs with `_CREATE_NO_WINDOW` (the app is windowed; a child
+console would be a visible pop-up) and a timeout. `_ArchiveProtected` is raised for
+encrypted archives so the UI lists them under "password-protected" rather than
+"corrupt", and `_archive_needs_password` extends `_is_password_protected` to
+`.7z`/`.rar` — deliberately reporting *not* protected when no extractor is
+available, so the user gets the real "install X" message instead of a wrong one.
+Document Structuring still only *accepts* `.zip`, but archives nested inside one
+are now expanded whatever their format, since it shares
+`_recursive_unzip_in_place`.
+
+**Image conversion.** `IMAGE_EXTS` splits into `_WORD_NATIVE_IMAGE_EXTS`, which
+Word's `AddPicture` filter reads directly, and `_PILLOW_IMAGE_EXTS`
+(`.webp`/`.heic`/`.heif`/`.ico`), which it cannot. `_image_pages_for_word` bridges
+both gaps by rewriting what Word can't read into temp PNGs in the caller's own
+`mkdtemp` — and by splitting a **multi-page TIFF** into one PNG per page, where
+`AddPicture` would silently take only the first. Multi-frame splitting is limited
+to TIFF on purpose: an animated GIF is one picture, not a 200-page document. HEIC
+needs `pillow-heif`, registered lazily by `_register_heif`. Two Word-side details
+are load-bearing: `_insert_picture_fitted` **downscales to the printable area**
+(an iPhone photo carries no DPI and lands ~42 inches wide, straight off the page),
+and pages are separated by setting `ParagraphFormat.PageBreakBefore` rather than
+inserting a page-break character — `InsertBreak` puts the break in a paragraph of
+its own whose paragraph mark claims a line and pushes a **blank page** out of the
+end, which turned a 3-page TIFF into a 4-page PDF. `_flatten_paragraph_spacing`
+zeroes Normal's 8pt space-after for the same class of reason.
+
+**Access → PDF (`.accdb`/`.mdb`).** `_access_to_pdf` exports every user table onto
+its own sheet of one temp `.xlsx` — `DoCmd.TransferSpreadsheet` appends a sheet per
+call when the file name is reused — then hands that workbook to the existing
+`_excel_to_pdf`, which already fits each sheet to one page wide and turns wide ones
+landscape. Access's own `DoCmd.OutputTo` was rejected because it prints the
+datasheet at 100% (slicing wide tables across pages) and writes one file per table,
+which doesn't fit the one-input-one-PDF model. This is a dump of the *data*:
+queries, forms, reports and relationships are not exported, the database is opened
+non-exclusively and never modified, and `_ACCESS_SYSTEM_PREFIXES` filters the Jet
+bookkeeping tables. A database-password prompt is interactive and can't be
+pre-answered, so that case is left to the per-file watchdog. Note this is the one
+mode needing two Office apps, which is why `families` is a tuple.
+
+**OneNote → PDF (`.one`).** A `.one` file is a *section*, not a self-contained
+document, so `OpenHierarchy` must add it to the OneNote hierarchy before `Publish`
+can render it (`pfPDF = 3`); `_onenote_to_pdf` then closes it again so a converted
+file isn't left in the user's notebook list. `_first_com_str` copes with the `[out]`
+object-ID parameter not surfacing through late binding, and `_onenote_section_id`
+falls back to matching the file path in the hierarchy XML. Only desktop OneNote
+exposes this API — the Store "OneNote for Windows 10" app does not. **This path is
+implemented to the documented API but has not been verified end to end**: the
+development machine's OneNote runs by hand yet cannot activate its COM server at
+all (see the ProgID/HRESULT notes above), so it exercises only the error paths.
+
+**Basic Text conversion (the mode shown as "Basic Text"; key still
+`text_report`).** `TEXT_REPORT_EXTS` covers everything that wants the same
+monospace, fit-to-widest-line treatment: report dumps from legacy/ERP/mainframe
+systems (`.rep`/`.rpt`/`.prn`/`.lst`), logs and program output
+(`.log`/`.out`/`.err`/`.dat`/`.trace`), structured data
+(`.json`/`.jsonl`/`.ndjson`/`.yaml`/`.sql`/`.tsv`/`.psv`/`.tab`), config
+(`.ini`/`.cfg`/`.conf`/`.toml`/`.properties`/`.env`), prose formats Word can't
+import (`.md`/`.text`/`.nfo`/`.asc`/`.rst`), diffs, and the scripts that turn up as
+evidence in controls work (`.bat`/`.cmd`/`.ps1`/`.sh`/`.py`/`.js`/`.vbs`/`.css`).
+The **key stays `text_report`** — it is what `convert_file` dispatches on and what
+`_text_report_to_pdf` is named for; only the user-facing wording changed.
+
+`TEXT_REPORT_ALSO_ACCEPTS` (`.txt`, `.xml`, `.csv`) is the mode's `shared` list:
+extensions it takes when picked by hand but does **not** own. Word owns `.txt`/`.xml`
+and Excel owns `.csv`, because their importers wrap prose and parse columns properly
+— `_fit_report_to_page` would shrink one long unwrapped paragraph to 5pt. Picking
+Basic Text is how the user asks for the raw text instead. `_mode_accepts(mode)`
+returns owned + shared and is what the drop zone and file dialog filter on;
+`PDF_MODE_BY_EXT` and `AUTO_PDF_EXTS` are built from `exts` alone, so automatic
+routing stays unambiguous and no two modes may own the same extension.
+
+Word selects an importer by extension and has
 none registered for these, so `_text_report_to_pdf` writes a temp `.txt` copy
 (UTF-8 with BOM, in its own `mkdtemp`) and opens *that* — never the original, and
 never a temp file next to the user's source. `_read_report_text` decodes through
 utf-8/cp1252/latin-1 and calls `_looks_binary` first, so a binary file wearing a
 report extension (a compiled Crystal Reports `.rpt`) fails with a clear message
-instead of emitting mojibake. `_fit_report_to_page` then forces Consolas, zeroes
-the paragraph spacing Word's Normal style would otherwise double-space the report
-with, and goes landscape past `_REPORT_LANDSCAPE_COLS` before scaling the type to
-the widest line. Wired into the PDF page (mode `"Text Report"` → `mode_key
-"text_report"`) and into `AUTO_PDF_EXTS` for Folder Unzipping's auto-PDF. The same
-function now also handles auto-PDF's **extensionless** files, which previously
-inlined their own temp-copy logic.
+instead of emitting mojibake. Wired into the PDF page and into `AUTO_PDF_EXTS`,
+and it also handles auto-PDF's **extensionless** files.
+
+**How the page layout is chosen — three rules that between them keep output
+readable.** `_fit_report_to_page` forces Consolas and zeroes the paragraph
+spacing Word's Normal style would otherwise double-space everything with, then:
+
+1. **Tabs are expanded to spaces first** (`_REPORT_TAB_WIDTH`, 8). Word's default
+   tab stops are half-inch, which matches neither the monospace grid nor the
+   one-character-per-tab a width estimate assumes — so a `.tsv` would drift out
+   of alignment *and* be measured too narrow. Expanding in `_text_report_to_pdf`
+   means the temp file Word opens and the width computed from it agree exactly.
+2. **Width comes from `_report_fit_columns`, a 95th percentile of line lengths —
+   not the maximum.** One 300-character stack trace in a log of 80-character
+   lines used to shrink the entire document to 5pt to protect alignment on the
+   one line that had none. Genuinely column-aligned content is unaffected,
+   because there the percentile *is* the maximum.
+3. **`_report_layout` will not shrink below `_REPORT_FONT_MIN` (7pt) to avoid
+   wrapping.** If the content fits portrait it stays portrait; past
+   `_REPORT_LANDSCAPE_COLS` it goes landscape; and if even the floor can't fit
+   it, that means wrapping is unavoidable — at which point the alignment this
+   whole layout exists to protect is already gone, so it returns to portrait at
+   `_REPORT_FONT_WRAP` (9pt) and lets it wrap. Short lines read better than a
+   wide wall of tiny text. Wherever wrapping does occur, continuations get a
+   hanging indent so they read as part of the line above.
+
+**`_inches()` replaced `Application.InchesToPoints`.** On a hidden, automated
+Word instance that COM helper raises "Unspecified error" — and because every call
+site wrapped it in a try/except, the failure was *silent*: the margins it was
+there to compute were never applied, so pages kept the Normal template's defaults
+and the fitting maths was computed against a width the document didn't have. The
+conversion is exactly 72 points to the inch, so it belongs in Python. This
+affected `_fit_word_doc_to_page` (Word/HTML/email output) as well as the text
+path.
 
 **Cross-cutting helpers worth reusing:**
 - `_unique_output_path` / `_unique_pdf_path` — never overwrite; suffix `_2`, `_3`…
@@ -210,11 +392,20 @@ inlined their own temp-copy logic.
   - `_ModernRadio` — Windows-11-style radio replacing `tk.Radiobutton`; instances
     sharing one variable form a group (selecting one re-renders all via a trace).
   - `_ModernDropdown` — readonly combobox replacement (replaced the PDF mode
-    `ttk.Combobox`). Popup animates open downward and gets slightly rounded corners
-    via `_apply_round_corners` (Windows DWM `DWMWCP_ROUNDSMALL`, best-effort/no-op
-    elsewhere). Calls `command` only when the selection actually changes (mirrors
-    `<<ComboboxSelected>>`). Animation `after` ticks are scheduled on the widget
-    (not the transient popup) and cancelled on close.
+    `ttk.Combobox`). Popup animates open **downward, always**, and gets slightly
+    rounded corners via `_apply_round_corners` (Windows DWM `DWMWCP_ROUNDSMALL`,
+    best-effort/no-op elsewhere). Calls `command` only when the selection actually
+    changes (mirrors `<<ComboboxSelected>>`). Animation `after` ticks are scheduled
+    on the widget (not the transient popup) and cancelled on close.
+    It shows at most `MAX_VISIBLE_ROWS` (10) — fewer if there isn't room below on
+    screen — and **scrolls** for the rest, so a growing list can never push options
+    off the bottom. Scrolling is deliberately not a Canvas: rows are `place`d inside
+    a clipping frame sized to the visible height, Tk clips children to their parent,
+    and scrolling just re-places them. Mouse wheel is bound on the Toplevel (which
+    is in the bindtag chain of every widget inside it, so the wheel works over the
+    rows), and the slim thumb is draggable. The popup opens with the current
+    selection already in view. `_close_popup` drops the row/thumb references so a
+    late wheel or drag event can't touch destroyed widgets.
   - Shared color helpers: `_hex_to_rgb`, `_lerp_rgb`; palette `TOGGLE_ON/OFF/DISABLED`.
 
 **Packaging specifics (`BoxOfScraps.spec`).** One-file build that

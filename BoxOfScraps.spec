@@ -15,10 +15,15 @@ hiddenimports = ['win32timezone']
 # Bundle pywin32 + Pillow, and the AI Preparation stack (markitdown and the
 # pieces PyInstaller can't auto-detect: magika models, onnxruntime, extract_msg,
 # pdfminer data). markitdown is imported lazily, so these must be collected
-# explicitly or "Convert to Markdown" would fail only at runtime.
+# explicitly or "Convert to Markdown" would fail only at runtime. The same
+# applies to py7zr (.7z extraction), rarfile (.rar) and pillow_heif (.heic/.heif
+# images) — all three are lazily imported behind an "install X" error, so
+# without collecting them here the feature would only fail on a user's machine.
 for _pkg in ('win32com', 'win32api', 'pywintypes', 'PIL',
              'markitdown', 'magika', 'onnxruntime', 'extract_msg', 'pdfminer',
-             'msoffcrypto', 'olefile'):   # Password Removal (open-password decryption)
+             'msoffcrypto', 'olefile',    # Password Removal (open-password decryption)
+             'py7zr', 'rarfile',          # Folder Unzipping: .7z / .rar archives
+             'pillow_heif'):              # HEIC/HEIF images (iPhone photos)
     tmp_ret = collect_all(_pkg)
     datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
