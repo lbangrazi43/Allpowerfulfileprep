@@ -50,6 +50,8 @@ stable releases.
   contents converted as well.
 - Attachments are always kept alongside their PDF, so nothing is lost when the
   email they came from is converted away.
+- About & Updates now shows the release date of the version you're running,
+  underneath the version number.
 - Clearer message when an Office app is installed but Windows can't start it,
   instead of being told to install something you already have.
 

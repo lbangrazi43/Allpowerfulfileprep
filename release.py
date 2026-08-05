@@ -15,9 +15,10 @@ What it does:
                      tag unused locally and on the remote, notes present, a
                      CHANGELOG.md section for this version, GitHub credentials
                      work.
-    2. Bump+build  — writes APP_VERSION, syntax-checks, builds the one-file exe,
-                     then runs the exe with --version-file to confirm the binary
-                     really reports the new version.
+    2. Bump+build  — writes APP_VERSION and APP_RELEASE_DATE, syntax-checks,
+                     builds the one-file exe, then runs the exe with
+                     --version-file to confirm the binary really reports the new
+                     version.
     3. Publish     — commits, tags, pushes, creates the release, uploads
                      BoxOfScraps.exe and BoxOfScraps.exe.sha256.
     4. Archive     — drafts the previously-visible stable release, so at most one
@@ -35,6 +36,7 @@ fallback is the failure worth catching. Tokens bypass 2FA either way, so the
 narrower one limits what a leak is worth.
 """
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -120,6 +122,21 @@ def set_version(new):
     path.write_text(out, encoding="utf-8")
 
 
+def set_release_date(value):
+    """Write APP_RELEASE_DATE, which the About page shows beside the version.
+
+    Bumped in the same breath as APP_VERSION because it is the same class of
+    trap: a stale value is not an error anywhere, it just quietly tells every
+    user the wrong thing forever."""
+    path = ROOT / "File.py"
+    src = path.read_text(encoding="utf-8")
+    out, n = re.subn(r'^(APP_RELEASE_DATE\s*=\s*)"[^"]*"', rf'\g<1>"{value}"',
+                     src, count=1, flags=re.M)
+    if n != 1:
+        fail("Couldn't rewrite APP_RELEASE_DATE in File.py")
+    path.write_text(out, encoding="utf-8")
+
+
 def github_token():
     """Return (token, where_it_came_from), preferring one dedicated to releasing.
 
@@ -196,14 +213,17 @@ def confirm(prompt, assume_yes):
         return False
 
 
-def changelog_entry(version: str) -> str:
-    """Return this version's CHANGELOG.md section, or fail the release.
+def changelog_entry(version: str):
+    """Return (body, iso_date) for this version's CHANGELOG.md section.
 
     The app reads CHANGELOG.md from the repo to tell a user what changed across
     every version they skipped, so a release with no section here is invisible
     in exactly the place users look. It is checked in preflight because the only
     cheap moment to notice is before the build — afterwards the fix means
-    another commit and another ten minutes."""
+    another commit and another ten minutes.
+
+    The heading's date is also the source for APP_RELEASE_DATE, so the date the
+    About page shows and the date the changelog shows can never disagree."""
     path = ROOT / "CHANGELOG.md"
     if not path.is_file():
         fail(f"CHANGELOG.md not found at {path}")
@@ -214,13 +234,22 @@ def changelog_entry(version: str) -> str:
         fail(f"CHANGELOG.md has no '## {version}' section.\n"
              f"      Add one (newest first) so the in-app update screen can "
              f"tell users what changed in {version}.")
+    heading_rest = m.group(1)
     body = text[m.end():]
     nxt = re.search(r"^##[ \t]+v?\d", body, re.MULTILINE)
     body = (body[:nxt.start()] if nxt else body).strip()
     if not body:
         fail(f"CHANGELOG.md's '## {version}' section is empty")
-    ok(f"changelog entry: '## {version}{m.group(1)}' ({len(body)} chars)")
-    return body
+    ok(f"changelog entry: '## {version}{heading_rest}' ({len(body)} chars)")
+
+    date_m = re.search(r"\d{4}-\d{2}-\d{2}", heading_rest)
+    iso = date_m.group(0) if date_m else ""
+    if iso:
+        ok(f"release date from changelog: {iso}")
+    else:
+        warn("changelog heading carries no YYYY-MM-DD date — today's date will "
+             "be used for APP_RELEASE_DATE")
+    return body, iso
 
 
 # ─────────────────────────────────────────────
@@ -283,7 +312,7 @@ def main():
         fail(f"notes file is empty: {notes_path}")
     ok(f"release notes: {notes_path} ({len(notes)} chars)")
 
-    changelog_entry(new)
+    _, changelog_date = changelog_entry(new)
 
     token, token_src = github_token()
     who = api("https://api.github.com/user", token)
@@ -330,7 +359,9 @@ def main():
     step(f"2/4  Bump to {new} and build")
 
     set_version(new)
-    ok(f"APP_VERSION = {new}")
+    released_on = changelog_date or datetime.date.today().isoformat()
+    set_release_date(released_on)
+    ok(f"APP_VERSION = {new}, APP_RELEASE_DATE = {released_on}")
     run([sys.executable, "-m", "py_compile", "File.py"])
     ok("File.py compiles")
 

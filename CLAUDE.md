@@ -91,7 +91,12 @@ The steps it automates, for when it has to be done by hand:
    for the in-app updater, which compares it against the newest release tag.
    Ship a stale value and the new exe still believes it is the old version, so
    it offers the same update forever. It must match the tag you are about to
-   push.
+   push. **`APP_RELEASE_DATE` sits directly beneath it and is bumped in the same
+   breath** — the About page shows it under the version number, and `release.py`
+   takes the value from that version's `CHANGELOG.md` heading so the date on the
+   About page and the date in the changelog can never disagree. It is the same
+   class of trap as a stale `APP_VERSION`: nothing errors, it just tells every
+   user the wrong thing forever.
 2. Build the exe with the command above (confirm `PYI_EXIT=0`).
 3. Commit on `main` with a `Co-Authored-By:` trailer; tag `vX.Y.Z`; push both.
 4. Create the GitHub release and upload `dist/BoxOfScraps.exe` as an asset

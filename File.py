@@ -29,6 +29,16 @@ from collections import deque, namedtuple
 # version, so it offers the same update forever.
 APP_VERSION = "1.7.3"
 
+# The date APP_VERSION was published, shown beside it on the About & Updates
+# page. Deliberately baked into the build rather than fetched: it describes the
+# version the user is *running*, so it must be right offline and instantly, and
+# the releases API only ever reports the newest release anyway.
+#
+# release.py writes this at the same moment it writes APP_VERSION, taking the
+# date from that version's CHANGELOG.md heading — the two must always describe
+# the same release, so they are bumped together rather than left to drift.
+APP_RELEASE_DATE = "2026-08-04"
+
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     HAS_DND = True
@@ -64,6 +74,22 @@ def _ensure_outlook():
             f"Make sure Microsoft Outlook is installed and has been set up.\n\n"
             f"Detail: {e}"
         )
+
+
+def _format_release_date(value: str) -> str:
+    """Render an ISO date for display: '2026-08-05' -> 'August 5, 2026'.
+
+    Returns whatever it was given if that isn't a plain ISO date, so a
+    hand-edited or unexpected value still shows something rather than vanishing.
+    """
+    from datetime import date
+    text = (value or "").strip()
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError:
+        return text
+    # %-d / %#d for an unpadded day is platform-specific; do it by hand.
+    return f"{parsed.strftime('%B')} {parsed.day}, {parsed.year}"
 
 
 def _inches(value: float) -> float:
@@ -7205,12 +7231,21 @@ class ConverterApp:
         card = tk.Frame(parent, bg=DROP_BG, highlightbackground=DROP_BD,
                         highlightthickness=2, relief="flat")
         card.pack(fill="x", padx=18, pady=(6, 8))
+        # Both captions share a width so the values line up in a column.
+        caption = {"bg": DROP_BG, "fg": "#4a6fa5", "font": ("Segoe UI", 9),
+                   "width": 17, "anchor": "w"}
         row = tk.Frame(card, bg=DROP_BG)
-        row.pack(fill="x", padx=14, pady=(10, 2))
-        tk.Label(row, text="Installed version", bg=DROP_BG, fg="#4a6fa5",
-                 font=("Segoe UI", 9)).pack(side="left")
+        row.pack(fill="x", padx=14, pady=(10, 0))
+        tk.Label(row, text="Installed version", **caption).pack(side="left")
         tk.Label(row, text=APP_VERSION, bg=DROP_BG, fg="#1a1a1a",
                  font=("Segoe UI", 11, "bold")).pack(side="left", padx=(8, 0))
+
+        date_row = tk.Frame(card, bg=DROP_BG)
+        date_row.pack(fill="x", padx=14, pady=(2, 2))
+        tk.Label(date_row, text="Release date", **caption).pack(side="left")
+        tk.Label(date_row, text=_format_release_date(APP_RELEASE_DATE) or "—",
+                 bg=DROP_BG, fg="#1a1a1a", font=("Segoe UI", 10),
+                 ).pack(side="left", padx=(8, 0))
 
         exe = _current_exe_path()
         if exe is None:
