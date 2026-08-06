@@ -14,6 +14,20 @@ Format is `## <version> — <YYYY-MM-DD>`, newest first. Prerelease sections are
 kept for the record but never shown in the app, which is only ever offered
 stable releases.
 
+## 1.8.0 — 2026-08-06
+
+- Document Structuring now does one thing: sort files into folders by file type.
+  The AI options have moved to their own tool.
+- Document Structuring now takes whole folders and loose files as well as
+  archives — and `.7z`/`.rar` alongside `.zip`. Everything inside is copied out
+  into folders named for what it is.
+- Document Structuring now asks for an output folder, so the sorted copies are
+  always kept apart from your originals. Nothing is moved, renamed or deleted,
+  and files already in the output folder are left alone.
+- New "AI Organization" tool for AI-suggested filenames and inferred date
+  prefixes. It isn't available yet — the page shows what's coming, but it can't
+  be run.
+
 ## 1.7.4 — 2026-08-05
 
 - New "All Types" mode on the PDF page, now the default: drop in a mixed pile of

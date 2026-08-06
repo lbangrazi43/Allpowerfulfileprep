@@ -1517,6 +1517,55 @@ def _delete_original_file(src: Path, allowed: set) -> bool:
         return False
 
 
+def _is_within(child, parent) -> bool:
+    """True if `child` is `parent` itself or sits underneath it.
+
+    Both sides are resolved first, so a junction/symlink can't disguise a path
+    as being inside a folder it isn't. The comparison is on path *components*
+    (`parent in child.parents`), never on string prefixes — "…\\Reports2" must
+    not read as inside "…\\Reports". Never raises; an unresolvable path is not
+    inside anything.
+    """
+    try:
+        child = Path(child).resolve()
+        parent = Path(parent).resolve()
+    except Exception:
+        return False
+    return child == parent or parent in child.parents
+
+
+def _files_under_folder(folder: Path) -> list:
+    """Every file inside `folder`, recursively — and nothing outside it.
+
+    HARD SAFEGUARD for the tools that accept a whole folder as input: what the
+    user added is the only thing that may be read. Directory symlinks and
+    Windows junctions are reparse points that can point anywhere on disk, so
+    they are neither followed nor returned, and every surviving candidate is
+    re-checked with `_is_within` against the resolved root. A link planted in
+    the input tree therefore can't pull in files from elsewhere.
+
+    Returns a sorted list; unreadable subtrees are skipped rather than raising.
+    """
+    try:
+        root = Path(folder).resolve()
+    except Exception:
+        return []
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        here = Path(dirpath)
+        # Prune reparse-point directories before os.walk descends into them.
+        dirnames[:] = [d for d in dirnames if not (here / d).is_symlink()]
+        for name in filenames:
+            p = here / name
+            try:
+                if p.is_symlink() or not _is_within(p, root):
+                    continue
+            except Exception:
+                continue
+            found.append(p)
+    return sorted(found)
+
+
 # ─────────────────────────────────────────────
 # Legacy Office → modern Office (one-to-one, by family)
 #
@@ -2035,6 +2084,29 @@ def _archive_needs_password(src_path: Path) -> bool:
     return False
 
 
+# ── Mixed input queues (Document Structuring, AI Organization) ──
+# Those pages accept three kinds of input side by side — an archive to extract,
+# a folder to walk, or a loose file taken as it is — so the queue needs to say
+# which is which. Lives here, next to ARCHIVE_EXTS, because that tuple is what
+# decides whether a queued file is an archive at all.
+
+def _input_entry_name(path: Path) -> str:
+    """Display name for one queued input. Falls back to the full path for a
+    drive root, whose `.name` is empty."""
+    return path.name or str(path)
+
+
+def _input_entry_label(path: Path, is_dir: bool) -> str:
+    """Listbox text for one queued input, tagged so a folder or an archive can
+    be told apart from a loose file at a glance."""
+    name = _input_entry_name(path)
+    if is_dir:
+        return f"{name}   (folder)"
+    if path.suffix.lower() in ARCHIVE_EXTS:
+        return f"{name}   (archive)"
+    return name
+
+
 # ─────────────────────────────────────────────
 # Password Removal — strip the open-password (encryption) from Office files.
 #
@@ -2351,11 +2423,35 @@ def _email_attachments_to_markdown(src_path: Path, md_out_path: Path) -> int:
 
 
 # ─────────────────────────────────────────────
-# Document Structuring — AI filename suggestions and organize-by-filetype.
+# AI Organization — AI-suggested filenames and inferred date prefixes.
+#
 # The AI naming reads the opening text of a document and asks the AI service
 # for a professional, standardized filename; everything is best-effort and
 # degrades gracefully when text or the API is unavailable.
+#
+# The feature is NOT AVAILABLE YET. Its page exists so the intended inputs and
+# options are visible, but nothing runs: AI_ORGANIZATION_ENABLED below is the
+# single switch that turns it on, and until it flips the toggles render
+# disabled with "(coming soon)" and the run button stays greyed out. The
+# helpers underneath are complete and are what the page will call — they are
+# deliberately kept rather than stubbed so enabling the feature is a flag flip
+# plus a worker, not a rewrite.
+#
+# Organize-by-filetype used to live on this same page; it is now the whole of
+# Document Structuring (see _ds_worker), which has no AI in it at all.
 # ─────────────────────────────────────────────
+
+# Master switch for the AI Organization page. Independent of
+# _ai_backend_ready(): credentials being present is not on its own permission
+# to ship the feature, so BOTH must be true before anything can run.
+AI_ORGANIZATION_ENABLED = False
+
+
+def _ai_organization_available() -> bool:
+    """True only when the AI Organization feature is switched on *and* its
+    backend credentials are present. Every entry point checks this."""
+    return AI_ORGANIZATION_ENABLED and _ai_backend_ready()
+
 
 # AI naming backend. Credentials are NEVER hardcoded or baked into this build —
 # the endpoint, key, and deployment are read at runtime from environment
@@ -2372,8 +2468,8 @@ def _email_attachments_to_markdown(src_path: Path, md_out_path: Path) -> int:
 #   APFP_AI_API_VERSION  optional; defaults to 2024-06-01
 #
 # When any of the three required variables is unset, _ai_backend_ready() is
-# False, both AI checkboxes render disabled with "(coming soon)", and the
-# feature cannot run.
+# False, both AI toggles render disabled with "(coming soon)", and the feature
+# cannot run.
 _AI_ENV_PREFIX = "APFP_AI_"
 
 
@@ -3072,7 +3168,7 @@ PDF_MODES = (
     # then fails only the files that actually needed it, rather than aborting the
     # whole run.
     _PdfMode(
-        key="all", label="All Types (mixed batch)", noun="supported",
+        key="all", label="All Types", noun="supported",
         exts=ALL_TYPES_EXTS,
         families=(), outlook=False,
         hint="any supported", auto=False,
@@ -5041,13 +5137,19 @@ class ConverterApp:
         self._cancel_pwd  = threading.Event()
         self._pwd_dialog  = None     # the open password prompt, if any
 
-        # Document Structuring page state
-        self._ds_files    = []
-        self._ds_out_dir  = None
-        self._cancel_ds   = threading.Event()
-        self._ds_rename   = tk.BooleanVar(value=False)
-        self._ds_date     = tk.BooleanVar(value=False)
-        self._ds_organize = tk.BooleanVar(value=True)
+        # Document Structuring page state. _ds_files is a mixed queue of
+        # archives, folders and loose files — see _ds_add_path.
+        self._ds_files   = []
+        self._ds_out_dir = None
+        self._cancel_ds  = threading.Event()
+
+        # AI Organization page state. The feature is not available yet (see
+        # AI_ORGANIZATION_ENABLED); the page collects inputs and options but
+        # nothing runs, so there is no cancel event or worker here.
+        self._aio_files   = []
+        self._aio_out_dir = None
+        self._aio_rename  = tk.BooleanVar(value=False)
+        self._aio_date    = tk.BooleanVar(value=False)
 
         # Updates page state
         self._upd_release   = None    # the newer release dict, once one is found
@@ -5199,7 +5301,8 @@ class ConverterApp:
                                 ("aiprep", "  Markdown Conversion"),
                                 ("office", "  Office Modernizer"),
                                 ("pwd", "  Password Removal"),
-                                ("structure", "  Document Structuring")]:
+                                ("structure", "  Document Structuring"),
+                                ("aiorg", "  AI Organization")]:
             btn = tk.Button(
                 self._sidebar,
                 text=label,
@@ -5276,6 +5379,8 @@ class ConverterApp:
                 self._build_pwd_page(frame)
             elif key == "structure":
                 self._build_structure_page(frame)
+            elif key == "aiorg":
+                self._build_aiorg_page(frame)
             elif key == "update":
                 self._build_update_page(frame)
             # Give this page's flat grey utility buttons a themed press-in effect.
@@ -5484,7 +5589,7 @@ class ConverterApp:
             parent,
             text=("Extract .zip, .7z and .rar archives to your chosen folder. Nested "
                   "archives (archives inside archives, in any mix of the three) are "
-                  "unpacked automatically, all the way down."),
+                  "unpacked automatically."),
             bg=APP_BG, fg="#555", font=("Segoe UI", 9),
             anchor="w", padx=18, justify="left", wraplength=620,
         ).pack(fill="x", pady=(0, 4))
@@ -6815,6 +6920,35 @@ class ConverterApp:
             )
 
     # ── Document Structuring page ──────────────────────
+    #
+    # One job: sort files into folders named for their type. There is no AI here
+    # and no toggle — that moved to the AI Organization page. The input queue is
+    # mixed: archives are extracted, folders are walked, loose files are taken as
+    # they are.
+    #
+    # Nothing outside the queue is ever read, and nothing anywhere is moved,
+    # renamed in place, overwritten or deleted. The safeguards, in the order they
+    # fire:
+    #   * _queue_add_path only queues paths that exist, so the queue is an exact,
+    #     literal statement of what the user offered.
+    #   * archives are extracted into a temp dir, never beside the source, so the
+    #     nested-archive expansion (which deletes each archive it unpacks) only
+    #     ever operates on our own copy.
+    #   * _files_under_folder will not follow a symlink or junction out of an
+    #     input folder, so a link planted in the tree can't pull in files from
+    #     elsewhere on disk.
+    #   * _start_ds rejects an output folder sitting inside a queued folder —
+    #     that would write this run's output into the very tree it is reading.
+    #   * every destination is re-checked with _is_within(out_base) immediately
+    #     before the copy, so nothing can land outside the chosen folder.
+    #   * files are COPIED and _unique_output_path suffixes collisions, so the
+    #     originals and anything already in the output folder are both untouched.
+    #     There is no unlink anywhere in this tool.
+
+    _DS_DROP_HINT = ("Drop archives, folders or files here\n"
+                     "or use the buttons below")
+    _DS_READY_MSG = "Ready — add archives, folders or files to organize."
+
     def _build_structure_page(self, parent):
         tk.Label(
             parent, text="Document Structuring",
@@ -6824,12 +6958,8 @@ class ConverterApp:
 
         tk.Label(
             parent,
-            text=("Add ZIP archives. Each one is extracted first (including any nested "
-                  "zips), then the extracted documents are standardized and organized: "
-                  "optionally renamed to AI-suggested professional names and/or sorted "
-                  "into folders by file type. Originals are never modified, and any "
-                  "files already in the output folder are left untouched — only the "
-                  "extracted documents are saved (and organized) there."),
+            text=("Add archives, folders or files — copies of everything inside them "
+                  "are sorted into folders by file type."),
             bg=APP_BG, fg="#555", font=("Segoe UI", 9),
             anchor="w", padx=18, justify="left", wraplength=620,
         ).pack(fill="x", pady=(0, 6))
@@ -6841,8 +6971,7 @@ class ConverterApp:
         )
         self._ds_drop_frame.pack(fill="both", expand=True, padx=18, pady=(10, 6))
         self._ds_drop_label = tk.Label(
-            self._ds_drop_frame,
-            text="Drop .zip files here\nor click 'Add Zip Files'",
+            self._ds_drop_frame, text=self._DS_DROP_HINT,
             bg=DROP_BG, fg="#4a6fa5", font=("Segoe UI", 11), justify="center",
         )
         self._ds_drop_label.pack(expand=True, pady=20)
@@ -6866,7 +6995,8 @@ class ConverterApp:
         btn_frame = tk.Frame(parent, bg=APP_BG)
         btn_frame.pack(fill="x", padx=18, pady=(4, 4))
         for label, cmd in [
-            ("Add Zip Files",   self._ds_add_files),
+            ("Add Files",       self._ds_add_files),
+            ("Add Folder",      self._ds_add_folder),
             ("Remove Selected", self._ds_remove_selected),
             ("Clear All",       self._ds_clear_files),
         ]:
@@ -6876,48 +7006,24 @@ class ConverterApp:
                 relief="flat", padx=12, pady=4, cursor="hand2",
             ).pack(side="left", padx=(0, 6))
 
-        # Options. The AI-naming checkbox stays disabled until the AI backend
-        # is live (placeholders replaced) — the feature is a shell for now.
-        opt_frame = tk.Frame(parent, bg=APP_BG)
-        opt_frame.pack(fill="x", padx=18, pady=(2, 0))
-        ai_ready = _ai_backend_ready()
-        if not ai_ready:
-            self._ds_rename.set(False)
-            self._ds_date.set(False)
-        self._ds_rename_check = _ToggleSwitch(
-            opt_frame,
-            text="AI filename suggestions" + ("" if ai_ready else "  (coming soon)"),
-            variable=self._ds_rename,
-            state=("normal" if ai_ready else "disabled"),
-        )
-        self._ds_rename_check.pack(anchor="w", pady=2)
-        self._ds_date_check = _ToggleSwitch(
-            opt_frame,
-            text="Add the document's inferred date as a filename prefix (Date_Name)"
-                 + ("" if ai_ready else "  (coming soon)"),
-            variable=self._ds_date,
-            state=("normal" if ai_ready else "disabled"),
-        )
-        self._ds_date_check.pack(anchor="w", pady=2)
-        _ToggleSwitch(
-            opt_frame, text="Organize into folders by file type",
-            variable=self._ds_organize,
-        ).pack(anchor="w", pady=2)
-
-        # Output folder row (optional — defaults to each zip's own folder). The
-        # folder need NOT be empty: only the extracted files are written/organized
-        # here, existing files are never moved, swept into subfolders, or overwritten.
+        # Output folder row. Required — the organized copies have to go
+        # somewhere separate from the originals, so there is no "same as source"
+        # here and the run button stays disabled until a folder is chosen. The
+        # folder need NOT be empty: only the type subfolders are created and
+        # only the queued files are copied in, so existing contents are never
+        # moved, swept into the new subfolders, or overwritten.
         out_frame = tk.Frame(parent, bg=APP_BG)
         out_frame.pack(fill="x", padx=18, pady=(4, 2))
         tk.Label(
             out_frame, text="Output folder:",
             bg=APP_BG, fg="#555", font=("Segoe UI", 9),
         ).pack(side="left")
-        self._ds_out_var = tk.StringVar(value="Same as source file")
-        tk.Label(
+        self._ds_out_var = tk.StringVar(value="Choose an output folder")
+        self._ds_out_label = tk.Label(
             out_frame, textvariable=self._ds_out_var,
-            bg=APP_BG, fg=ACCENT, font=("Segoe UI", 9, "italic"),
-        ).pack(side="left", padx=4)
+            bg=APP_BG, fg="#c0392b", font=("Segoe UI", 9, "italic"),
+        )
+        self._ds_out_label.pack(side="left", padx=4)
         tk.Button(
             out_frame, text="Choose…", command=self._ds_choose_output,
             bg="#e0e8f0", fg="#333", font=("Segoe UI", 9), relief="flat",
@@ -6928,8 +7034,7 @@ class ConverterApp:
         self._ds_progress = ttk.Progressbar(parent, mode="determinate")
         self._ds_progress.pack(fill="x", padx=18, pady=(6, 2))
         self._ds_tracker = _ProgressTracker(self.root, self._ds_progress)
-        self._ds_status_var = tk.StringVar(
-            value="Ready — add .zip files to extract and organize.")
+        self._ds_status_var = tk.StringVar(value=self._DS_READY_MSG)
         tk.Label(parent, textvariable=self._ds_status_var, bg=APP_BG, fg="#555",
                  font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=20, pady=(0, 4))
         self._ds_timer = self._build_timer(parent)
@@ -6938,10 +7043,11 @@ class ConverterApp:
         ds_btn_row = tk.Frame(parent, bg=APP_BG)
         ds_btn_row.pack(pady=(4, 14))
         self._ds_btn = tk.Button(
-            ds_btn_row, text="Structure Documents", command=self._start_ds,
+            ds_btn_row, text="Organize Files", command=self._start_ds,
             bg=ACCENT, fg=BTN_FG, font=("Segoe UI", 12, "bold"),
             relief="flat", padx=30, pady=8, cursor="hand2",
             activebackground="#005a9e", activeforeground=BTN_FG,
+            state="disabled",
         )
         self._ds_btn.pack(side="left")
         self._ds_cancel_btn = tk.Button(
@@ -6954,23 +7060,26 @@ class ConverterApp:
 
     def _ds_add_files(self):
         paths = filedialog.askopenfilenames(
-            title="Select ZIP files",
-            filetypes=[("ZIP archives", "*.zip"), ("All files", "*.*")],
+            title="Select files or archives",
+            filetypes=[
+                ("All files", "*.*"),
+                ("Archives", " ".join(f"*{e}" for e in ARCHIVE_EXTS)),
+            ],
         )
         for p in paths:
             self._ds_add_path(p)
+
+    def _ds_add_folder(self):
+        d = filedialog.askdirectory(title="Select a folder to organize")
+        if d:
+            self._ds_add_path(d)
 
     def _ds_on_drop(self, event):
         for p in self.root.tk.splitlist(event.data):
             self._ds_add_path(p)
 
     def _ds_add_path(self, p):
-        path = Path(p)
-        if not path.is_file() or path.suffix.lower() != ".zip":
-            return   # only accept .zip archives; ignore anything else
-        if path not in self._ds_files:
-            self._ds_files.append(path)
-            self._ds_file_list.insert("end", path.name)
+        self._queue_add_path(p, self._ds_files, self._ds_file_list)
         self._ds_update_drop_label()
 
     def _ds_remove_selected(self):
@@ -6984,26 +7093,28 @@ class ConverterApp:
         self._ds_file_list.delete(0, "end")
         self._ds_update_drop_label()
         # Return the page to its ready state (clear any "Done!"/error status).
-        self._ds_status_var.set("Ready — add .zip files to extract and organize.")
+        self._ds_status_var.set(self._DS_READY_MSG)
         self._ds_tracker.reset()
 
     def _ds_update_drop_label(self):
         if self._ds_files:
-            self._ds_drop_label.config(text=f"{len(self._ds_files)} zip file(s) queued")
+            self._ds_drop_label.config(text=f"{len(self._ds_files)} item(s) queued")
         else:
-            self._ds_drop_label.config(text="Drop .zip files here\nor click 'Add Zip Files'")
+            self._ds_drop_label.config(text=self._DS_DROP_HINT)
 
     def _ds_choose_output(self):
         d = filedialog.askdirectory(title="Select output folder")
         if d:
             self._ds_out_dir = Path(d)
             self._ds_out_var.set(str(self._ds_out_dir))
-        else:
-            self._ds_out_dir = None
-            self._ds_out_var.set("Same as source file")
+            self._ds_out_label.config(fg=ACCENT)
+            self._ds_btn.config(state="normal")
+        elif self._ds_out_dir is None:
+            self._ds_out_var.set("Choose an output folder")
+            self._ds_out_label.config(fg="#c0392b")
 
     def _cancel_ds_op(self):
-        # Stop the batch. Work is copies + short network calls, so the loop
+        # Stop the batch. The work is extraction plus file copies, so the loop
         # exits between files; there are no Office processes to kill.
         self._cancel_ds.set()
         self._set_cancel_state(self._ds_cancel_btn, False)
@@ -7011,34 +7122,39 @@ class ConverterApp:
 
     def _start_ds(self):
         if not self._ds_files:
-            messagebox.showwarning("No Files", "Please add ZIP files first.")
+            messagebox.showwarning(
+                "Nothing to Organize",
+                "Please add archives, folders or files first.")
             return
-        do_rename = self._ds_rename.get()
-        do_date = self._ds_date.get()
-        do_organize = self._ds_organize.get()
+        out_dir = self._ds_out_dir
+        if out_dir is None:
+            messagebox.showwarning(
+                "No Output Folder", "Please choose an output folder first.")
+            return
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            messagebox.showerror(
+                "Output Folder Unusable",
+                f"The output folder can't be used:\n\n{out_dir}\n\n{exc}")
+            return
 
-        cfg = None
-        if do_rename or do_date:
-            # Hard gate: the AI backend is unavailable unless its credentials are
-            # present in the environment (never baked into this build). The
-            # checkboxes are disabled too; this guard is belt-and-braces.
-            if not _ai_backend_ready():
-                messagebox.showinfo(
-                    "AI Features Not Available Yet",
-                    "The AI features (filename suggestions and date prefixing) "
-                    "aren't available in this version yet. Organizing into folders "
-                    "by file type still works.")
+        # SAFEGUARD: the output folder must not sit inside a folder that was
+        # queued as input. Allowing it would drop this run's organized copies
+        # into the very tree being read — mixing them in with the user's
+        # originals, and duplicating everything again on the next run.
+        for entry in self._ds_files:
+            if entry.is_dir() and _is_within(out_dir, entry):
+                messagebox.showerror(
+                    "Output Folder Is Inside an Input Folder",
+                    f"The output folder\n\n{out_dir}\n\nis inside a folder you added "
+                    f"as input:\n\n{entry}\n\nChoose an output folder outside your "
+                    "input folders, so the organized copies stay separate from your "
+                    "originals.")
                 return
-            cfg = _load_ai_backend()
 
-        # Snapshot the job on the main thread — the worker must not read Tk vars.
-        self._ds_job = {
-            "rename": do_rename,
-            "date": do_date,
-            "organize": do_organize,
-            "cfg": cfg,
-            "out_dir": self._ds_out_dir,
-        }
+        # Snapshot the job on the main thread — the worker must not read Tk state.
+        self._ds_job = {"out_dir": out_dir}
         self._cancel_ds.clear()
         self._ds_btn.config(state="disabled")
         self._set_cancel_state(self._ds_cancel_btn, True)
@@ -7047,159 +7163,128 @@ class ConverterApp:
         threading.Thread(target=self._ds_worker, daemon=True).start()
 
     def _ds_worker(self):
-        job = self._ds_job
-        do_rename, do_date, do_organize = job["rename"], job["date"], job["organize"]
-        cfg, out_base = job["cfg"], job["out_dir"]
-        zips = list(self._ds_files)
-        total = len(zips)
+        out_base = self._ds_job["out_dir"]
+        entries = list(self._ds_files)
+        total = len(entries)
         saved = 0
-        renamed = 0
-        failed = []        # (name, reason) — files that couldn't be saved
-        notes = []         # (name, info) — kept original name, with the reason why
+        failed = []        # (name, reason) — files that couldn't be copied
         protected = []     # password-protected archives we skipped
-        bad_zips = []      # (name, reason) — archives that couldn't be extracted
+        bad_archives = []  # (name, reason) — archives that couldn't be extracted
+        empties = []       # inputs that turned out to hold no files at all
 
-        # Each ZIP is extracted into its own temp dir (nested zips expanded in
-        # place), then every extracted file is structured into the output folder.
-        for i, zip_path in enumerate(zips):
+        for i, entry in enumerate(entries):
             if self._cancel_ds.is_set():
                 break
-            self._ds_timer.set_file(zip_path.name)
-
-            # Skip password-protected archives — they can't be extracted here.
-            if _is_password_protected(zip_path):
-                protected.append(zip_path.name)
-                self._ds_tracker.complete_item()
-                continue
-
-            self._set_ds_status(f"Extracting: {zip_path.name}  ({i + 1}/{total})")
+            name = _input_entry_name(entry)
+            self._ds_timer.set_file(name)
             self._ds_tracker.begin_item()
-            tmp = Path(tempfile.mkdtemp())
+            tmp = None
             try:
-                with zipfile.ZipFile(zip_path, "r") as zf:
-                    zf.extractall(tmp)
-                _recursive_unzip_in_place(tmp)   # expand nested zips at any depth
-                extracted = sorted(p for p in tmp.rglob("*") if p.is_file())
-            except zipfile.BadZipFile:
-                bad_zips.append((zip_path.name, "not a valid ZIP file or corrupted"))
-                shutil.rmtree(tmp, ignore_errors=True)
-                self._ds_tracker.complete_item()
-                continue
-            except Exception as exc:
-                bad_zips.append((zip_path.name, str(exc)))
-                shutil.rmtree(tmp, ignore_errors=True)
-                self._ds_tracker.complete_item()
-                continue
+                if entry.is_dir():
+                    self._set_ds_status(f"Reading folder: {name}  ({i + 1}/{total})")
+                    files = _files_under_folder(entry)
+                elif entry.is_file() and entry.suffix.lower() in ARCHIVE_EXTS:
+                    if _is_password_protected(entry):
+                        protected.append(name)
+                        continue
+                    self._set_ds_status(f"Extracting: {name}  ({i + 1}/{total})")
+                    # Always into temp, never beside the user's archive.
+                    tmp = Path(tempfile.mkdtemp())
+                    try:
+                        _extract_archive(entry, tmp)
+                    except _ArchiveProtected:
+                        protected.append(name)
+                        continue
+                    except zipfile.BadZipFile:
+                        bad_archives.append((name, "not a valid archive, or corrupted"))
+                        continue
+                    except Exception as exc:
+                        bad_archives.append((name, str(exc)))
+                        continue
+                    # Nested archives are expanded here and only here: this tree
+                    # is our own temp copy, so the in-place expansion (which
+                    # deletes each archive as it unpacks it) can never reach
+                    # anything belonging to the user.
+                    _recursive_unzip_in_place(tmp)
+                    files = _files_under_folder(tmp)
+                elif entry.is_file():
+                    files = [entry]
+                else:
+                    failed.append((name, "no longer exists"))
+                    continue
 
-            # No output folder chosen → save beside the source zip ("same as
-            # source"). The folder may already contain unrelated files; that's
-            # fine — only the extracted files are written here.
-            base = out_base if out_base else zip_path.parent
-            try:
-                ntotal = len(extracted)
-                for j, src in enumerate(extracted):
+                if not files:
+                    empties.append(name)
+                    continue
+
+                nfiles = len(files)
+                for j, src in enumerate(files):
                     if self._cancel_ds.is_set():
                         break
-                    s, r = self._ds_structure_file(
-                        src, zip_path.name, base, do_rename, do_date,
-                        do_organize, cfg, i, total, j, ntotal, failed, notes)
-                    saved += s
-                    renamed += r
+                    self._set_ds_status(
+                        f"Saving: {src.name}  [{name} ({i + 1}/{total}) — {j + 1}/{nfiles}]")
+                    if self._ds_copy_into_type_folder(src, out_base, failed):
+                        saved += 1
             finally:
-                shutil.rmtree(tmp, ignore_errors=True)
-
-            self._ds_tracker.complete_item()
+                if tmp is not None:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                self._ds_tracker.complete_item()
 
         self.root.after(
-            0, lambda: self._ds_finish(saved, renamed, failed, notes, protected, bad_zips))
+            0, lambda: self._ds_finish(saved, failed, protected, bad_archives, empties))
 
-    def _ds_structure_file(self, src, zip_name, out_base, do_rename, do_date,
-                           do_organize, cfg, i, total, j, ntotal, failed, notes):
-        """Optionally AI-rename and/or AI-date-prefix one extracted file, then
-        copy it into the output folder. When both AI options are on the result is
-        'Date_AISuggestedName'; date-only gives 'Date_OriginalName'. Mutates
-        `failed`/`notes`; returns (saved_count, renamed_count) as 0/1."""
-        new_stem = src.stem
-        name_changed = False
-        date_prefix = None
-        where = f"{zip_name} ({i + 1}/{total}) — {j + 1}/{ntotal}"
+    def _ds_copy_into_type_folder(self, src: Path, out_base: Path, failed: list) -> bool:
+        """Copy one file into out_base/<Type>/, the only write this tool makes.
 
-        # Both AI features read the same opening text, so extract it just once.
-        if do_rename or do_date:
-            if _is_password_protected(src):
-                notes.append((src.name, "password-protected — kept original name "
-                                        "(use Password Removal first)"))
-            else:
-                self._set_ds_status(f"Reading: {src.name}  [{where}]")
-                text = _extract_document_text(src)
-                if not text:
-                    notes.append((src.name, "no readable text (or unsupported type) — "
-                                            "kept original name, no date added"))
-                else:
-                    if do_rename and not self._cancel_ds.is_set():
-                        self._set_ds_status(f"Asking AI for a name: {src.name}  [{where}]")
-                        suggestion = _ai_suggest_filename(text, cfg)
-                        if suggestion and suggestion != src.stem:
-                            new_stem = suggestion
-                            name_changed = True
-                        elif not suggestion:
-                            notes.append((src.name, "no AI name suggestion (API "
-                                                    "unavailable) — kept original name"))
-                    if do_date and not self._cancel_ds.is_set():
-                        self._set_ds_status(f"Asking AI for the date: {src.name}  [{where}]")
-                        date_prefix = _ai_infer_date(text, cfg)
-                        if not date_prefix:
-                            notes.append((src.name, "no date could be inferred — "
-                                                    "no date prefix added"))
-                if self._cancel_ds.is_set():
-                    return (0, 0)
-
-        # Date goes first, then '_', then the (possibly AI-renamed) base name.
-        if date_prefix:
-            new_stem = f"{date_prefix}_{new_stem}"
-            name_changed = True
-
-        self._set_ds_status(f"Saving: {new_stem}{src.suffix}  [{where}]")
-        target_dir = out_base
-        if do_organize:
-            target_dir = target_dir / _filetype_folder(src.suffix)
+        Creates the type subfolder if it is missing and copies the file in under
+        a name that doesn't already exist (_unique_output_path suffixes _2, _3,
+        …), so nothing already in the output folder is overwritten, moved, or
+        swept into the new subfolders. Both the folder and the final path are
+        re-checked with _is_within, so even a pathological name can't write
+        outside the folder the user chose. Mutates `failed`; returns True if the
+        file was saved.
+        """
+        target_dir = out_base / _filetype_folder(src.suffix)
+        refused = "refused — the destination fell outside the output folder"
+        if not _is_within(target_dir, out_base):
+            failed.append((src.name, refused))
+            return False
         try:
-            # Safe to share a non-empty output folder: we only ever CREATE the
-            # filetype subfolder (if missing) and COPY this one extracted file in.
-            # Files already in the output folder are never moved into the new
-            # subfolders, and _unique_output_path guarantees we never overwrite an
-            # existing file (it suffixes _2, _3, …). Originals are copied, not moved.
             target_dir.mkdir(parents=True, exist_ok=True)
-            out_path = _unique_output_path(target_dir, new_stem, src.suffix)
+            out_path = _unique_output_path(target_dir, src.stem, src.suffix)
+            if not _is_within(out_path, target_dir):
+                failed.append((src.name, refused))
+                return False
             shutil.copy2(src, out_path)
-            return (1, 1 if name_changed else 0)
+            return True
         except Exception as exc:
             failed.append((src.name, str(exc)))
-            return (0, 0)
+            return False
 
     def _set_ds_status(self, msg):
         self.root.after(0, lambda: self._ds_status_var.set(msg))
 
-    def _ds_finish(self, saved, renamed, failed, notes, protected, bad_zips):
+    def _ds_finish(self, saved, failed, protected, bad_archives, empties):
         self._ds_timer.stop()
         self._ds_tracker.finish()
         elapsed = self._ds_timer.elapsed_str()
         self._ds_timer.reset()
-        self._ds_btn.config(state="normal")
+        self._ds_btn.config(state="normal" if self._ds_out_dir else "disabled")
         self._set_cancel_state(self._ds_cancel_btn, False)
 
         extra = ""
-        if renamed:
-            extra += f"\n{renamed} file(s) renamed."
-        if protected:
-            extra += (f"\n{len(protected)} archive(s) skipped (password-protected): "
-                      + ", ".join(protected))
-        if bad_zips:
-            bad_lines = "\n".join(f"• {n}: {e}" for n, e in bad_zips)
+        if bad_archives:
+            bad_lines = "\n".join(f"• {n}: {e}" for n, e in bad_archives)
             extra += f"\n\nArchives that couldn't be extracted:\n{bad_lines}"
-        if notes:
-            note_lines = "\n".join(f"• {n}: {info}" for n, info in notes)
-            extra += f"\n\nKept original names:\n{note_lines}"
+        if empties:
+            extra += "\n\nNo files found in: " + ", ".join(empties)
+        # Archive passwords aren't Office encryption, so Password Removal can't
+        # help here — give archive-appropriate guidance instead.
+        extra += _password_skip_note(
+            protected,
+            advice=("These archives are password-protected and can't be extracted "
+                    "here. Open them with your unzip program using the password, "
+                    "then add the extracted folder instead."))
 
         if self._cancel_ds.is_set():
             self._ds_status_var.set(
@@ -7214,8 +7299,8 @@ class ConverterApp:
             self._ds_status_var.set(f"✅  Done! {saved} file(s) saved.")
             messagebox.showinfo(
                 "Document Structuring Complete",
-                f"{saved} file(s) extracted and saved to the output folder.{extra}"
-                f"\n\nTotal time elapsed: {elapsed}",
+                f"{saved} file(s) organized into the output folder by file type."
+                f"{extra}\n\nTotal time elapsed: {elapsed}",
             )
         else:
             err_lines = "\n".join(f"• {n}: {e}" for n, e in failed)
@@ -7225,6 +7310,256 @@ class ConverterApp:
                 f"{saved} saved, {len(failed)} failed:{extra}\n\n{err_lines}"
                 f"\n\nTotal time elapsed: {elapsed}",
             )
+
+    # ── AI Organization page ──────────────────────
+    #
+    # NOT AVAILABLE YET — AI_ORGANIZATION_ENABLED is the switch, and it is off.
+    # The page is deliberately built right up to the point of doing work: it
+    # accepts the same mixed queue of archives, folders and loose files that
+    # Document Structuring does, and it shows the two options the feature will
+    # offer, so what is coming is visible and its inputs are understood. What it
+    # does not have is a worker — both toggles render disabled, the run button is
+    # greyed out, and _start_aiorg refuses regardless of how it is reached. The
+    # _ai_* helpers it will call (text extraction, name suggestion, date
+    # inference) are complete and live above.
+
+    _AIO_DROP_HINT = ("Drop archives, folders or files here\n"
+                      "or use the buttons below")
+
+    def _build_aiorg_page(self, parent):
+        available = _ai_organization_available()
+
+        tk.Label(
+            parent, text="AI Organization",
+            bg=APP_BG, fg="#1a1a1a", font=("Segoe UI", 14, "bold"),
+            anchor="w", padx=18,
+        ).pack(fill="x", pady=(14, 4))
+
+        tk.Label(
+            parent,
+            text=("Give documents professional, standardized names. Add archives "
+                  "(.zip, .7z, .rar), whole folders, or individual files — archives are "
+                  "extracted first — then each document's opening text is read and used "
+                  "to suggest a name, a date prefix, or both. Copies are saved to your "
+                  "output folder; originals are never modified."),
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+            anchor="w", padx=18, justify="left", wraplength=620,
+        ).pack(fill="x", pady=(0, 6))
+
+        if not available:
+            tk.Label(
+                parent,
+                text=("⏳  Coming soon — this tool isn't available yet. You can see what "
+                      "it will do here, but it can't be run."),
+                bg="#fdf3d8", fg="#7a5c00", font=("Segoe UI", 9),
+                anchor="w", padx=10, pady=7, justify="left", wraplength=600,
+            ).pack(fill="x", padx=18, pady=(0, 6))
+
+        # Drop zone
+        self._aio_drop_frame = tk.Frame(
+            parent, bg=DROP_BG, highlightbackground=DROP_BD,
+            highlightthickness=2, relief="flat",
+        )
+        self._aio_drop_frame.pack(fill="both", expand=True, padx=18, pady=(6, 6))
+        self._aio_drop_label = tk.Label(
+            self._aio_drop_frame, text=self._AIO_DROP_HINT,
+            bg=DROP_BG, fg="#4a6fa5", font=("Segoe UI", 11), justify="center",
+        )
+        self._aio_drop_label.pack(expand=True, pady=20)
+        list_frame = tk.Frame(self._aio_drop_frame, bg=DROP_BG)
+        list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical")
+        self._aio_file_list = tk.Listbox(
+            list_frame, yscrollcommand=scrollbar.set, selectmode="extended",
+            bg="#ffffff", fg="#1a1a1a", font=("Segoe UI", 9),
+            relief="flat", bd=1, activestyle="none", highlightthickness=0,
+        )
+        scrollbar.config(command=self._aio_file_list.yview)
+        scrollbar.pack(side="right", fill="y")
+        self._aio_file_list.pack(fill="both", expand=True)
+        if HAS_DND:
+            for widget in (self._aio_drop_frame, self._aio_drop_label,
+                           list_frame, self._aio_file_list):
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._aio_on_drop)
+
+        # Add / Remove / Clear
+        btn_frame = tk.Frame(parent, bg=APP_BG)
+        btn_frame.pack(fill="x", padx=18, pady=(4, 4))
+        for label, cmd in [
+            ("Add Files",       self._aio_add_files),
+            ("Add Folder",      self._aio_add_folder),
+            ("Remove Selected", self._aio_remove_selected),
+            ("Clear All",       self._aio_clear_files),
+        ]:
+            tk.Button(
+                btn_frame, text=label, command=cmd,
+                bg="#e0e8f0", fg="#333", font=("Segoe UI", 9),
+                relief="flat", padx=12, pady=4, cursor="hand2",
+            ).pack(side="left", padx=(0, 6))
+
+        # The two options the feature will offer. Both stay off and disabled
+        # while the feature is unavailable, so the page can't collect a choice
+        # that would then be silently ignored.
+        opt_frame = tk.Frame(parent, bg=APP_BG)
+        opt_frame.pack(fill="x", padx=18, pady=(2, 0))
+        if not available:
+            self._aio_rename.set(False)
+            self._aio_date.set(False)
+        soon = "" if available else "  (coming soon)"
+        self._aio_rename_check = _ToggleSwitch(
+            opt_frame,
+            text="AI filename suggestions" + soon,
+            variable=self._aio_rename,
+            state=("normal" if available else "disabled"),
+        )
+        self._aio_rename_check.pack(anchor="w", pady=2)
+        self._aio_date_check = _ToggleSwitch(
+            opt_frame,
+            text="Add the document's inferred date as a filename prefix (Date_Name)" + soon,
+            variable=self._aio_date,
+            state=("normal" if available else "disabled"),
+        )
+        self._aio_date_check.pack(anchor="w", pady=2)
+
+        # Output folder row
+        out_frame = tk.Frame(parent, bg=APP_BG)
+        out_frame.pack(fill="x", padx=18, pady=(6, 2))
+        tk.Label(
+            out_frame, text="Output folder:",
+            bg=APP_BG, fg="#555", font=("Segoe UI", 9),
+        ).pack(side="left")
+        self._aio_out_var = tk.StringVar(value="Choose an output folder")
+        self._aio_out_label = tk.Label(
+            out_frame, textvariable=self._aio_out_var,
+            bg=APP_BG, fg="#c0392b", font=("Segoe UI", 9, "italic"),
+        )
+        self._aio_out_label.pack(side="left", padx=4)
+        tk.Button(
+            out_frame, text="Choose…", command=self._aio_choose_output,
+            bg="#e0e8f0", fg="#333", font=("Segoe UI", 9), relief="flat",
+            padx=8, pady=2, cursor="hand2",
+        ).pack(side="left", padx=4)
+
+        self._aio_status_var = tk.StringVar(
+            value=("Ready — add archives, folders or files." if available
+                   else "Not available yet — this tool can't be run in this version."))
+        tk.Label(parent, textvariable=self._aio_status_var, bg=APP_BG, fg="#555",
+                 font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=20, pady=(8, 4))
+
+        # Run button. Greyed out while the feature is unavailable, rather than
+        # live-but-refusing: a button that always errors is worse than one that
+        # plainly can't be pressed.
+        aio_btn_row = tk.Frame(parent, bg=APP_BG)
+        aio_btn_row.pack(pady=(4, 14))
+        self._aio_btn = tk.Button(
+            aio_btn_row, text="Organize with AI", command=self._start_aiorg,
+            bg=ACCENT, fg=BTN_FG, font=("Segoe UI", 12, "bold"),
+            relief="flat", padx=30, pady=8, cursor="hand2",
+            activebackground="#005a9e", activeforeground=BTN_FG,
+            state=("normal" if available else "disabled"),
+        )
+        self._aio_btn.pack(side="left")
+
+    def _aio_add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Select files or archives",
+            filetypes=[
+                ("All files", "*.*"),
+                ("Archives", " ".join(f"*{e}" for e in ARCHIVE_EXTS)),
+            ],
+        )
+        for p in paths:
+            self._aio_add_path(p)
+
+    def _aio_add_folder(self):
+        d = filedialog.askdirectory(title="Select a folder to organize")
+        if d:
+            self._aio_add_path(d)
+
+    def _aio_on_drop(self, event):
+        for p in self.root.tk.splitlist(event.data):
+            self._aio_add_path(p)
+
+    def _aio_add_path(self, p):
+        self._queue_add_path(p, self._aio_files, self._aio_file_list)
+        self._aio_update_drop_label()
+
+    def _aio_remove_selected(self):
+        for i in sorted(self._aio_file_list.curselection(), reverse=True):
+            self._aio_file_list.delete(i)
+            del self._aio_files[i]
+        self._aio_update_drop_label()
+
+    def _aio_clear_files(self):
+        self._aio_files.clear()
+        self._aio_file_list.delete(0, "end")
+        self._aio_update_drop_label()
+
+    def _aio_update_drop_label(self):
+        if self._aio_files:
+            self._aio_drop_label.config(text=f"{len(self._aio_files)} item(s) queued")
+        else:
+            self._aio_drop_label.config(text=self._AIO_DROP_HINT)
+
+    def _aio_choose_output(self):
+        d = filedialog.askdirectory(title="Select output folder")
+        if d:
+            self._aio_out_dir = Path(d)
+            self._aio_out_var.set(str(self._aio_out_dir))
+            self._aio_out_label.config(fg=ACCENT)
+        elif self._aio_out_dir is None:
+            self._aio_out_var.set("Choose an output folder")
+            self._aio_out_label.config(fg="#c0392b")
+
+    def _start_aiorg(self):
+        """Run button handler — a refusal, since the feature is off.
+
+        Kept as the button's command (rather than leaving the button command-less)
+        so the run path can never become a silent no-op: whatever state the page
+        is in, pressing it says something true. The two branches distinguish the
+        two ways it can be unavailable, which is the first thing whoever flips
+        AI_ORGANIZATION_ENABLED will need to know.
+        """
+        if not AI_ORGANIZATION_ENABLED:
+            messagebox.showinfo(
+                "AI Organization Isn't Available Yet",
+                "AI filename suggestions and inferred date prefixes aren't available "
+                "in this version yet.\n\nTo sort files into folders by file type "
+                "today, use the Document Structuring tool.")
+            return
+        if not _ai_backend_ready():
+            messagebox.showinfo(
+                "AI Backend Not Configured",
+                "The AI service credentials aren't set on this machine, so AI "
+                "Organization can't run.")
+            return
+        messagebox.showinfo(
+            "AI Organization",
+            "The AI backend is configured, but this build has no AI Organization "
+            "worker wired up yet.")
+
+    # ── shared input queue ──────────────────────
+    def _queue_add_path(self, p, files, listbox) -> bool:
+        """Queue one input — an archive, a folder, or a loose file — for a page
+        whose drop zone accepts all three (Document Structuring, AI
+        Organization). Shared so the two can't drift apart in what they accept.
+
+        A path that doesn't currently exist is ignored rather than queued, which
+        is what lets the queue stand as an exact statement of what the tool is
+        permitted to read. Returns True if it was added.
+        """
+        path = Path(p)
+        try:
+            is_dir = path.is_dir()
+            is_file = path.is_file()
+        except Exception:
+            return False
+        if not (is_dir or is_file) or path in files:
+            return False
+        files.append(path)
+        listbox.insert("end", _input_entry_label(path, is_dir))
+        return True
 
     # ── About & Updates ──────────────────────
     def _build_update_page(self, parent):

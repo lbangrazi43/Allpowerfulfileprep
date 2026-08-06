@@ -269,8 +269,8 @@ encrypted archives so the UI lists them under "password-protected" rather than
 "corrupt", and `_archive_needs_password` extends `_is_password_protected` to
 `.7z`/`.rar` — deliberately reporting *not* protected when no extractor is
 available, so the user gets the real "install X" message instead of a wrong one.
-Document Structuring still only *accepts* `.zip`, but archives nested inside one
-are now expanded whatever their format, since it shares
+Document Structuring accepts every `ARCHIVE_EXTS` format at the top level and
+expands whatever is nested inside them, since it shares `_extract_archive` and
 `_recursive_unzip_in_place`.
 
 **Image conversion.** `IMAGE_EXTS` splits into `_WORD_NATIVE_IMAGE_EXTS`, which
@@ -385,6 +385,19 @@ path.
   folder can never be deleted. Used by `_aiprep_worker`, `_office_worker`, and
   `_auto_pdf_scan_and_convert`. Other `unlink` calls only remove uniquely-named
   output the app just wrote (failure cleanup) or program-created temp files.
+- `_is_within(child, parent)` / `_files_under_folder(folder)` — the containment
+  safeguards for tools that take a **folder** as input. `_is_within` resolves both
+  sides and compares path *components* (`parent in child.parents`), so a string
+  prefix can't make `…\Reports2` read as inside `…\Reports` and a junction can't
+  disguise a path. `_files_under_folder` walks with `os.walk(followlinks=False)`,
+  prunes reparse-point directories, and re-checks every hit with `_is_within` — a
+  symlink planted in an input folder therefore cannot pull in files from elsewhere
+  on disk. Use both whenever a new tool accepts a folder.
+- `_queue_add_path` / `_input_entry_label` / `_input_entry_name` — the shared
+  mixed input queue (archive / folder / loose file) behind Document Structuring
+  and AI Organization, so the two can't drift apart in what they accept. Paths
+  that don't exist are never queued, which is what lets the queue stand as the
+  literal definition of what the tool may read.
 - `_OpTimer` / `_build_timer` — the stacked Total + per-file elapsed-time labels.
 - `_set_cancel_state` — the grey/red Cancel-button states.
 - `_safe_filename`, `_is_password_protected`, `_get_markitdown` (markitdown powers
@@ -423,20 +436,55 @@ and resurfaces over the app. A separate animated `_SplashScreen` runs during UI
 construction. Asset paths resolve through `_resource_base()` /
 `sys._MEIPASS` when frozen.
 
-**Document Structuring tool.** Input is **ZIP archives only** (drop zone and Add
-dialog reject non-`.zip`). The worker `_ds_worker` extracts each archive to a
-temp dir, expands nested zips at any depth via the shared
-`_recursive_unzip_in_place`, then runs the selected structuring on every
-extracted file (`_ds_structure_file`): optional AI rename, optional AI
-date-prefix (`_ai_infer_date` → `YYYY-MM-DD`, applied as `Date_Name`; with rename
-on it becomes `Date_AISuggestedName`), and/or organize into filetype subfolders
-(`FILETYPE_FOLDERS` / `_filetype_folder`). Output folder is **optional** (defaults
-to each zip's own folder, "Same as source") and **need not be empty** — only the
-extracted files are written/organized there: existing files are never moved, swept
-into the created subfolders, or overwritten (`_unique_output_path` suffixes
-collisions; files are copied, not moved). Password-protected archives are skipped;
-bad/corrupt zips are reported. (Note: Folder Unzipping still *does* require an
-empty output folder — that constraint was removed only from Document Structuring.)
+**Document Structuring tool — organize by filetype, and nothing else.** It has
+**no options and no toggle**: the one thing it does is sort files into
+`<out>/<Type>/` (`FILETYPE_FOLDERS` / `_filetype_folder`). The AI rename and
+date-prefix that used to share this page moved to AI Organization below.
+
+Input is a **mixed queue** of three kinds, added by drop, "Add Files" or "Add
+Folder" (`_queue_add_path`): an **archive** (any `ARCHIVE_EXTS`, extracted to a
+temp dir with nested archives expanded via `_recursive_unzip_in_place`), a
+**folder** (walked with `_files_under_folder`), or a **loose file** (taken as it
+is). An output folder is **required** — the Run button stays disabled and the
+label stays red until one is chosen — but it **need not be empty**.
+
+The safeguards are the point of this tool, and they fire in this order:
+1. `_queue_add_path` refuses to queue a path that doesn't exist, so the queue is
+   an exact statement of what may be read.
+2. Archives extract into `tempfile.mkdtemp()`, **never** beside the source — this
+   is what makes `_recursive_unzip_in_place` safe here, since that function
+   *deletes each archive it unpacks* and must therefore only ever see our copy.
+   A `.zip` sitting inside a dropped *folder* is deliberately **not** expanded
+   (it is filed under Archives); expanding it would mutate the user's own tree.
+3. `_files_under_folder` won't follow a symlink/junction out of an input folder.
+4. `_start_ds` rejects an output folder that is inside a queued input folder —
+   that would write the run's output into the tree it is reading.
+5. `_ds_copy_into_type_folder` re-checks both the type subfolder and the final
+   path with `_is_within(out_base)` immediately before copying.
+6. Files are **copied**, `_unique_output_path` suffixes collisions, and only the
+   type subfolders are created — so originals, and anything already sitting in
+   the output folder, are both untouched. **There is no `unlink` in this tool at
+   all.**
+
+Password-protected archives are skipped and listed; corrupt ones are reported.
+(Note: Folder Unzipping still *does* require an empty output folder — that
+constraint was removed only from Document Structuring.)
+
+**AI Organization tool — present, but switched off.** `AI_ORGANIZATION_ENABLED`
+(`False`) is the single master switch, and `_ai_organization_available()` is
+`AI_ORGANIZATION_ENABLED and _ai_backend_ready()` — credentials appearing in the
+environment is deliberately *not* on its own permission to run the feature, so
+both must be true. While it is off: a "Coming soon" banner shows, both
+`_ToggleSwitch`es render disabled with "(coming soon)" and are forced off, the
+Run button is greyed out (not live-but-erroring), and `_start_aiorg` refuses with
+a message that names which of the two gates failed.
+
+The page is built right up to the point of doing work — it accepts the same mixed
+archive/folder/file queue as Document Structuring — but it has **no worker**.
+That is the missing piece: `_extract_document_text`, `_ai_suggest_filename` and
+`_ai_infer_date` are complete and are what a worker will call, and are kept
+rather than stubbed so enabling the feature is a flag flip plus a worker, not a
+rewrite.
 
 **Self-update from GitHub Releases (the "About & Updates" page).** `APP_VERSION`
 (top of `File.py`) is compared against `/releases/latest`, which returns only the
@@ -561,9 +609,10 @@ reads the endpoint, key, and deployment from environment variables at call time
 `APFP_AI_API_VERSION` defaulting to `2024-06-01`). This keeps the shipped binary
 safe to distribute — a malicious reader of the source/binary finds no key to
 exploit. When any required variable is unset, `_ai_backend_ready()` is False,
-both AI checkboxes (rename and date-prefix) render disabled with "(coming soon)",
-and `_start_ds` refuses any AI path (organize-by-filetype still works). Renames
-apply AI suggestions automatically — there is deliberately no per-file approval
-dialog. The API is called with stdlib `urllib` (no SDK dependency; request shape
-is Azure-OpenAI-style chat completions) and every step degrades gracefully when
-text extraction yields nothing or the API is unreachable.
+which is one of the two gates on the AI Organization page (see above) — the other
+being `AI_ORGANIZATION_ENABLED`, so credentials alone never switch the feature
+on. The API is called with stdlib `urllib` (no SDK dependency; request shape is
+Azure-OpenAI-style chat completions) and every step degrades gracefully when text
+extraction yields nothing or the API is unreachable. When the feature does go
+live, renames are intended to apply AI suggestions automatically — deliberately
+no per-file approval dialog.
