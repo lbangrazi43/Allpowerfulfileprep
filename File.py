@@ -3875,8 +3875,9 @@ def _sha256_file(path: Path) -> str:
 
 
 # Folder names that mean "this directory is continuously synced by a cloud
-# client". Matched against whole path components, so "OneDrive - Contoso"
-# hits via its prefix while an ordinary folder called "Boxes" does not.
+# client". Matched against whole path components, so a business tenant folder
+# ("OneDrive - Contoso") hits via its prefix while an ordinary folder called
+# "Boxes" does not.
 _CLOUD_SYNC_FOLDERS = {
     "onedrive":       "OneDrive",
     "dropbox":        "Dropbox",
