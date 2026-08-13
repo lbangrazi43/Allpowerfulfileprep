@@ -86,6 +86,13 @@ $RECYCLE.BIN/
 *-DESKTOP-*
 .DS_Store
 
+# ── Local diagnostics ────────────────────────
+# The update-connection diagnostic: a separate console exe with its own spec,
+# never built by BoxOfScraps.spec and never shipped. Kept on the machine that
+# needs it rather than in a public repo, where it would read as part of the app.
+tools/
+BoxOfScraps-Diag.spec
+
 # ── Scratch / throwaway ──────────────────────
 # Verification scripts get written, run, and deleted (see CLAUDE.md); these
 # catch the ones that outlive their session.

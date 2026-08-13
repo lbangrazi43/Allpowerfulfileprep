@@ -908,7 +908,7 @@ def _word_to_pdf(src_path: Path, out_path: Path, word):
 # emitted as mojibake, so listing a sometimes-binary extension is safe.
 TEXT_REPORT_EXTS = (
     # Report dumps
-    ".rep", ".rpt", ".prn", ".lst",
+    ".rep", ".rpt", ".rt", ".prn", ".lst",
     # Logs, traces and program output
     ".log", ".out", ".err", ".dat", ".trace",
     # Structured text and data dumps
@@ -932,6 +932,20 @@ TEXT_REPORT_EXTS = (
 # `.csv` is Excel's. Choosing "Basic Text" is how you say you want the raw text
 # instead — useful for a malformed CSV or an XML you want to read as-is.
 TEXT_REPORT_ALSO_ACCEPTS = (".txt", ".xml", ".csv")
+
+# Sentinel usable in a mode's `shared` list, meaning "also accept any extension
+# that no mode owns". It exists for what legacy and ERP systems actually emit —
+# EXTRACT.20260813, LEDGER.001, REPORT.D1 — files Windows labels "20260813 File"
+# and opens in Notepad, and which no fixed list of extensions can ever
+# enumerate, because the extension is a serial number or a date.
+#
+# It is confined to `shared` on purpose. PDF_MODE_BY_EXT, ALL_TYPES_EXTS and
+# AUTO_PDF_EXTS are all built from `exts` alone, so automatic routing never sees
+# it, and neither does auto-PDF — which DELETES each original once its PDF is
+# written, and must therefore only ever act on types it positively recognises.
+# Reaching this path takes a deliberate switch to Basic Text, and even then
+# _mode_takes_ext refuses any extension another mode owns.
+ANY_UNOWNED_EXT = "*"
 
 # Image formats, split by whether Word's own picture filter can read them.
 # Declared here — well above _image_to_pdf, which uses them — because the
@@ -975,6 +989,12 @@ _REPORT_TAB_WIDTH = 8
 # Hanging indent, in characters, applied only when lines wrap: it makes a
 # continuation visibly subordinate to the line it belongs to.
 _REPORT_WRAP_INDENT_CHARS = 4
+# Ceiling on a file read as text. _read_report_text decodes the whole file into
+# memory, and ANY_UNOWNED_EXT means the caller can no longer promise that what
+# arrives here is a report — a mis-selected disk image would exhaust memory and
+# take the app down with it before _looks_binary ever ran. Word gives up on
+# anything approaching this size long before the limit itself is the problem.
+_REPORT_MAX_BYTES = 64 * 1024 * 1024
 
 
 def _looks_binary(raw: bytes) -> bool:
@@ -995,13 +1015,29 @@ def _looks_binary(raw: bytes) -> bool:
 
 
 def _read_report_text(src_path: Path) -> str:
-    """Decode a report dump, tolerating the code pages legacy systems emit."""
-    raw = src_path.read_bytes()
-    if _looks_binary(raw[:8192]):
-        raise RuntimeError(
-            f"{src_path.name} looks like a binary file, not a plain-text report. "
-            "Only text report dumps can be converted."
-        )
+    """Decode a report dump, tolerating the code pages legacy systems emit.
+
+    The binary and size checks run BEFORE the file is read in, not after. Basic
+    Text can be pointed at any unowned extension by hand (ANY_UNOWNED_EXT), so
+    "this is a text file" is no longer something the caller can promise — and
+    reading a multi-gigabyte file in just to discover it was binary is the one
+    failure mode that would take the whole app down rather than one conversion.
+    """
+    with open(src_path, "rb") as fh:
+        head = fh.read(8192)
+        if _looks_binary(head):
+            raise RuntimeError(
+                f"{src_path.name} looks like a binary file, not plain text. "
+                "Only files that are really text can be converted this way."
+            )
+        size = src_path.stat().st_size
+        if size > _REPORT_MAX_BYTES:
+            raise RuntimeError(
+                f"{src_path.name} is {size / (1024 * 1024):.0f} MB, over the "
+                f"{_REPORT_MAX_BYTES // (1024 * 1024)} MB limit for text "
+                f"conversion."
+            )
+        raw = head + fh.read()
     for enc in ("utf-8-sig", "cp1252", "latin-1"):
         try:
             return raw.decode(enc)
@@ -1469,6 +1505,23 @@ def _unique_pdf_path(directory: Path, stem: str) -> Path:
         candidate = directory / f"{stem}_{counter}.pdf"
         counter += 1
     return candidate
+
+
+def _pdf_stem_for(src: Path) -> str:
+    """What to name a file's PDF after.
+
+    Normally the stem, so REPORT.docx becomes REPORT.pdf. But when the extension
+    is one no mode owns — the date and serial suffixes ANY_UNOWNED_EXT exists
+    for — it is not really an extension at all but part of the file's identity,
+    and dropping it does active harm: a batch of EXTRACT.20260813 and
+    EXTRACT.20260814 would collapse onto one name and be told apart only by
+    _unique_pdf_path's _2 suffix, which follows queue order rather than date.
+    So those keep their full name and become EXTRACT.20260813.pdf.
+
+    Auto-PDF already does this for extensionless files, for the same reason.
+    """
+    ext = src.suffix.lower()
+    return src.name if ext and ext not in PDF_MODE_BY_EXT else src.stem
 
 
 def _unique_output_path(directory: Path, stem: str, ext: str) -> Path:
@@ -2488,9 +2541,21 @@ def _load_ai_backend() -> dict:
 
 def _ai_backend_ready() -> bool:
     """True only when the endpoint, key, and deployment are all present in the
-    environment. The credentials live entirely outside this build."""
+    environment *and* the endpoint is HTTPS. The credentials live entirely
+    outside this build.
+
+    The scheme is part of the readiness test rather than a check at request
+    time, so a misconfigured `APFP_AI_ENDPOINT` leaves the feature switched off
+    instead of quietly shipping the contents of the user's documents — and the
+    API key that goes with them — across the network in the clear."""
     cfg = _load_ai_backend()
-    return all(cfg[k] for k in ("endpoint", "api_key", "deployment"))
+    if not all(cfg[k] for k in ("endpoint", "api_key", "deployment")):
+        return False
+    import urllib.parse
+    try:
+        return urllib.parse.urlsplit(cfg["endpoint"]).scheme.lower() == "https"
+    except ValueError:
+        return False
 
 
 def _extract_document_text(src_path: Path, limit: int = 1500) -> str:
@@ -2659,7 +2724,9 @@ def convert_file(src_path: Path, out_dir: Path, mode: str, apps: dict, outlook=N
     Returns the path of the created PDF. Never overwrites an existing PDF.
     """
     ext = src_path.suffix.lower()
-    out_path = _unique_pdf_path(out_dir, src_path.stem)
+    # Named after the stem for every recognised type; see _pdf_stem_for for why
+    # an unowned "extension" is kept instead of stripped.
+    out_path = _unique_pdf_path(out_dir, _pdf_stem_for(src_path))
     word = apps.get("word")
 
     if mode == "email":
@@ -3025,7 +3092,7 @@ def _image_to_pdf(src: Path, out_path: Path, word):
 # Every mode the PDF Conversion page offers, in one table.
 #
 # The page used to branch on the dropdown label in five separate places —
-# _allowed_extensions, _add_files, _update_drop_label, and both the
+# _add_path, _add_files, _update_drop_label, and both the
 # app-launching and mode_key halves of _convert_worker — so adding a file type
 # meant editing all five and hoping they stayed in agreement. They all read from
 # here now, and Folder Unzipping's auto-PDF derives its own table from it below,
@@ -3056,10 +3123,40 @@ _PdfMode.__new__.__defaults__ = ((),)      # `shared` is empty for most modes
 
 
 def _mode_accepts(mode) -> tuple:
-    """Every extension `mode` will take from the user: the ones it owns plus the
-    ones it merely accepts. This is what the drop zone and Add Files dialog
-    filter on; automatic routing uses `mode.exts` alone."""
-    return tuple(mode.exts) + tuple(mode.shared)
+    """Every *named* extension `mode` will take from the user: the ones it owns
+    plus the ones it merely accepts. The ANY_UNOWNED_EXT sentinel is excluded —
+    it is a rule rather than an extension, and the callers that want a concrete
+    list (the Add Files dialog filter) need real ones. Automatic routing uses
+    `mode.exts` alone; to test a single extension use _mode_takes_ext."""
+    return tuple(mode.exts) + tuple(e for e in mode.shared if e != ANY_UNOWNED_EXT)
+
+
+# Extensions the wildcard refuses even though no PDF mode owns them. Each is
+# both certainly binary and already better served elsewhere: an archive belongs
+# in Folder Unzipping, and a PDF is what this page produces. They would fail
+# _looks_binary anyway — refusing by name just replaces "looks like a binary
+# file" with an answer the user can act on.
+_NEVER_AS_TEXT_EXTS = frozenset(
+    {".pdf", ".exe", ".dll", ".msi", ".iso", ".vmdk", ".bak"}) | set(ARCHIVE_EXTS)
+
+
+def _mode_takes_ext(mode, ext: str) -> bool:
+    """Whether `mode` accepts a file whose extension is `ext` — lower-cased,
+    including the dot, and "" for a file with no extension at all.
+
+    The wildcard deliberately opens a mode only to extensions NO mode owns. An
+    .xlsx dropped on Basic Text is still refused, because reading a zip
+    container as text can only yield a rejected binary or a page of noise, and
+    the user has a mode that converts it properly one dropdown entry away.
+    EXTRACT.20260813 has nowhere else to go, so it gets in.
+    """
+    if ext in _mode_accepts(mode):
+        return True
+    if ANY_UNOWNED_EXT in mode.shared:
+        # PDF_MODE_BY_EXT is defined below this function but resolved at call
+        # time, so it is the complete owned-extension map by the time we run.
+        return ext not in PDF_MODE_BY_EXT and ext not in _NEVER_AS_TEXT_EXTS
+    return False
 
 # The single-type modes. PDF_MODES below prepends the mixed-batch "All Types"
 # entry, which is built from these.
@@ -3077,7 +3174,12 @@ _PDF_TYPE_MODES = (
         # it covers report dumps.
         key="text_report", label="Basic Text (.txt, .log, .json, …)",
         noun="Basic text",
-        exts=TEXT_REPORT_EXTS, shared=TEXT_REPORT_ALSO_ACCEPTS,
+        exts=TEXT_REPORT_EXTS,
+        # The wildcard makes this the mode that will read anything nothing else
+        # claims — the date- and serial-numbered extensions ERP and mainframe
+        # extracts arrive with. See ANY_UNOWNED_EXT for why it is safe to sit in
+        # `shared` and nowhere else.
+        shared=TEXT_REPORT_ALSO_ACCEPTS + (ANY_UNOWNED_EXT,),
         families=("word",), outlook=False,
         hint=".txt / .log / .json / .sql / .rpt", auto=True,
     ),
@@ -3570,6 +3672,11 @@ UPDATE_CHUNK          = 256 * 1024
 UPDATE_MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
 UPDATE_MAX_CHECKSUM_BYTES = 4096            # a sha256 line is ~80 bytes
 UPDATE_MAX_CHANGELOG_BYTES = 512 * 1024     # the whole history is ~10 KB
+# The release JSON is a few KB. Reading it with a bound rather than json.load'ing
+# the socket means a server that answers the version check with an endless body
+# can't grow this process until it dies — the same reasoning as the download
+# ceiling above, applied to the one request that was still unbounded.
+UPDATE_MAX_API_BYTES  = 2 * 1024 * 1024
 # Everything the PyInstaller one-file bootloader puts in the environment to tell
 # the Python process it starts where the bundle was unpacked. Any process we
 # launch must NOT inherit them; `_clean_child_env` explains what happens when it
@@ -3635,6 +3742,75 @@ def _is_allowed_update_url(url: str) -> bool:
     return host in UPDATE_ALLOWED_HOSTS or host.endswith(UPDATE_ALLOWED_HOST_SUFFIX)
 
 
+# Built once and reused: assembling it reads the Windows certificate stores,
+# which is cheap but pointless to repeat on every request. Guarded by a lock
+# because the update check runs on a worker thread.
+_UPDATE_SSL_CONTEXT = None
+_UPDATE_SSL_LOCK = threading.Lock()
+
+
+def _update_ssl_context():
+    """The TLS context every update request is verified against.
+
+    Background, because the obvious "fix" here is wrong and was tried. On a
+    network doing TLS inspection the proxy re-signs github.com with a company
+    CA, and the check fails with CERTIFICATE_VERIFY_FAILED / "unable to get
+    local issuer certificate" while the user's browser opens the same URL
+    happily. The tempting explanation is that Python only reads Windows' ROOT
+    store and so misses the issuing CA in the separate intermediate store. That
+    is **not** true: CPython's `load_default_certs` already reads both
+    (`SSLContext._windows_cert_stores` is `("CA", "ROOT")`), filtered to the
+    certificates Windows marks as trusted for server authentication. Loading
+    those stores again by hand fixes nothing, and doing it without honouring the
+    trust flags actively widens trust — on this machine that promoted 27 extra
+    CAs, trusted only for things like code signing and EFS, into TLS anchors.
+
+    What OpenSSL genuinely cannot do, and Schannel can, is fetch a missing
+    intermediate through the certificate's AIA extension and pick up a root from
+    the Microsoft Trusted Root Program on demand. That is the real gap, and
+    `truststore` closes it by handing verification to Schannel — so it is used
+    whenever it is installed and this falls back to the stock context otherwise.
+
+    When the CA genuinely isn't on the machine in any form, no context can help
+    and none should: the thing being verified is the download of an executable
+    that then replaces this application, so an unknown CA has to fail."""
+    global _UPDATE_SSL_CONTEXT
+    import ssl
+    with _UPDATE_SSL_LOCK:
+        if _UPDATE_SSL_CONTEXT is not None:
+            return _UPDATE_SSL_CONTEXT
+        try:
+            import truststore
+            ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        except Exception:
+            ctx = ssl.create_default_context()
+        # Assert the defaults rather than assume them, and refuse the obsolete
+        # TLS versions: GitHub has required 1.2 or better for years, so anything
+        # older on this connection is a downgrade rather than a real peer.
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        try:
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        except (AttributeError, ValueError):
+            pass
+        _UPDATE_SSL_CONTEXT = ctx
+        return ctx
+
+
+def _is_cert_verify_error(e) -> bool:
+    """True when a request failed because the certificate could not be verified,
+    as opposed to the machine being offline or the request being blocked.
+
+    urllib wraps the ssl error inside URLError.reason, so both are inspected;
+    the text match is the backstop for anything that arrives already
+    stringified."""
+    import ssl
+    for cand in (e, getattr(e, "reason", None)):
+        if isinstance(cand, ssl.SSLCertVerificationError):
+            return True
+    return "CERTIFICATE_VERIFY_FAILED" in str(e)
+
+
 def _update_opener():
     """URL opener used for every update request, enforcing the HTTPS+GitHub rule
     on redirects and not merely on the first address.
@@ -3645,8 +3821,9 @@ def _update_opener():
     unencrypted connection, or off GitHub entirely. This refuses the redirect
     instead, so the whole chain stays encrypted and on GitHub.
 
-    Certificate verification is untouched — it comes from urllib's default HTTPS
-    handler, which validates against the system trust store."""
+    Certificate verification comes from `_update_ssl_context`, which is the
+    system trust store either way and Schannel's own chain building when
+    `truststore` is installed."""
     import urllib.request
     import urllib.error
 
@@ -3660,8 +3837,10 @@ def _update_opener():
                     headers, fp)
             return super().redirect_request(req, fp, code, msg, headers, newurl)
 
-    # build_opener replaces the default redirect handler with our subclass.
-    return urllib.request.build_opener(_SafeRedirect)
+    # build_opener replaces the default redirect and HTTPS handlers with these.
+    return urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=_update_ssl_context()),
+        _SafeRedirect)
 
 
 def _rate_limit_reset_text(err) -> str:
@@ -3698,7 +3877,12 @@ def _fetch_latest_release(timeout: int = UPDATE_NET_TIMEOUT) -> dict:
         # Same opener as the download, so the check can't be redirected off
         # GitHub or onto an unencrypted connection either.
         with _update_opener().open(req, timeout=timeout) as r:
-            return json.load(r)
+            raw = r.read(UPDATE_MAX_API_BYTES + 1)
+        if len(raw) > UPDATE_MAX_API_BYTES:
+            raise RuntimeError(
+                "GitHub's reply was far larger than a release listing can be, "
+                "so it was discarded rather than parsed.")
+        return json.loads(raw.decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         # A 403 is only a quota problem when the remaining-calls header says 0;
         # 429 is always one. Anything else 403 is a genuine refusal.
@@ -3718,7 +3902,24 @@ def _fetch_latest_release(timeout: int = UPDATE_NET_TIMEOUT) -> dict:
             raise RuntimeError(
                 "No published release was found for this app on GitHub.")
         raise RuntimeError(f"GitHub returned HTTP {e.code} ({e.reason}).")
+    except RuntimeError:
+        raise                          # our own refusals already read clearly
     except Exception as e:
+        # A certificate failure is worth its own wording. On a company network
+        # it almost never means "no internet" — it means the connection is being
+        # inspected and this PC is missing the certificate that would make the
+        # inspection trusted, so telling the user to check their wifi sends them
+        # to fix something that isn't broken.
+        if _is_cert_verify_error(e):
+            raise RuntimeError(
+                "Couldn't verify GitHub's security certificate, so the check "
+                "was stopped rather than trusted.\n\nThis usually means your "
+                "network inspects encrypted traffic and this PC is missing the "
+                "certificate that makes that inspection trusted. Your IT team "
+                "can install it — the update will work as soon as it is "
+                "present. Updating from the releases page in your browser works "
+                "in the meantime."
+                f"\n\nDetail: {e}")
         raise RuntimeError(
             "Couldn't reach GitHub. Check your internet connection — a company "
             f"firewall or proxy may also be blocking it.\n\nDetail: {e}")
@@ -3874,6 +4075,21 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _parse_sha256_line(text: str) -> str:
+    """The digest out of a `sha256sum`-style line, lowercased, or "".
+
+    Returns "" unless the first field is exactly 64 hex characters, so a digest
+    that is truncated, wrapped in quotes, or actually an error page can't be
+    compared against and quietly appear to match nothing."""
+    first = (text or "").strip().split()
+    if not first:
+        return ""
+    digest = first[0].strip().lower()
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        return ""
+    return digest
+
+
 # Folder names that mean "this directory is continuously synced by a cloud
 # client". Matched against whole path components, so a business tenant folder
 # ("OneDrive - Contoso") hits via its prefix while an ordinary folder called
@@ -3968,10 +4184,24 @@ def _stage_beside(src: Path, target: Path) -> Path:
         os.remove(staged)
     except OSError:
         pass
+    size = src.stat().st_size
     try:
-        os.replace(src, staged)
+        os.replace(src, staged)        # same volume: atomic, nothing to check
     except OSError:
         shutil.copy2(src, staged)      # different volume: copy instead
+    # The cross-volume copy is the one step between "verified" and "installed"
+    # that could hand on a short file — the destination volume filling up part
+    # way through. Everything above was checked on the download, so compare
+    # sizes here rather than let a truncated build reach the swap.
+    if staged.stat().st_size != size:
+        try:
+            os.remove(staged)
+        except OSError:
+            pass
+        raise RuntimeError(
+            "The verified download didn't copy across to the application "
+            "folder intact, so it was not installed. Check the free space on "
+            f"{target.drive or target.parent} and try again.")
     return staged
 
 
@@ -5113,6 +5343,9 @@ class ConverterApp:
         self.files    = []
         self._out_dir = None
         self._mode    = tk.StringVar(value=PDF_MODES[0].label)
+        # True while the status line is showing why a file was turned away, so
+        # that message can be cleared once a file is accepted (see _add_path).
+        self._rejected = False
         self._cancel_convert = threading.Event()
         self._pdf_app_pids   = []   # PIDs of dedicated Office instances (not Outlook)
 
@@ -7991,6 +8224,12 @@ class ConverterApp:
 
             # Verify against a published checksum when the release carries one.
             # Releases without it still install — the PE check above is the floor.
+            #
+            # But once a release *does* advertise a checksum, failing to fetch or
+            # parse it is fatal rather than skipped. Treating it as optional at
+            # this point would mean anyone able to block one small request could
+            # turn verification off, which is exactly the request an attacker
+            # tampering with the download would choose to block.
             checksum_asset = _find_release_asset(
                 release, UPDATE_ASSET_NAME + ".sha256")
             if checksum_asset is not None:
@@ -8000,19 +8239,25 @@ class ConverterApp:
                         checksum_asset.get("browser_download_url"), sums,
                         cancel_event=self._cancel_update,
                         max_bytes=UPDATE_MAX_CHECKSUM_BYTES)
-                    expected = sums.read_text(
-                        encoding="utf-8", errors="ignore").split()[0].strip().lower()
+                    expected = _parse_sha256_line(
+                        sums.read_text(encoding="utf-8", errors="ignore"))
                 except _UpdateCancelled:
                     raise
                 except Exception:
                     expected = ""
-                if expected:
-                    if _sha256_file(download).lower() != expected:
-                        raise RuntimeError(
-                            "The download doesn't match the checksum published "
-                            "with the release, so it was not installed. Try "
-                            "again; if it keeps failing, download the new "
-                            "version manually.")
+                if not expected:
+                    raise RuntimeError(
+                        "This release publishes a checksum for the download, "
+                        "but it couldn't be read — so there was no way to "
+                        "confirm the file arrived intact and it was not "
+                        "installed.\n\nTry again, or download the new version "
+                        "manually from the releases page.")
+                if _sha256_file(download).lower() != expected:
+                    raise RuntimeError(
+                        "The download doesn't match the checksum published "
+                        "with the release, so it was not installed. Try "
+                        "again; if it keeps failing, download the new "
+                        "version manually.")
 
             if self._cancel_update.is_set():
                 raise _UpdateCancelled()
@@ -8085,9 +8330,6 @@ class ConverterApp:
         first mode so a stale StringVar can never leave the page without one."""
         return PDF_MODE_BY_LABEL.get(self._mode.get(), PDF_MODES[0])
 
-    def _allowed_extensions(self):
-        return _mode_accepts(self._current_mode())
-
     def _on_mode_change(self, event=None):
         # Clear files when mode changes — they may be wrong type
         self._clear_files()
@@ -8100,9 +8342,15 @@ class ConverterApp:
         # bare "*" and turn the filter into "show everything". Those files are
         # still accepted — they're just reached through the All files filter.
         pattern = " ".join(f"*{e}" for e in _mode_accepts(mode) if e)
+        filters = [(f"{mode.noun} files", pattern), ("All files", "*.*")]
+        # A mode with the wildcard takes files whose extensions can't be listed
+        # in a filter, so lead with All files. Opening on a filter that hides
+        # the very files the mode was widened for reads as "not supported".
+        if ANY_UNOWNED_EXT in mode.shared:
+            filters.reverse()
         paths = filedialog.askopenfilenames(
             title=f"Select {mode.noun} files",
-            filetypes=[(f"{mode.noun} files", pattern), ("All files", "*.*")],
+            filetypes=filters,
         )
         for p in paths:
             self._add_path(p)
@@ -8113,12 +8361,47 @@ class ConverterApp:
 
     def _add_path(self, p):
         path = Path(p)
-        if path.suffix.lower() not in self._allowed_extensions():
+        mode = self._current_mode()
+        if not _mode_takes_ext(mode, path.suffix.lower()):
+            self._reject_path(path, mode)
             return
         if path not in self.files:
             self.files.append(path)
             self.file_list.insert("end", path.name)
+            # Clear any rejection message left over from a previous drop, so it
+            # can't sit there contradicting a queue that is now filling up.
+            if self._rejected:
+                self._rejected = False
+                self.status_var.set("Ready — add files to get started.")
         self._update_drop_label()
+
+    def _reject_path(self, path, mode):
+        """Say why a file was turned away.
+
+        It used to be dropped in silence, which is indistinguishable from the
+        app ignoring the drop entirely — and worst for exactly the files Basic
+        Text was widened for, where nothing on screen suggests the extension is
+        the objection.
+        """
+        self._rejected = True
+        ext = path.suffix.lower()
+        if ext in ARCHIVE_EXTS:
+            self.status_var.set(
+                f"{path.name} — archives aren't converted here. Use Folder "
+                f"Unzipping to extract it, then convert what's inside.")
+        elif ext == ".pdf":
+            self.status_var.set(f"{path.name} is already a PDF.")
+        elif (ext and ext not in PDF_MODE_BY_EXT
+                and ext not in _NEVER_AS_TEXT_EXTS
+                and mode.key != "text_report"):
+            # Nothing owns this type, so there is a specific place to send them.
+            self.status_var.set(
+                f"{path.name} — nothing converts '{ext}' automatically. "
+                f"Choose \"Basic Text\" to read it as plain text.")
+        else:
+            self.status_var.set(
+                f"{path.name} — not a {mode.noun} file. "
+                f"Pick the matching type from the dropdown.")
 
     def _remove_selected(self):
         for i in sorted(self.file_list.curselection(), reverse=True):
@@ -8129,6 +8412,7 @@ class ConverterApp:
     def _clear_files(self):
         self.files.clear()
         self.file_list.delete(0, "end")
+        self._rejected = False
         self._update_drop_label()
         # Return the page to its ready state (clear any "Done!"/error status).
         self.status_var.set("Ready — add files to get started.")
@@ -8137,9 +8421,15 @@ class ConverterApp:
     def _update_drop_label(self):
         if self.files:
             self.drop_label.config(text=f"{len(self.files)} file(s) queued")
-        else:
-            self.drop_label.config(
-                text=f"Drop {self._current_mode().hint} files here\nor click 'Add Files'")
+            return
+        mode = self._current_mode()
+        text = f"Drop {mode.hint} files here\nor click 'Add Files'"
+        if ANY_UNOWNED_EXT in mode.shared:
+            # The wildcard is the one thing about this mode that can't be
+            # inferred from the dropdown label, and it is the reason someone
+            # holding an EXTRACT.20260813 would pick it.
+            text += "\n— or any unrecognised type, read as plain text"
+        self.drop_label.config(text=text)
 
     def _choose_output(self):
         d = filedialog.askdirectory(title="Select output folder")
@@ -8293,7 +8583,17 @@ class ConverterApp:
                     ext = src.suffix.lower()
                     key = "text_report" if ext == "" else PDF_MODE_BY_EXT.get(ext)
                     if key is None:
-                        failed.append((src.name, f"no converter for '{ext}' files"))
+                        # Unreachable from the drop zone, which rejects these
+                        # before they queue; kept because routing must never
+                        # guess. The mixed batch stays strict on purpose —
+                        # reading an unknown type as text is a decision for the
+                        # user to make by choosing Basic Text, not one to take
+                        # silently on their behalf mid-batch.
+                        failed.append((
+                            src.name,
+                            f"no converter for '{ext}' files — convert it on "
+                            f"its own with the Basic Text mode to read it as "
+                            f"plain text"))
                         self._pdf_tracker.complete_item()
                         continue
                     file_mode = PDF_MODE_BY_KEY[key]
@@ -8333,7 +8633,10 @@ class ConverterApp:
                     continue
 
                 out_dir = self._out_dir if self._out_dir else src.parent
-                out_path = _unique_pdf_path(out_dir, src.stem)
+                # _pdf_stem_for keeps the whole name when the "extension" is
+                # really part of it, so EXTRACT.20260813 and EXTRACT.20260814
+                # don't both land on EXTRACT.pdf.
+                out_path = _unique_pdf_path(out_dir, _pdf_stem_for(src))
                 # Bound this file so one stuck conversion can't hang the batch.
                 wd = _FileWatchdog(self._pdf_app_pids)
                 try:

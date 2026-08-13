@@ -23,7 +23,16 @@ for _pkg in ('win32com', 'win32api', 'pywintypes', 'PIL',
              'markitdown', 'magika', 'onnxruntime', 'extract_msg', 'pdfminer',
              'msoffcrypto', 'olefile',    # Password Removal (open-password decryption)
              'py7zr', 'rarfile',          # Folder Unzipping: .7z / .rar archives
-             'pillow_heif'):              # HEIC/HEIF images (iPhone photos)
+             'pillow_heif',               # HEIC/HEIF images (iPhone photos)
+             # Updater TLS. _update_ssl_context imports it inside the function
+             # and falls back to the stock context when it is missing — so a
+             # build that quietly dropped it would still run, and the certificate
+             # failures on TLS-inspecting networks it exists to fix would come
+             # back with nothing to show they had. Collected explicitly so that
+             # can't happen silently; its platform backends are chosen by a
+             # sys.platform branch, which collect_all follows and a bare
+             # hiddenimport would not.
+             'truststore'):
     tmp_ret = collect_all(_pkg)
     datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

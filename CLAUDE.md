@@ -39,9 +39,11 @@ dist\BoxOfScraps.exe --version-file v.txt
 
 Runtime dependencies (import-time or lazily imported): `tkinterdnd2`, `pywin32`
 (`win32com`/`pythoncom`), `Pillow`, `markitdown`, `msoffcrypto-tool`, `py7zr`
-(.7z), `rarfile` (.rar), `pillow-heif` (.heic/.heif). Several are imported lazily
-with a clear "install X" error so the rest of the app still runs when one is
-missing.
+(.7z), `rarfile` (.rar), `pillow-heif` (.heic/.heif), `truststore` (updater TLS).
+Several are imported lazily with a clear "install X" error so the rest of the app
+still runs when one is missing. `truststore` is the exception that degrades
+silently — `_update_ssl_context` falls back to the stock SSL context — so a build
+that drops it looks healthy and simply stops fixing what it was added for.
 
 **There is no automated test suite.** Verification is done by running the app, or
 by writing throwaway COM scripts (load `File.py` via `importlib`, call the target
@@ -333,6 +335,56 @@ Basic Text is how the user asks for the raw text instead. `_mode_accepts(mode)`
 returns owned + shared and is what the drop zone and file dialog filter on;
 `PDF_MODE_BY_EXT` and `AUTO_PDF_EXTS` are built from `exts` alone, so automatic
 routing stays unambiguous and no two modes may own the same extension.
+
+**`ANY_UNOWNED_EXT` (`"*"`) — the wildcard, and why only Basic Text has it.** The
+extension list can never be finished: ERP and mainframe extracts arrive as
+`EXTRACT.20260813`, `LEDGER.001`, `REPORT.D1`, where the suffix is a date or a
+serial number. Windows calls those a "20260813 File", Notepad opens them fine,
+and the app used to drop them **silently** — `_add_path` returned without a word,
+which is indistinguishable from the drop being ignored. Basic Text's `shared` now
+ends with the sentinel, and `_mode_takes_ext(mode, ext)` is the membership test
+every caller goes through. Four things bound it:
+
+1. **It lives in `shared`, never `exts`.** `PDF_MODE_BY_EXT`, `ALL_TYPES_EXTS` and
+   `AUTO_PDF_EXTS` are all built from `exts`, so automatic routing never sees it —
+   and neither does auto-PDF, which **deletes each original** once its PDF exists
+   and must only ever act on types it positively recognises. Reaching the wildcard
+   takes a deliberate switch to Basic Text.
+2. **It only opens the mode to extensions no mode owns.** `_mode_takes_ext` returns
+   False for anything in `PDF_MODE_BY_EXT`, so an `.xlsx` dropped on Basic Text is
+   still refused rather than read as a zip container full of noise — the mode that
+   converts it properly is one dropdown entry away.
+3. **`_NEVER_AS_TEXT_EXTS`** additionally refuses types that are unowned but
+   certainly binary and better served elsewhere — `ARCHIVE_EXTS` plus `.pdf`,
+   `.exe`, `.dll`, `.msi`, `.iso`, `.vmdk`, `.bak`. They would fail `_looks_binary`
+   anyway; refusing by name just replaces "looks like a binary file" with an answer
+   the user can act on (an archive belongs in Folder Unzipping).
+4. **The mixed-batch "All Types" mode deliberately did not get it.** Treating an
+   unknown extension as text is a judgement the user makes by choosing Basic Text,
+   not one to take silently on their behalf halfway through a batch of real
+   documents.
+
+`_mode_accepts` filters the sentinel out, because its callers need concrete
+extensions — the Add Files filter string can't express it, so `_add_files` puts
+"All files" **first** for a wildcard mode instead (opening on a filter that hides
+the very files the mode exists for reads as "not supported"). Rejections are no
+longer silent: `_reject_path` names the file and says what to do — for an unknown
+type in any other mode, that it should be converted with Basic Text.
+
+**`_pdf_stem_for` keeps the whole name when the "extension" isn't one.** A PDF is
+normally named after `src.stem`, but for an unowned suffix that suffix *is* part
+of the file's identity: `EXTRACT.20260813` and `EXTRACT.20260814` would both
+become `EXTRACT.pdf`, told apart only by `_unique_pdf_path`'s `_2`, which follows
+queue order rather than date. They become `EXTRACT.20260813.pdf` instead. It sits
+in `convert_file`, so every caller gets it; auto-PDF already did the same thing
+for extensionless files by passing `src.name`.
+
+**`_read_report_text` checks before it reads, not after.** It sniffs 8 KB for
+`_looks_binary` and the size against `_REPORT_MAX_BYTES` (64 MB) with the file
+open, then reads the rest. The order matters now that the caller can no longer
+promise the file is text: decoding a multi-gigabyte file into memory to discover
+it was binary is the one failure that takes the whole app down rather than one
+conversion.
 
 Word selects an importer by extension and has
 none registered for these, so `_text_report_to_pdf` writes a temp `.txt` copy
