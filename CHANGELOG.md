@@ -16,23 +16,16 @@ stable releases.
 
 ## 1.8.1 — 2026-08-13
 
-- "Basic Text" now converts files whose extension nothing recognises — the
-  date- and number-suffixed extracts legacy and ERP systems produce, like
-  `EXTRACT.20260813` or `LEDGER.001`, which Windows just calls a "File" and
-  opens in Notepad. Pick Basic Text and drop them in.
-- Those files keep their full name in the PDF, so a folder of daily extracts
-  stays one PDF per day instead of collapsing onto a single name.
-- Files the PDF page won't accept now say why instead of being silently ignored,
-  and point you at the mode that will take them.
-- `.rt` files are now converted as basic text.
-- Update checks now work on networks that inspect encrypted traffic, where they
-  used to fail with a certificate error. Verification is handed to Windows,
-  which can complete the certificate chain where Python could not.
-- When a certificate genuinely can't be verified, the update page now says so,
-  rather than reporting it like a lost internet connection and sending you off
-  to check your wifi.
-- When a release publishes a checksum, the update now refuses to install if the
-  download doesn't match it, or if the checksum itself can't be read.
+- "Basic Text" now converts files with an unrecognised extension, like
+  `EXTRACT.20260813` or `LEDGER.001`. Pick Basic Text and drop them in.
+- Those files keep their full name, so you get `EXTRACT.20260813.pdf` rather
+  than `EXTRACT.pdf`.
+- Files the PDF page won't accept now say why, instead of being ignored.
+- `.rt` files convert as basic text.
+- Update checks now work on networks that inspect encrypted traffic.
+- A certificate problem during an update check now says so, instead of looking
+  like a lost connection.
+- Updates check the published checksum and won't install if it doesn't match.
 
 ## 1.8.0 — 2026-08-06
 
