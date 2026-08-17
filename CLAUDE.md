@@ -150,9 +150,13 @@ and the page and Folder Unzipping's auto-PDF cannot drift apart. `families` is a
 tuple because a mode may drive two apps (Access needs Excel to lay the tables out);
 the worker launches, tracks, watchdog-kills and replaces every family in it, and
 `convert_file` takes a `{family: app}` dict rather than one parameter per
-application. `auto=False` keeps a type off auto-PDF — set for Access and OneNote,
-because auto-PDF **deletes the original** once the PDF is written and a table dump
-loses queries, forms and relationships in a way a Word→PDF never does.
+application. `auto=False` keeps a type off auto-PDF, because auto-PDF **deletes
+the original** once the PDF is written. The test is whether the PDF can stand in
+for the file it came from: a Word→PDF can, a *derived reading* cannot. So it is
+set for Access and OneNote (a table dump loses queries, forms and relationships;
+a published section loses the notebook) and for SQLite, which is the same table
+dump one layer shorter. All three still convert normally on the PDF page, where
+the user asked for that specific file and nothing is deleted.
 
 The table is built in two pieces. `_PDF_TYPE_MODES` holds the single-type modes;
 `PDF_MODES` prepends the **`"all"` mixed-batch mode**, which is therefore first in
@@ -256,10 +260,25 @@ Password Removal. That check short-circuits on extension first
 (`ENCRYPTABLE_EXTS` = `PWD_EXTS` + `ARCHIVE_EXTS`), so batches of images/text/email
 don't pay to open and parse files that can never be encrypted.
 
-**Archive extraction (`.zip`/`.7z`/`.rar`).** `ARCHIVE_EXTS` is what Folder
+**Archive extraction (`.zip`/`.7z`/`.rar`/`.tar`/`.tgz`/`.gz`).** `ARCHIVE_EXTS`
+is what Folder
 Unzipping accepts and what `_recursive_unzip_in_place` looks for at any depth, in
 any mix. `_extract_archive` dispatches: stdlib `zipfile`, `py7zr` (pure Python, so
-it bundles cleanly), and `rarfile` for RAR. **RAR needs an external extractor** —
+it bundles cleanly), stdlib `tarfile` for the tar family, and `rarfile` for RAR.
+`ARCHIVE_HINT` derives the user-facing format list from the tuple so the drop
+zones and page text can't drift from what is accepted.
+
+**`_extract_tar` extracts with `filter="data"`, and that is the load-bearing
+part.** Unlike `zipfile`, `tarfile` does **not** sanitise member names: a crafted
+tar carrying absolute paths or `../` components will happily write outside the
+destination. The `"data"` filter rejects those along with device nodes, setuid
+bits and links pointing out of the tree. It only becomes the default in Python
+3.14 and this app ships on 3.12, so it must be asked for explicitly. A bare `.gz`
+is the awkward case — gzip is a single-stream compressor, not an archive format,
+so it may hold a tar or one lone file; `tarfile` is tried first and the
+single-file `gzip` reading is the fallback. `_archive_content_name` strips the
+trailing `.tar` from a compound suffix, so `report.tar.gz` unpacks into `report/`
+rather than a folder called `report.tar`. **RAR needs an external extractor** —
 its decompression is proprietary and `rarfile` is only a parser — so `_extract_rar`
 tries `rarfile` (which finds an installed unrar/unar/bsdtar itself) and then falls
 back to invoking Windows' own `tar.exe` directly. That fallback is the point: bsdtar
@@ -275,14 +294,24 @@ Document Structuring accepts every `ARCHIVE_EXTS` format at the top level and
 expands whatever is nested inside them, since it shares `_extract_archive` and
 `_recursive_unzip_in_place`.
 
-**Image conversion.** `IMAGE_EXTS` splits into `_WORD_NATIVE_IMAGE_EXTS`, which
-Word's `AddPicture` filter reads directly, and `_PILLOW_IMAGE_EXTS`
-(`.webp`/`.heic`/`.heif`/`.ico`), which it cannot. `_image_pages_for_word` bridges
+**Image conversion.** `IMAGE_EXTS` splits three ways: `_WORD_NATIVE_IMAGE_EXTS`,
+which Word's `AddPicture` filter reads directly; `_PILLOW_IMAGE_EXTS`
+(`.webp`/`.heic`/`.heif`/`.ico`/`.apng`), which it cannot; and
+`_WORD_VECTOR_IMAGE_EXTS` (`.svg`), which Word draws itself and **Pillow cannot
+open at all**. That third set exists because `_image_pages_for_word` calls
+`Image.open` before its native-format check, so an SVG reaching that line raises
+`UnidentifiedImageError` — it therefore returns early, before Pillow is even
+imported, which also keeps the SVG vector in the PDF instead of rasterising it.
+Office has read SVG since 2016/365; on an older build `AddPicture` refuses the
+file, so `_image_to_pdf` names that specifically rather than letting it read as a
+corrupt image. `_image_pages_for_word` bridges
 both gaps by rewriting what Word can't read into temp PNGs in the caller's own
 `mkdtemp` — and by splitting a **multi-page TIFF** into one PNG per page, where
 `AddPicture` would silently take only the first. Multi-frame splitting is limited
-to TIFF on purpose: an animated GIF is one picture, not a 200-page document. HEIC
-needs `pillow-heif`, registered lazily by `_register_heif`. Two Word-side details
+to TIFF on purpose: an animated GIF or APNG is one picture, not a 200-page
+document. HEIC
+needs `pillow-heif`, registered lazily by `_register_heif`.
+Two Word-side details
 are load-bearing: `_insert_picture_fitted` **downscales to the printable area**
 (an iPhone photo carries no DPI and lands ~42 inches wide, straight off the page),
 and pages are separated by setting `ParagraphFormat.PageBreakBefore` rather than
@@ -304,6 +333,68 @@ bookkeeping tables. A database-password prompt is interactive and can't be
 pre-answered, so that case is left to the per-file watchdog. Note this is the one
 mode needing two Office apps, which is why `families` is a tuple.
 
+**SQLite → PDF (`.db`).** `_sqlite_to_pdf` is the Access shape one layer shorter:
+stdlib `sqlite3` reads the tables, so the only application involved is the Excel
+that lays them out — hence `families=("excel",)`, and a machine without Access
+can still do it. Each table and view becomes a sheet via
+`_write_sheets_to_workbook`, and that workbook goes to `_excel_to_pdf` for the
+same fit-to-one-page-wide layout. Four decisions carry it:
+
+- **`.db` is sniffed, not assumed.** The extension is shared with Thunderbird,
+  thumbnail caches and others, so `_looks_like_sqlite` checks the 16-byte
+  `SQLite format 3\0` magic and anything else is told what it actually is.
+- **Opened read-only, `mode=ro` before `immutable=1`.** `mode=ro` still reads a
+  `-wal` sidecar, so a database left in WAL mode reports its most recent commits;
+  it needs to map a `-shm` file to do that, which fails on read-only media, and
+  only then does `immutable=1` take over — at the cost of anything still
+  un-checkpointed. Never a writable open: that would checkpoint the WAL and
+  **modify the user's file**.
+- **Every cell is written as text, with the range pre-formatted `"@"`.** SQLite
+  has no date type, so dates live in TEXT columns — and Excel, handed
+  `2026-01-05`, converts it to a serial date and redisplays it in the machine's
+  locale, while `00123` loses its leading zeros. On a dump that exists as
+  evidence that is silent corruption, so nothing is ever handed to Excel's type
+  detection. It also means a value like `=SUM(A1:A9)` cannot become a live
+  formula (verified by reading `HasFormula` back off the saved workbook).
+- **`_SQLITE_MAX_ROWS` (10 000) per table, with the truncation written into the
+  sheet** — a silent cut would pass for a complete extract. `auto=False`, as for
+  Access.
+
+**Four file types were built, then deliberately removed — don't re-add them
+without addressing the reason.** `.epub`, `.key`/`.numbers`/`.pages`,
+`.pcap`/`.pcapng` and `.cer`/`.der`/`.pem` were implemented and working against
+real files, and were taken back out because none could be relied on:
+
+- **iWork (`.key`/`.numbers`/`.pages`)** — the whole approach rested on extracting
+  the preview Apple embeds in the bundle (`QuickLook/Preview.pdf`, then
+  `preview.jpg`, then `thumbs/*.jpg`), because the actual content is
+  protobuf-encoded `.iwa` with no reader outside Apple's apps. Those member names
+  came from documentation and were **never confirmed against a real Apple file** —
+  none was available to test. It would also have been first-slide fidelity at
+  best. Re-adding this needs real `.key`/`.numbers` files first.
+- **EPUB** — worked well on a real Gutenberg book (31 chapters → 120 pages, images
+  and tables intact), but a DRM'd commercial ebook has a plaintext manifest and
+  encrypted content, so the spine parses, the bytes decode as Latin-1 garbage, and
+  Word renders **pages of mojibake instead of failing**. Silent wrong output is
+  the one failure mode worth removing a feature over. Fixed-layout EPUBs also
+  reflow to nonsense. A revival needs a `META-INF/encryption.xml` guard and
+  `auto=False`.
+- **Packet captures** — correct on a real Wireshark Ethernet capture, but the
+  output is a per-packet *summary* (no payloads), non-Ethernet link types
+  (radiotap Wi-Fi, USB, Bluetooth) decode to nothing useful, and the pcapng
+  reader was never run against a real pcapng — now Wireshark's default format.
+- **Certificates** — correct via `certutil -dump`, but `certutil` is a well-known
+  LOLBin that enterprise AppLocker/WDAC policies frequently block, which is
+  exactly the environment this app ships into. A 146-certificate CA bundle also
+  produced ~73 pages, most of it raw base64, because certutil decodes only the
+  first block.
+
+The removal left `.pem`/`.crt` still convertible by hand through Basic Text (they
+are text), and the binary ones now fall to `_looks_binary`'s "looks like a binary
+file" message. They were deliberately **not** added to `_NEVER_AS_TEXT_EXTS`:
+that list exists to replace a generic refusal with an actionable one ("an archive
+belongs in Folder Unzipping"), and here there is no other tool to point at.
+
 **OneNote → PDF (`.one`).** A `.one` file is a *section*, not a self-contained
 document, so `OpenHierarchy` must add it to the OneNote hierarchy before `Publish`
 can render it (`pfPDF = 3`); `_onenote_to_pdf` then closes it again so a converted
@@ -320,10 +411,14 @@ all (see the ProgID/HRESULT notes above), so it exercises only the error paths.
 monospace, fit-to-widest-line treatment: report dumps from legacy/ERP/mainframe
 systems (`.rep`/`.rpt`/`.prn`/`.lst`), logs and program output
 (`.log`/`.out`/`.err`/`.dat`/`.trace`), structured data
-(`.json`/`.jsonl`/`.ndjson`/`.yaml`/`.sql`/`.tsv`/`.psv`/`.tab`), config
+(`.json`/`.jsonl`/`.ndjson`/`.yaml`/`.sql`/`.tsv`/`.psv`/`.tab`/`.xbrl`), config
 (`.ini`/`.cfg`/`.conf`/`.toml`/`.properties`/`.env`), prose formats Word can't
-import (`.md`/`.text`/`.nfo`/`.asc`/`.rst`), diffs, and the scripts that turn up as
-evidence in controls work (`.bat`/`.cmd`/`.ps1`/`.sh`/`.py`/`.js`/`.vbs`/`.css`).
+import (`.md`/`.markdown`/`.text`/`.nfo`/`.asc`/`.rst`), diffs, and the scripts
+that turn up as
+evidence in controls work (`.bat`/`.cmd`/`.ps1`/`.sh`/`.py`/`.pl`/`.js`/`.vbs`/`.css`).
+`.xbrl` is owned here rather than by Word because an XBRL instance is a data
+document, not prose — the same call as `.json`, where plain `.xml` stays Word's
+because that one really can be a document.
 The **key stays `text_report`** — it is what `convert_file` dispatches on and what
 `_text_report_to_pdf` is named for; only the user-facing wording changed.
 
@@ -417,6 +512,27 @@ spacing Word's Normal style would otherwise double-space everything with, then:
    `_REPORT_FONT_WRAP` (9pt) and lets it wrap. Short lines read better than a
    wide wall of tiny text. Wherever wrapping does occur, continuations get a
    hanging indent so they read as part of the line above.
+
+**An XML prolog silently defeats Word's HTML importer.** When a file opened as
+HTML starts with `<?xml … ?>`, Word stops treating it as HTML and runs its
+generic XML path instead: **every image, table and stylesheet is dropped**, and
+if the file also declares a DOCTYPE it fails outright with "DTD is prohibited".
+This has nothing to do with the extension — an `.html` saved as XHTML hits it too,
+so it was a latent bug in the existing HTML mode, not just the `.xhtml` gap.
+Verified both ways: with the prolog present Word reported 0 inline shapes and 0
+tables, and with it removed the same bytes imported 1 of each plus the CSS.
+
+`_html_source_for_word` is the fix and it is deliberately a no-op in the ordinary
+case — a clean `.html` is opened **in place**, exactly as before, which is what
+keeps its relative images and stylesheets resolving off its own folder. Only when
+`_html_has_xml_prolog` says so is a corrected copy written into the caller's
+`mkdtemp` (never beside the user's file) with the prolog stripped and a `.html`
+extension. Moving the markup out of its own folder would break every relative
+reference in it, so `_HTML_REL_REF_RE` rewrites `src`/`href` absolute against the
+original's directory — skipping anything already absolute (a URL scheme, `//host`
+or a bare `#` fragment) and leaving alone anything that doesn't resolve on disk.
+`.mht`/`.mhtml` are excluded entirely: they are MIME containers whose HTML is
+quoted-printable or base64 inside, so there is no HTML text to operate on.
 
 **`_inches()` replaced `Application.InchesToPoints`.** On a hidden, automated
 Word instance that COM helper raises "Unspecified error" — and because every call

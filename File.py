@@ -911,18 +911,22 @@ TEXT_REPORT_EXTS = (
     ".rep", ".rpt", ".rt", ".prn", ".lst",
     # Logs, traces and program output
     ".log", ".out", ".err", ".dat", ".trace",
-    # Structured text and data dumps
+    # Structured text and data dumps. .xbrl is an XBRL instance document —
+    # financial-statement XML that arrives as evidence in audit work. It is a
+    # data instance rather than prose, so the verbatim monospace reading is the
+    # honest one, exactly as for .json and .yaml. (Plain .xml stays Word's,
+    # because that one really can be a document; see TEXT_REPORT_ALSO_ACCEPTS.)
     ".json", ".jsonl", ".ndjson", ".yaml", ".yml", ".sql",
-    ".tsv", ".psv", ".tab",
+    ".tsv", ".psv", ".tab", ".xbrl",
     # Config files
     ".ini", ".cfg", ".conf", ".toml", ".properties", ".env",
     # Plain prose / notes formats Word has no importer for
-    ".md", ".text", ".nfo", ".asc", ".rst",
+    ".md", ".markdown", ".text", ".nfo", ".asc", ".rst",
     # Diffs
     ".diff", ".patch",
     # Scripts and source, which turn up as evidence in IT/controls work and
     # are only ever wanted verbatim, in a fixed-width font
-    ".bat", ".cmd", ".ps1", ".sh", ".py", ".js", ".vbs", ".css",
+    ".bat", ".cmd", ".ps1", ".sh", ".py", ".pl", ".js", ".vbs", ".css",
 )
 
 # Extensions this mode will take when the user picks it by hand, but does NOT
@@ -955,8 +959,21 @@ _WORD_NATIVE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".t
 # Formats Word has no filter for at all. Pillow rewrites these to a temp PNG
 # first; .heic/.heif additionally need the pillow-heif plugin registered. HEIC
 # matters because it is what an iPhone saves photos as by default.
-_PILLOW_IMAGE_EXTS = {".webp", ".heic", ".heif", ".ico"}
-IMAGE_EXTS = tuple(sorted(_WORD_NATIVE_IMAGE_EXTS | _PILLOW_IMAGE_EXTS))
+#
+# .apng is an animated PNG. Pillow reads it (reporting format "PNG"), but Word
+# picks its picture filter by extension and has none for .apng, so it has to be
+# rewritten like the rest. Only the first frame is kept — see
+# _image_pages_for_word on why multi-frame splitting is TIFF-only.
+_PILLOW_IMAGE_EXTS = {".webp", ".heic", ".heif", ".ico", ".apng"}
+# Vector formats Word draws itself and Pillow cannot open at all. Office has
+# read SVG since 2016/365, and AddPicture returns a real InlineShape for one, so
+# the file goes to Word untouched — which also keeps it vector in the PDF
+# instead of rasterising it. These MUST bypass Pillow: Image.open on an SVG
+# raises UnidentifiedImageError, so _image_pages_for_word returns early for them
+# before it ever opens the file.
+_WORD_VECTOR_IMAGE_EXTS = {".svg"}
+IMAGE_EXTS = tuple(sorted(
+    _WORD_NATIVE_IMAGE_EXTS | _PILLOW_IMAGE_EXTS | _WORD_VECTOR_IMAGE_EXTS))
 
 # Points held back from an image's height budget for the line box it sits in.
 # See _insert_picture_fitted.
@@ -1038,6 +1055,13 @@ def _read_report_text(src_path: Path) -> str:
                 f"conversion."
             )
         raw = head + fh.read()
+    return _decode_text_bytes(raw)
+
+
+def _decode_text_bytes(raw: bytes) -> str:
+    """Decode bytes that are known to be text, tolerating the code pages legacy
+    systems emit. Tries UTF-8 (dropping any BOM), then Windows-1252, then
+    Latin-1 — which cannot fail, so this always returns a string."""
     for enc in ("utf-8-sig", "cp1252", "latin-1"):
         try:
             return raw.decode(enc)
@@ -1378,6 +1402,262 @@ def _access_to_pdf(src_path: Path, out_path: Path, access, excel):
         _excel_to_pdf(tmp_xlsx, out_path, excel)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ─────────────────────────────────────────────
+# SQLite (.db) → PDF
+#
+# Deliberately the Access shape, one layer shorter. _access_to_pdf needs Access
+# itself to read the tables out; SQLite is served by the stdlib `sqlite3`, so the
+# only application involved is the Excel that lays the tables out — which is why
+# this mode's `families` is ("excel",) and a machine without Access can still do
+# it.
+# ─────────────────────────────────────────────
+
+# Every SQLite database begins with this exact 16-byte string. ".db" is a
+# thoroughly generic extension — it is also used by Thunderbird, Windows
+# thumbnail caches and half a dozen other formats — so the magic is checked
+# rather than assumed, and anything else gets told what it actually is.
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+# Rows exported per table. A database dump is evidence, not a report, but an
+# unbounded one can be millions of rows — which is a PDF nobody can open and a
+# COM transfer that runs for hours. Truncation is recorded IN the sheet (see
+# _sqlite_sheet_rows) so it can never pass for a complete extract.
+_SQLITE_MAX_ROWS = 10000
+
+# Excel's own hard cap on the characters one cell can hold.
+_EXCEL_MAX_CELL_CHARS = 32767
+
+# Characters Excel forbids in a sheet name, plus its 31-character limit.
+_EXCEL_SHEET_BAD_CHARS = r"[]:*?/\'"
+_EXCEL_SHEET_NAME_MAX = 31
+
+
+def _looks_like_sqlite(src_path: Path) -> bool:
+    """Whether a file really is a SQLite database, by its magic header."""
+    try:
+        with open(src_path, "rb") as fh:
+            return fh.read(len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
+    except OSError:
+        return False
+
+
+def _excel_sheet_name(raw: str, used: set) -> str:
+    """A legal, unique Excel sheet name for a database table.
+
+    Excel rejects []:*?/\\ and anything over 31 characters, and silently refuses
+    a duplicate — so a long table name, or two that differ only past character
+    31, would otherwise fail the export for that table alone.
+    """
+    name = "".join("_" if c in _EXCEL_SHEET_BAD_CHARS else c for c in raw).strip()
+    name = name[:_EXCEL_SHEET_NAME_MAX] or "Table"
+    candidate, counter = name, 2
+    while candidate.lower() in used:
+        suffix = f"_{counter}"
+        candidate = name[:_EXCEL_SHEET_NAME_MAX - len(suffix)] + suffix
+        counter += 1
+    used.add(candidate.lower())
+    return candidate
+
+
+def _sqlite_cell_text(value) -> str:
+    """One SQLite value as the text to put in a cell.
+
+    Everything becomes a string, and the sheet is formatted as text, on purpose.
+    SQLite has no date type, so dates live in TEXT columns — and Excel, handed
+    "2026-01-05", converts it to a serial date and redisplays it in whatever
+    format the machine's locale prefers. Codes like "00123" lose their leading
+    zeros the same way. On a dump that exists as evidence, that is silent
+    corruption, so no value is ever handed to Excel's type detection.
+    """
+    if value is None:
+        return ""                       # NULL, as an empty cell
+    if isinstance(value, bytes):
+        # A BLOB is not renderable and could be megabytes. Say what it was.
+        return f"<BLOB {len(value)} bytes>"
+    text = value if isinstance(value, str) else str(value)
+    if len(text) > _EXCEL_MAX_CELL_CHARS:
+        return text[:_EXCEL_MAX_CELL_CHARS - 3] + "..."
+    return text
+
+
+def _sqlite_table_names(con) -> list:
+    """User tables and views in a SQLite database, alphabetically.
+
+    sqlite_% is SQLite's own reserved namespace (sqlite_sequence,
+    sqlite_stat1, …) — internal bookkeeping, the counterpart of the MSys tables
+    _ACCESS_SYSTEM_PREFIXES filters out.
+    """
+    return [row[0] for row in con.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','view') "
+        "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+
+
+def _sqlite_sheet_rows(con, table: str):
+    """Header row plus body rows for one table, as lists of cell text.
+
+    Returns (rows, truncated). The identifier is quoted by doubling any embedded
+    double quotes — a table named with a space or a keyword is legal in SQLite
+    and cannot be interpolated bare, and parameter binding is not available for
+    identifiers.
+    """
+    quoted = '"' + table.replace('"', '""') + '"'
+    cur = con.execute(f"SELECT * FROM {quoted} LIMIT {_SQLITE_MAX_ROWS + 1}")
+    columns = [d[0] for d in cur.description] if cur.description else []
+    fetched = cur.fetchall()
+    truncated = len(fetched) > _SQLITE_MAX_ROWS
+    rows = [columns]
+    rows.extend([_sqlite_cell_text(v) for v in record]
+                for record in fetched[:_SQLITE_MAX_ROWS])
+    if truncated:
+        # Counted separately rather than from len(fetched), which stopped at the
+        # limit and so cannot say how many rows there really are.
+        total = con.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0]
+        note = [""] * max(1, len(columns))
+        note[0] = (f"... truncated: {total:,} rows in table, "
+                   f"first {_SQLITE_MAX_ROWS:,} shown")
+        rows.append(note)
+    return rows, truncated
+
+
+def _sqlite_to_pdf(src_path: Path, out_path: Path, excel):
+    """Convert every table and view in a SQLite .db to a single PDF.
+
+    Each table is written onto its own sheet of one temp workbook, and that
+    workbook goes through _excel_to_pdf — so it inherits the same fit-to-one-
+    page-wide and landscape-when-wide layout the Access and Excel modes get.
+
+    Like the Access mode this is a dump of the *data*: indexes, triggers and
+    foreign keys are not represented. The database is opened READ-ONLY through a
+    file: URI, so nothing here can modify the user's file — which matters more
+    than usual for SQLite, where merely opening a database can create -wal and
+    -shm files beside it and roll back a hot journal.
+    """
+    if excel is None:
+        raise RuntimeError(
+            "Microsoft Excel is required to convert database files "
+            "(tables are laid out as sheets before export).\n"
+            "Please ensure Excel is installed."
+        )
+    if not _looks_like_sqlite(src_path):
+        raise RuntimeError(
+            f"{src_path.name} is not a SQLite database. '.db' is used by several "
+            "unrelated formats; only SQLite databases can be converted here.")
+
+    import sqlite3
+    import urllib.request
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="apfp_sqlite_"))
+    tmp_xlsx = tmp_dir / ((src_path.stem or "database") + ".xlsx")
+    try:
+        try:
+            # pathname2url turns C:\dir\f.db into ///C:/dir/f.db and
+            # percent-encodes the characters a URI can't carry, which is what
+            # makes a Windows path usable as a sqlite3 file: URI at all.
+            base_uri = "file:" + urllib.request.pathname2url(str(src_path.resolve()))
+            con = None
+            last_error = ""
+            # mode=ro first: it is read-only but still reads a -wal sidecar, so a
+            # database left in WAL mode reports its most recent commits. It needs
+            # to map a -shm file to do that, which fails on read-only media — and
+            # then immutable=1 gets us the data, at the cost of anything still
+            # sitting un-checkpointed in the WAL. Never the other way round, and
+            # never a writable open: that would checkpoint the WAL, modifying the
+            # user's file.
+            for query in ("?mode=ro", "?mode=ro&immutable=1"):
+                try:
+                    con = sqlite3.connect(base_uri + query, uri=True, timeout=5)
+                    # connect() is lazy — force a real read so a failure to open
+                    # surfaces here rather than on the first query.
+                    con.execute("SELECT count(*) FROM sqlite_master").fetchone()
+                    break
+                except sqlite3.Error as e:
+                    if con is not None:
+                        con.close()
+                        con = None
+                    last_error = str(e)
+            if con is None:
+                raise RuntimeError(f"could not open the database: {last_error}")
+
+            try:
+                names = _sqlite_table_names(con)
+                if not names:
+                    raise RuntimeError("it contains no tables or views")
+
+                sheets = []
+                used_names: set = set()
+                for table in names:
+                    try:
+                        rows, _ = _sqlite_sheet_rows(con, table)
+                    except sqlite3.Error:
+                        # One unreadable table (a view over a missing table, a
+                        # corrupt page) must not cost the whole database.
+                        continue
+                    sheets.append((_excel_sheet_name(table, used_names), rows))
+                if not sheets:
+                    raise RuntimeError("none of its tables could be read")
+            finally:
+                con.close()
+
+            _write_sheets_to_workbook(sheets, tmp_xlsx, excel)
+        except Exception as e:
+            raise RuntimeError(f"Database to PDF conversion failed: {e}")
+
+        # Outside the wrapper above so Excel's own error text isn't double-prefixed.
+        _excel_to_pdf(tmp_xlsx, out_path, excel)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _write_sheets_to_workbook(sheets, dest: Path, excel):
+    """Write [(sheet_name, rows), …] to a new .xlsx at `dest` via Excel COM.
+
+    Each sheet's used range is formatted as text BEFORE any value is written, so
+    Excel's type detection never sees the data — see _sqlite_cell_text. Rows are
+    assigned as one rectangular block per sheet rather than cell by cell: a COM
+    round trip per cell would take minutes on a table of any size.
+    """
+    wb = None
+    # A new workbook normally comes with however many sheets the user's Excel is
+    # configured to create; forcing one means there are never leftovers to delete.
+    try:
+        original_sheet_count = excel.SheetsInNewWorkbook
+    except Exception:
+        original_sheet_count = None
+    try:
+        if original_sheet_count is not None:
+            excel.SheetsInNewWorkbook = 1
+        wb = excel.Workbooks.Add()
+        for index, (name, rows) in enumerate(sheets):
+            ws = wb.Worksheets(1) if index == 0 else wb.Worksheets.Add(
+                After=wb.Worksheets(wb.Worksheets.Count))
+            ws.Name = name
+            width = max((len(r) for r in rows), default=0)
+            if not width:
+                continue
+            # Pad short rows: a block assignment needs every row the same length.
+            block = tuple(tuple(r) + ("",) * (width - len(r)) for r in rows)
+            target = ws.Range(ws.Cells(1, 1), ws.Cells(len(block), width))
+            target.NumberFormat = "@"
+            target.Value = block
+            try:
+                ws.Rows(1).Font.Bold = True
+            except Exception:
+                pass
+        wb.SaveAs(str(dest.resolve()), FileFormat=51)     # xlOpenXMLWorkbook
+    finally:
+        if wb is not None:
+            try:
+                wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if original_sheet_count is not None:
+            try:
+                excel.SheetsInNewWorkbook = original_sheet_count
+            except Exception:
+                pass
 
 
 def _first_com_str(value) -> str:
@@ -1969,18 +2249,28 @@ def _modernize_office_file(src_path: Path, out_path: Path, family: str, fmt: int
 # ─────────────────────────────────────────────
 # Archive extraction
 #
-# Folder Unzipping accepts three container formats, and nested-archive expansion
-# looks for all three at any depth. Each needs a different reader:
+# Folder Unzipping accepts these container formats, and nested-archive expansion
+# looks for all of them at any depth. Each needs a different reader:
 #
-#   .zip  stdlib zipfile.
-#   .7z   py7zr — pure Python, so it bundles into the exe with no extra binary.
-#   .rar  rarfile, which is only a *parser*: RAR's decompression algorithm is
-#         proprietary and there is no pure-Python implementation of it, so
-#         something external has to do the actual work. See _extract_rar for how
-#         that is arranged without shipping a third-party binary.
+#   .zip           stdlib zipfile.
+#   .7z            py7zr — pure Python, so it bundles into the exe with no extra
+#                  binary.
+#   .rar           rarfile, which is only a *parser*: RAR's decompression
+#                  algorithm is proprietary and there is no pure-Python
+#                  implementation of it, so something external has to do the
+#                  actual work. See _extract_rar for how that is arranged
+#                  without shipping a third-party binary.
+#   .tar .tgz .gz  stdlib tarfile, which reads plain, gzip, bzip2 and xz tars
+#                  transparently. A bare .gz holding a single compressed file
+#                  rather than a tar is handled separately — see _extract_tar.
 # ─────────────────────────────────────────────
 
-ARCHIVE_EXTS = (".zip", ".7z", ".rar")
+ARCHIVE_EXTS = (".zip", ".7z", ".rar", ".tar", ".tgz", ".gz")
+
+# The formats spelled out for the user, derived from the tuple above so the drop
+# zones and page descriptions cannot fall out of step with what is accepted —
+# the same reason the PDF page's hints live in PDF_MODES.
+ARCHIVE_HINT = " / ".join(ARCHIVE_EXTS)
 
 # A stuck external extractor shouldn't hang a batch the way a stuck Office
 # instance would; unlike COM there is a process to wait on, so it gets a bound.
@@ -2089,6 +2379,58 @@ def _extract_rar(src: Path, dest: Path):
     )
 
 
+def _extract_tar(src: Path, dest: Path):
+    """Extract a .tar / .tgz / .tar.gz / .gz archive with the stdlib.
+
+    tarfile reads plain, gzip, bzip2 and xz tars transparently through "r:*", so
+    one call covers .tar, .tgz and .tar.gz alike. A bare .gz is the awkward case:
+    gzip is a single-stream *compressor*, not an archive format, so a .gz may
+    hold a tar or may hold one lone compressed file. tarfile is asked first and
+    the single-file reading is the fallback.
+
+    Extraction uses filter="data", which is what makes this safe. Unlike
+    zipfile, tarfile does NOT sanitise member names by default: a crafted tar can
+    carry absolute paths or ../ components and write outside `dest` entirely.
+    The "data" filter rejects those, along with device nodes, setuid bits and
+    links pointing out of the tree. It is the default from Python 3.14 but must
+    be asked for explicitly before that, and this app ships on 3.12.
+    """
+    import tarfile
+
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(src, mode="r:*") as tf:
+            try:
+                tf.extractall(dest, filter="data")
+            except TypeError:
+                # Python without the extraction filters (< 3.12). Fall back, but
+                # drop anything that would escape `dest` ourselves.
+                members = [m for m in tf.getmembers()
+                           if not m.name.startswith(("/", "\\"))
+                           and ".." not in Path(m.name.replace("\\", "/")).parts
+                           and (m.isfile() or m.isdir())]
+                tf.extractall(dest, members=members)
+        return
+    except tarfile.ReadError:
+        pass        # not a tar — a bare .gz of a single file, handled below
+
+    if src.suffix.lower() != ".gz":
+        raise RuntimeError(
+            f"{src.name} is not a readable tar archive (it may be truncated or "
+            f"corrupt).")
+
+    import gzip
+    # Name the decompressed file after the archive minus its .gz, which is what
+    # gunzip itself would do. A .gz with nothing left after stripping falls back
+    # to a fixed name rather than producing an empty one.
+    inner = src.stem or "contents"
+    try:
+        with gzip.open(src, "rb") as gz:
+            (dest / _safe_filename(inner)).write_bytes(gz.read())
+    except Exception as e:
+        raise RuntimeError(f"Could not decompress {src.name}: {e}")
+
+
 def _extract_archive(src: Path, dest: Path):
     """Extract any archive in ARCHIVE_EXTS into `dest`.
 
@@ -2104,10 +2446,25 @@ def _extract_archive(src: Path, dest: Path):
         _extract_7z(src, dest)
     elif ext == ".rar":
         _extract_rar(src, dest)
+    elif ext in (".tar", ".tgz", ".gz"):
+        _extract_tar(src, dest)
     else:
         raise RuntimeError(
             f"Unsupported archive type: {ext or '(no extension)'}. "
             f"Supported: {', '.join(ARCHIVE_EXTS)}")
+
+
+def _archive_content_name(src: Path) -> str:
+    """What to name the folder an archive's contents are unpacked into.
+
+    Normally the stem, but a compound suffix leaves a stem that is still wearing
+    half an extension: report.tar.gz has the stem "report.tar", which would
+    produce a folder literally called "report.tar". Strip that too.
+    """
+    stem = src.stem
+    if stem.lower().endswith(".tar"):
+        stem = stem[:-4]
+    return stem or src.name
 
 
 def _archive_needs_password(src_path: Path) -> bool:
@@ -2682,10 +3039,11 @@ FILETYPE_FOLDERS = {
     ".pps": "PowerPoint", ".ppsx": "PowerPoint", ".ppsm": "PowerPoint",
     ".pot": "PowerPoint", ".potx": "PowerPoint", ".potm": "PowerPoint",
     ".odp": "PowerPoint",
-    ".accdb": "Databases", ".mdb": "Databases",
+    ".accdb": "Databases", ".mdb": "Databases", ".db": "Databases",
     ".one": "OneNote",
     ".msg": "Emails", ".eml": "Emails",
     ".html": "Web Pages", ".htm": "Web Pages", ".mht": "Web Pages", ".mhtml": "Web Pages",
+    ".xhtml": "Web Pages",
     ".zip": "Archives", ".7z": "Archives", ".rar": "Archives",
     ".tar": "Archives", ".gz": "Archives", ".tgz": "Archives",
     ".vsd": "Visio", ".vsdx": "Visio", ".vsdm": "Visio",
@@ -2708,7 +3066,8 @@ def convert_file(src_path: Path, out_dir: Path, mode: str, apps: dict, outlook=N
     Convert a single file to PDF.
 
     mode: one of the keys in PDF_MODES — 'email', 'html', 'visio', 'excel',
-          'word_doc', 'powerpoint', 'image', 'text_report', 'access', 'onenote'.
+          'word_doc', 'powerpoint', 'image', 'text_report', 'access', 'sqlite',
+          'onenote'.
     apps: {family: COM app} holding the isolated Office instances this mode
           needs, keyed as in OFFICE_INFO. A family that failed to launch maps to
           None, and the converter raises its own "Microsoft X is required"
@@ -2752,6 +3111,8 @@ def convert_file(src_path: Path, out_dir: Path, mode: str, apps: dict, outlook=N
         _image_to_pdf(src_path, out_path, word)
     elif mode == "access":
         _access_to_pdf(src_path, out_path, apps.get("access"), apps.get("excel"))
+    elif mode == "sqlite":
+        _sqlite_to_pdf(src_path, out_path, apps.get("excel"))
     elif mode == "onenote":
         _onenote_to_pdf(src_path, out_path, apps.get("onenote"))
     else:
@@ -2760,9 +3121,89 @@ def convert_file(src_path: Path, out_dir: Path, mode: str, apps: dict, outlook=N
     return out_path
 
 
+# An XML declaration at the very start of a file, which is what XHTML — and
+# .xhtml's whole reason for existing — opens with. Kept in both flavours: the
+# bytes form tests the file before it has been decoded, the text form strips it.
+_XML_PROLOG_BYTES_RE = re.compile(rb"^\s*<\?xml\b[^>]*\?>", re.I)
+_XML_PROLOG_TEXT_RE = re.compile(r"^\s*<\?xml\b[^>]*\?>\s*", re.I)
+
+# A relative src=/href= reference. The lookahead skips anything already absolute:
+# a URL scheme (http:, data:, file:), a protocol-relative //host, or a bare #
+# fragment. Only these need rewriting when the markup is moved to a temp folder.
+_HTML_REL_REF_RE = re.compile(
+    r"""(?P<attr>\b(?:src|href)\s*=\s*)(?P<q>["'])"""
+    r"""(?!\s*(?:[A-Za-z][A-Za-z0-9+.\-]*:|//|\#))(?P<ref>[^"']+)(?P=q)""")
+
+# MIME-archived web pages. Everything in this section works on HTML *text*, and
+# an .mht is a MIME container whose HTML is quoted-printable or base64 inside —
+# so it is handed to Word untouched, exactly as before.
+_MIME_HTML_EXTS = frozenset({".mht", ".mhtml"})
+
+
+def _html_has_xml_prolog(src_path: Path) -> bool:
+    """Whether an HTML file opens with an XML declaration.
+
+    This is the difference between Word importing a file as HTML and Word
+    treating it as a generic XML document: with a prolog present, every image,
+    table and stylesheet is silently dropped, and an XHTML file that also
+    declares a DOCTYPE fails outright with "DTD is prohibited". Neither has
+    anything to do with the extension — a .html file saved as XHTML hits it too.
+    """
+    try:
+        with open(src_path, "rb") as fh:
+            head = fh.read(512)
+    except OSError:
+        return False
+    if head.startswith(b"\xef\xbb\xbf"):       # UTF-8 BOM, before the prolog
+        head = head[3:]
+    return bool(_XML_PROLOG_BYTES_RE.match(head))
+
+
+def _html_source_for_word(src_path: Path, tmp_dir: Path) -> Path:
+    """The path Word should actually open for an HTML/XHTML file.
+
+    Returns `src_path` itself in the ordinary case, so a plain .html is opened
+    in place exactly as before — which is also what keeps its relative images and
+    stylesheets resolving off its own folder.
+
+    When the file carries an XML prolog (see _html_has_xml_prolog) it cannot be
+    opened as-is, so a corrected copy is written into `tmp_dir` — never beside
+    the user's file — with the prolog removed and a .html extension. Moving the
+    markup away from its own folder would break every relative reference in it,
+    so those are resolved against the original's directory and rewritten
+    absolute on the way out.
+    """
+    if src_path.suffix.lower() in _MIME_HTML_EXTS or not _html_has_xml_prolog(src_path):
+        return src_path
+
+    import urllib.parse
+
+    text = _XML_PROLOG_TEXT_RE.sub("", _decode_text_bytes(src_path.read_bytes()))
+    base = src_path.resolve().parent
+
+    def _absolutise(m):
+        # Strip any query/fragment before touching the filesystem, and undo the
+        # percent-encoding a reference to "my file.png" arrives with.
+        ref = m.group("ref").split("#", 1)[0].split("?", 1)[0]
+        try:
+            target = (base / urllib.parse.unquote(ref).replace("/", "\\"))
+            if target.exists():
+                return f'{m.group("attr")}{m.group("q")}{target.resolve()}{m.group("q")}'
+        except OSError:
+            pass
+        return m.group(0)        # leave anything we can't resolve alone
+
+    text = _HTML_REL_REF_RE.sub(_absolutise, text)
+    dest = tmp_dir / ((src_path.stem or "page") + ".html")
+    # BOM so Word reads it as UTF-8 rather than guessing a code page, matching
+    # what _text_report_to_pdf does for the same reason.
+    dest.write_text(text, encoding="utf-8-sig")
+    return dest
+
+
 def _html_to_pdf(src_path: Path, out_path: Path, word):
     """
-    Convert a .html / .htm file to PDF via Word COM.
+    Convert a .html / .htm / .xhtml / .mht file to PDF via Word COM.
     Word opens the HTML file and exports it as PDF — no Outlook needed.
     """
     if word is None:
@@ -2772,10 +3213,11 @@ def _html_to_pdf(src_path: Path, out_path: Path, word):
         )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="apfp_html_"))
     doc = None
     try:
         doc = word.Documents.Open(
-            str(src_path.resolve()),
+            str(_html_source_for_word(src_path, tmp_dir).resolve()),
             ConfirmConversions=False,
             ReadOnly=True,
             AddToRecentFiles=False,
@@ -2803,6 +3245,7 @@ def _html_to_pdf(src_path: Path, out_path: Path, word):
                 doc.Close(SaveChanges=False)
             except Exception:
                 pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ─────────────────────────────────────────────
@@ -2852,7 +3295,7 @@ def _recursive_unzip_in_place(directory: Path):
             try:
                 _extract_archive(zip_path, tmp)
                 content_root = _find_extraction_root(tmp)
-                target_dir = zip_path.parent / zip_path.stem
+                target_dir = zip_path.parent / _archive_content_name(zip_path)
                 target_dir.mkdir(parents=True, exist_ok=True)
                 for item in content_root.iterdir():
                     target = target_dir / item.name
@@ -2946,19 +3389,24 @@ def _image_pages_for_word(src: Path, tmp_dir: Path):
     """Return the image files to place in the document, one per output page.
 
     Two gaps in Word's own picture support are closed here:
-      • formats it has no filter for (.webp/.heic/.heif/.ico) are rewritten as
-        temp PNGs;
+      • formats it has no filter for (.webp/.heic/.heif/.ico/.apng) are
+        rewritten as temp PNGs;
       • a multi-page TIFF — a scanned document, so every page matters — is split
         into one PNG per page, where AddPicture would silently take only the
         first.
-    Multi-frame splitting is deliberately limited to TIFF: an animated GIF is
-    one picture, not a 200-page document.
+    Multi-frame splitting is deliberately limited to TIFF: an animated GIF or
+    APNG is one picture, not a 200-page document.
 
     Returns [src] unchanged whenever Word can read the file as-is, so the common
     case does no work and never touches Pillow. Temp files are written to
     `tmp_dir` (the caller's own mkdtemp), never beside the user's file.
     """
     ext = src.suffix.lower()
+    # Vector formats leave before Pillow is even imported: it cannot open an SVG
+    # (UnidentifiedImageError), and there is nothing to rasterise or paginate —
+    # Word draws it, and keeping it out of Pillow's hands keeps it vector.
+    if ext in _WORD_VECTOR_IMAGE_EXTS:
+        return [src]
     if ext in (".heic", ".heif"):
         _register_heif()
 
@@ -3044,6 +3492,7 @@ def _image_to_pdf(src: Path, out_path: Path, word):
     extra pages of a multi-page TIFF, are bridged by _image_pages_for_word;
     each resulting page is scaled to the printable area by _insert_picture_fitted.
     """
+    ext = src.suffix.lower()
     if word is None:
         raise RuntimeError(
             "Microsoft Word is required for image conversion.\n"
@@ -3078,6 +3527,14 @@ def _image_to_pdf(src: Path, out_path: Path, word):
     except RuntimeError:
         raise                               # already a clear "install X" message
     except Exception as e:
+        if ext in _WORD_VECTOR_IMAGE_EXTS:
+            # Word draws SVG itself, and only from 2016/365 onwards. On an older
+            # build AddPicture simply refuses the file, which is worth naming —
+            # otherwise this reads as a corrupt image.
+            raise RuntimeError(
+                f"SVG to PDF conversion failed: {e}\n"
+                "Word 2016 or newer (or Microsoft 365) is required to draw SVG "
+                "images.")
         raise RuntimeError(f"Image to PDF conversion failed: {e}")
     finally:
         if doc is not None:
@@ -3184,16 +3641,16 @@ _PDF_TYPE_MODES = (
         hint=".txt / .log / .json / .sql / .rpt", auto=True,
     ),
     _PdfMode(
-        key="html", label="HTML (.html, .htm, .mht)", noun="HTML",
-        exts=(".html", ".htm", ".mht", ".mhtml"),
+        key="html", label="HTML (.html, .htm, .xhtml, .mht)", noun="HTML",
+        exts=(".html", ".htm", ".xhtml", ".mht", ".mhtml"),
         families=("word",), outlook=False,
-        hint=".html / .htm / .mht", auto=True,
+        hint=".html / .htm / .xhtml / .mht", auto=True,
     ),
     _PdfMode(
-        key="image", label="Image (.jpg, .png, .heic, …)", noun="Image",
+        key="image", label="Image (.jpg, .png, .svg, .heic, …)", noun="Image",
         exts=IMAGE_EXTS,
         families=("word",), outlook=False,
-        hint=".jpg / .png / .tiff / .heic / .webp", auto=True,
+        hint=".jpg / .png / .svg / .tiff / .heic / .webp", auto=True,
     ),
     _PdfMode(
         key="word_doc", label="Word (.doc, .docx, .odt, …)", noun="Word / Text",
@@ -3232,6 +3689,14 @@ _PDF_TYPE_MODES = (
         # Access reads the tables; Excel lays them out and does the export.
         families=("access", "excel"), outlook=False,
         hint=".accdb / .mdb", auto=False,
+    ),
+    _PdfMode(
+        key="sqlite", label="SQLite database (.db)", noun="SQLite database",
+        exts=(".db",),
+        # No Access here — the stdlib reads SQLite, so only the Excel that lays
+        # the tables out is needed. See _sqlite_to_pdf.
+        families=("excel",), outlook=False,
+        hint=".db", auto=False,
     ),
     _PdfMode(
         key="onenote", label="OneNote (.one)", noun="OneNote section",
@@ -3309,7 +3774,7 @@ def _expand_attached_archive(src: Path) -> list:
     _auto_pdf_scan_and_convert on why attachments are never deleted). Archives
     nested inside are expanded too, by the shared recursive helper.
     """
-    dest = _unique_dir(src.parent, src.stem + "_extracted")
+    dest = _unique_dir(src.parent, _archive_content_name(src) + "_extracted")
     try:
         _extract_archive(src, dest)
     except Exception:
@@ -5821,8 +6286,8 @@ class ConverterApp:
 
         tk.Label(
             parent,
-            text=("Extract .zip, .7z and .rar archives to your chosen folder. Nested "
-                  "archives (archives inside archives, in any mix of the three) are "
+            text=(f"Extract {ARCHIVE_HINT} archives to your chosen folder. Nested "
+                  "archives (archives inside archives, in any mix of formats) are "
                   "unpacked automatically."),
             bg=APP_BG, fg="#555", font=("Segoe UI", 9),
             anchor="w", padx=18, justify="left", wraplength=620,
@@ -5839,7 +6304,7 @@ class ConverterApp:
 
         self._uz_drop_label = tk.Label(
             uz_drop_frame,
-            text="Drop .zip / .7z / .rar files here\nor click 'Add Archives'",
+            text=f"Drop {ARCHIVE_HINT} files here\nor click 'Add Archives'",
             bg=DROP_BG, fg="#4a6fa5",
             font=("Segoe UI", 11),
             justify="center",
@@ -6021,7 +6486,7 @@ class ConverterApp:
             self._uz_drop_label.config(text=f"{len(self._zip_files)} archive(s) queued")
         else:
             self._uz_drop_label.config(
-                text="Drop .zip / .7z / .rar files here\nor click 'Add Archives'")
+                text=f"Drop {ARCHIVE_HINT} files here\nor click 'Add Archives'")
 
     def _uz_choose_output(self):
         d = filedialog.askdirectory(title="Select an empty output folder")
@@ -7572,7 +8037,7 @@ class ConverterApp:
         tk.Label(
             parent,
             text=("Give documents professional, standardized names. Add archives "
-                  "(.zip, .7z, .rar), whole folders, or individual files — archives are "
+                  f"({ARCHIVE_HINT}), whole folders, or individual files — archives are "
                   "extracted first — then each document's opening text is read and used "
                   "to suggest a name, a date prefix, or both. Copies are saved to your "
                   "output folder; originals are never modified."),

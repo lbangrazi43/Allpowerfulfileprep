@@ -14,6 +14,16 @@ Format is `## <version> — <YYYY-MM-DD>`, newest first. Prerelease sections are
 kept for the record but never shown in the app, which is only ever offered
 stable releases.
 
+## 1.8.2 — 2026-08-17
+
+- SQLite `.db` files convert to PDF, one sheet per table. Values are kept
+  exactly as stored, so dates and codes like `00123` are not reformatted.
+- Images now include `.svg` and `.apng`.
+- `.xhtml` converts, and web pages written as XHTML no longer lose their
+  images, tables and formatting.
+- Basic Text adds `.markdown`, `.pl` and `.xbrl`.
+- Folder Unzipping accepts `.tar`, `.tgz` and `.gz` archives.
+
 ## 1.8.1 — 2026-08-13
 
 - "Basic Text" now converts files with an unrecognised extension, like
