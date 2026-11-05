@@ -65,7 +65,7 @@ from collections import deque, namedtuple
 # decide whether an update exists. MUST be bumped before every release build —
 # leaving it stale makes the freshly-installed exe still believe it is the old
 # version, so it offers the same update forever.
-APP_VERSION = "1.8.3"
+APP_VERSION = "1.8.4"
 
 # The date APP_VERSION was published, shown beside it on the About & Updates
 # page. Deliberately baked into the build rather than fetched: it describes the
