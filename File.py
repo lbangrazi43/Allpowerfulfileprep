@@ -6204,7 +6204,7 @@ class ConverterApp:
         for label, cmd in [
             ("Add Files",        self._add_files),
             ("Remove Selected",  self._remove_selected),
-            ("Clear All",        self._clear_files),
+            ("Clear All",        self._clear_all),
         ]:
             tk.Button(
                 btn_frame, text=label, command=cmd,
@@ -6480,6 +6480,11 @@ class ConverterApp:
         # Return the page to its ready state (clear any "Done!"/error status).
         self._uz_status_var.set("Ready — add archives to get started.")
         self._uz_tracker.reset()
+        # This page has no default folder, so Run locks until one is chosen again.
+        self._unzip_out_dir = None
+        self._uz_out_var.set("Choose an output folder")
+        self._uz_out_label.config(fg="#c0392b")
+        self._uz_btn.config(state="disabled")
 
     def _uz_update_drop_label(self):
         if self._zip_files:
@@ -6570,7 +6575,8 @@ class ConverterApp:
         self._uz_tracker.finish()
         elapsed = self._uz_timer.elapsed_str()
         self._uz_timer.reset()
-        self._uz_btn.config(state="normal")
+        # Clear All may have dropped the folder while this run was going.
+        self._uz_btn.config(state="normal" if self._unzip_out_dir else "disabled")
         self._set_cancel_state(self._uz_cancel_btn, False)
         protected = protected or []
         # Archive passwords aren't Office encryption, so the Password Removal
@@ -6761,6 +6767,8 @@ class ConverterApp:
         # Return the page to its ready state (clear any "Done!"/error status).
         self._ai_status_var.set("Ready — add files to convert to Markdown.")
         self._ai_tracker.reset()
+        self._ai_out_dir = None
+        self._ai_out_var.set("Same as source file")
 
     def _ai_update_drop_label(self):
         if self._ai_files:
@@ -6795,6 +6803,9 @@ class ConverterApp:
 
     def _aiprep_worker(self):
         files = list(self._ai_files)
+        # Read once: Clear All can reset this while the batch is still running,
+        # and that must not redirect the files still to come.
+        chosen_out = self._ai_out_dir
         delete_orig = self._ai_delete_orig.get()
         # Only ever delete files the user actually uploaded — never anything else
         # that may live in the output folder. See _delete_original_file.
@@ -6831,7 +6842,7 @@ class ConverterApp:
             self._ai_timer.set_file(src.name)
             self._ai_tracker.begin_item()
             try:
-                out_dir = self._ai_out_dir if self._ai_out_dir else src.parent
+                out_dir = chosen_out if chosen_out else src.parent
                 out = _to_markdown(src, out_dir)
                 if out.exists() and out.stat().st_size > 0:
                     converted += 1
@@ -7040,6 +7051,8 @@ class ConverterApp:
         # Return the page to its ready state (clear any "Done!"/error status).
         self._office_status_var.set("Ready — add legacy Office files to modernize.")
         self._office_tracker.reset()
+        self._office_out_dir = None
+        self._office_out_var.set("Same as source file")
 
     def _office_update_drop_label(self):
         if self._office_files:
@@ -7081,6 +7094,9 @@ class ConverterApp:
 
     def _office_worker(self):
         files = list(self._office_files)
+        # Read once: Clear All can reset this while the batch is still running,
+        # and that must not redirect the files still to come.
+        chosen_out = self._office_out_dir
         delete_orig = self._office_delete_orig.get()
         # Only ever delete files the user actually uploaded — never anything else
         # that may live in the output folder. See _delete_original_file.
@@ -7125,7 +7141,7 @@ class ConverterApp:
                     self._office_app_pids[family] = set(pids)
                     ensured[family] = True
 
-                out_dir = self._office_out_dir if self._office_out_dir else src.parent
+                out_dir = chosen_out if chosen_out else src.parent
                 out_path = _unique_output_path(out_dir, src.stem, out_ext)
 
                 # Bound this file: if it isn't done within OFFICE_FILE_TIMEOUT
@@ -7367,6 +7383,8 @@ class ConverterApp:
         # Return the page to its ready state (clear any "Done!"/error status).
         self._pwd_status_var.set("Ready — add password-protected Office files to unlock.")
         self._pwd_tracker.reset()
+        self._pwd_out_dir = None
+        self._pwd_out_var.set("Same as source file")
 
     def _pwd_update_drop_label(self):
         if self._pwd_files:
@@ -7513,6 +7531,10 @@ class ConverterApp:
 
     def _pwd_worker(self):
         files = list(self._pwd_files)
+        # Read once: Clear All can reset this while the batch is still running
+        # (the password prompt doesn't block the main window), and that must not
+        # redirect the files still to come.
+        chosen_out = self._pwd_out_dir
         total = len(files)
         unlocked = 0
         failed = []     # (name, reason)
@@ -7550,7 +7572,7 @@ class ConverterApp:
                 self._set_pwd_status(f"Unlocking: {src.name}  ({i + 1}/{total})")
                 self._pwd_timer.set_file(src.name)
                 self._pwd_tracker.begin_item()
-                out_dir = self._pwd_out_dir if self._pwd_out_dir else src.parent
+                out_dir = chosen_out if chosen_out else src.parent
                 out_path = _unique_output_path(out_dir, src.stem + "_nopass", src.suffix)
                 try:
                     _strip_office_password(src, out_path, pwd)
@@ -7794,6 +7816,11 @@ class ConverterApp:
         # Return the page to its ready state (clear any "Done!"/error status).
         self._ds_status_var.set(self._DS_READY_MSG)
         self._ds_tracker.reset()
+        # This page has no default folder, so Run locks until one is chosen again.
+        self._ds_out_dir = None
+        self._ds_out_var.set("Choose an output folder")
+        self._ds_out_label.config(fg="#c0392b")
+        self._ds_btn.config(state="disabled")
 
     def _ds_update_drop_label(self):
         if self._ds_files:
@@ -8194,6 +8221,9 @@ class ConverterApp:
         self._aio_files.clear()
         self._aio_file_list.delete(0, "end")
         self._aio_update_drop_label()
+        self._aio_out_dir = None
+        self._aio_out_var.set("Choose an output folder")
+        self._aio_out_label.config(fg="#c0392b")
 
     def _aio_update_drop_label(self):
         if self._aio_files:
@@ -8883,6 +8913,14 @@ class ConverterApp:
         self.status_var.set("Ready — add files to get started.")
         self._pdf_tracker.reset()
 
+    def _clear_all(self):
+        """The Clear All button: empty the queue and put the output folder back
+        to its default. Separate from _clear_files because changing the type
+        dropdown empties the queue too, and that shouldn't lose a chosen folder."""
+        self._clear_files()
+        self._out_dir = None
+        self.out_var.set("Same as source file")
+
     def _update_drop_label(self):
         if self.files:
             self.drop_label.config(text=f"{len(self.files)} file(s) queued")
@@ -8939,6 +8977,9 @@ class ConverterApp:
 
     def _convert_worker(self):
         mode = self._current_mode()
+        # Read once: Clear All can reset this while a file is being set up, and
+        # that must not send the file somewhere other than the folder chosen.
+        chosen_out = self._out_dir
         # The mixed-batch mode owns no converter: each file is routed by its own
         # extension, and the applications it needs are started lazily as those
         # files come up rather than all at once up front.
@@ -9097,7 +9138,7 @@ class ConverterApp:
                     self._pdf_tracker.complete_item()
                     continue
 
-                out_dir = self._out_dir if self._out_dir else src.parent
+                out_dir = chosen_out if chosen_out else src.parent
                 # _pdf_stem_for keeps the whole name when the "extension" is
                 # really part of it, so EXTRACT.20260813 and EXTRACT.20260814
                 # don't both land on EXTRACT.pdf.
