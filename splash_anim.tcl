@@ -3,6 +3,9 @@
 # time. PyInstaller's part has already created the window and .root.canvas, and
 # set up the connection File.py talks to.
 #
+# This file must stay pure ASCII: AnimatedSplash in the spec explains why and refuses
+# to build otherwise. Write anything else as a Tcl backslash-u escape.
+#
 # This runs in the bootloader process, on its own thread, so it keeps animating
 # no matter how busy the app's Python process is.
 #
@@ -40,7 +43,7 @@ set anim_logo_end   [expr {-[image width anim_owl_img] / 2.0 - 10 - $anim_gap}]
 .root.canvas create image -200 $anim_ground -image anim_logo_img -tags anim_logo
 .root.canvas create image -200 $anim_ground -image anim_owl_img  -tags anim_owl
 .root.canvas create text [expr {$image_width / 2}] 170 \
-    -text "Loading… 0%" -fill "#073b5e" -font {{Segoe UI} 11} -tags anim_pct
+    -text "Loading\u2026 0%" -fill "#073b5e" -font {{Segoe UI} 11} -tags anim_pct
 
 proc anim_on_status {args} {
     global status_text anim_cost anim_cost_total anim_cost_done anim_extracting
@@ -102,7 +105,7 @@ proc anim_tick {} {
     .root.canvas coords anim_owl [expr {$logo_x + $anim_gap}] \
         [expr {$anim_ground - 8 * abs(sin($phase + 0.9))}]
     .root.canvas itemconfigure anim_pct \
-        -text "Loading… [expr {int($anim_shown)}]%"
+        -text "Loading\u2026 [expr {int($anim_shown)}]%"
 
     after 20 anim_tick
 }

@@ -14,6 +14,10 @@ Format is `## <version> — <YYYY-MM-DD>`, newest first. Prerelease sections are
 kept for the record but never shown in the app, which is only ever offered
 stable releases.
 
+## 1.8.4 — 2026-11-05
+
+- The loading screen's animation and percentage now run. In 1.8.3 they stayed on 0%.
+
 ## 1.8.3 — 2026-11-05
 
 - The app starts in about half the time.

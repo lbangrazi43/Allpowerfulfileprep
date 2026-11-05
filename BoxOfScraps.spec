@@ -185,6 +185,14 @@ class AnimatedSplash(Splash):
             anim = anim.replace(key, str(value))
 
         script = super().generate_script() + '\n' + anim
+        # PyInstaller records the script's length in characters but stores it as UTF-8,
+        # so each non-ASCII character makes the bootloader cut bytes off the end of the
+        # script, with no error. In 1.8.3 that lost the last line, the call that starts
+        # the animation, leaving a splash stuck on 0%.
+        if not script.isascii():
+            found = sorted({c for c in script if not c.isascii()})
+            raise SystemExit(f'ERROR: the splash script must be pure ASCII, found {found}. '
+                             'Write these in splash_anim.tcl as Tcl backslash-u escapes.')
         # PyInstaller keeps a copy on disk so the script that ran can be read.
         with open(self.script_name, 'w', encoding='utf-8') as f:
             f.write(script)

@@ -643,6 +643,16 @@ with the clock; they have to agree across the spec (`SPLASH_EXTRACT_SHARE`,
 changes much. `_splash_close()` runs once the main window is painted. Running from source shows
 no splash at all.
 
+**The splash script must stay pure ASCII, and has to be tested unmodified.** PyInstaller
+records the script's length in characters but stores it as UTF-8, so one `…` costs two
+bytes off the end of the script, with no error anywhere. In 1.8.3 that turned the last
+line, `anim_tick`, into `anim_t`, so the animation never started and the splash sat on
+"Loading… 0%". It got through testing because the test builds had a timeline log appended
+to the script, so they lost harmless bytes instead. `AnimatedSplash` now refuses to build
+a non-ASCII script. To check the splash, build the real spec with nothing added and look
+at real screen pixels from a foreground launch: `PrintWindow` makes the window redraw
+itself, and a background launch sits behind whatever is in front.
+
 **`import pyi_splash` MUST stay a static import** — a dynamic import makes
 PyInstaller omit the module, leaving nothing to close the splash. It sits at the
 very top of `File.py`, before the other imports, because they are part of what the
