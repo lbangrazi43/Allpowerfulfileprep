@@ -80,14 +80,16 @@ proc anim_tick {} {
     global anim_shown anim_floor anim_ceiling anim_ground anim_gap
     global anim_logo_start anim_logo_end
 
-    # Glide up to what has been proven, then creep toward the ceiling. 100 is the
-    # last thing shown before the window appears, so there is nothing to glide to.
+    # Glide quickly up to what has been proven and creep toward the ceiling, taking
+    # whichever is the bigger step. Both ease in without ever arriving, so neither
+    # can be made to wait for the other to finish. 100 is the last thing shown before
+    # the window appears, so there is nothing to glide to.
     if {$anim_floor >= 100} {
         set anim_shown 100.0
-    } elseif {$anim_shown < $anim_floor} {
-        set anim_shown [expr {$anim_shown + ($anim_floor - $anim_shown) * 0.10}]
-    } elseif {$anim_shown < $anim_ceiling} {
-        set anim_shown [expr {$anim_shown + ($anim_ceiling - $anim_shown) * 0.025}]
+    } else {
+        set anim_shown [expr {$anim_shown + max(0.0,
+                              ($anim_floor - $anim_shown) * 0.15,
+                              ($anim_ceiling - $anim_shown) * 0.08)}]
     }
 
     set logo_x [expr {$anim_logo_start

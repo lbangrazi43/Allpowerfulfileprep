@@ -238,7 +238,9 @@ contents are always kept — the email they came from *is* deleted once its PDF
 exists, so keeping them is what stops a bulk run leaving a picture of a
 spreadsheet as the only copy. Known gap: an email attached to an email is still
 not extracted by either backend (`olEmbeddeditem` is skipped, and a
-`message/rfc822` part yields no payload bytes).
+`message/rfc822` part yields no payload bytes). Another: markitdown only reads the
+Unicode streams of a `.msg`, so one saved in Outlook's older ANSI format (`olMSG`, 3,
+rather than `olMSGUnicode`, 9) comes out of Markdown Conversion with an empty body.
 
 **`_FileWatchdog` bounds a single file** so one stuck conversion can't hang a
 batch. Used as a context manager around each file by all three conversion workers
@@ -598,6 +600,31 @@ path.
 `collect_all`s pywin32/PIL/markitdown/msoffcrypto and excludes heavy ML/GUI libs
 (torch, scipy, PyQt, …) to shrink the archive and speed startup.
 
+**The bundle is trimmed, because unpacking is most of the launch.** A one-file build
+unpacks every file on every launch while Defender scans each one. File count matters
+more than size (roughly 1–2 ms per file against 6–9 ms per MB), and over half the
+files used to be three copies of the time zone database. The filter right after
+`Analysis` in the spec took the bundle from 3,434 files to 840 and the launch from
+11–12 s to about 5 s on the development machine. It has to run before `PYZ` and the
+splash, which read those lists.
+
+What it costs: `pytz.timezone(name)` raises for any named zone, `zoneinfo` only knows
+the zones tzlocal can map a Windows zone to, and a machine whose `TZ` variable names
+any other zone gets an error converting a `.msg` to Markdown. Offline `recognize_sphinx`
+and `win32ui` are gone; neither is used.
+
+**Don't cut these, which look removable:** `libx265` (libheif hard-imports it),
+`tzdata` entirely (extract_msg reads dates through tzlocal), and numpy, pandas,
+onnxruntime or magika (`MarkItDown()` constructs Magika, and `.xlsx` needs pandas).
+Don't add `distutils` to `EXCLUDES`: the build dies inside PyInstaller's hook for it.
+
+After changing the trim, test inside a frozen build rather than from source, since
+source still has everything: real Word, Excel and PowerPoint conversions, a `.msg`,
+encrypted Office files, each archive format, audio, and an update check. When timing
+a launch, use a local copy; running from the OneDrive `dist` folder is seconds slower
+than the Downloads copy a user has. Note that `tkinter.Toplevel` copies its parent's
+title, so finding "the main window" by title alone can match a smaller dialog.
+
 **The loading screen is the bootloader's `Splash`, and there is only one.** It runs
 in the bootloader process on its own thread, so it keeps animating however busy
 Python is. An in-app Tk splash can't do that, and can't appear until unpacking and
@@ -610,9 +637,10 @@ Progress comes from two real sources, both through the Tcl variable `status_text
 the bootloader writes the name of each file it unpacks (weighted by size, because
 over half the bytes sit in ten files), then `_splash_stage(floor, ceiling)` in
 `File.py` reports each stage. Between events the display drifts toward the ceiling
-without reaching it. The percentages have to agree across the spec
-(`SPLASH_EXTRACT_SHARE`, `SPLASH_BOOT_CEILING`) and the `_splash_stage` calls.
-`_splash_close()` runs once the main window is painted. Running from source shows
+without reaching it. The percentages come from a logged launch so the bar keeps pace
+with the clock; they have to agree across the spec (`SPLASH_EXTRACT_SHARE`,
+`SPLASH_BOOT_CEILING`) and the `_splash_stage` calls, and need retiming if the bundle
+changes much. `_splash_close()` runs once the main window is painted. Running from source shows
 no splash at all.
 
 **`import pyi_splash` MUST stay a static import** — a dynamic import makes

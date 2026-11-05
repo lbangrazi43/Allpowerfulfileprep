@@ -5,6 +5,7 @@ import os
 
 from PIL import Image, ImageOps
 from PyInstaller.utils.hooks import collect_all, copy_metadata
+from tzlocal.windows_tz import win_tz
 
 datas = [
     # All build inputs are repo-relative on purpose: an absolute path here (this
@@ -51,6 +52,10 @@ EXCLUDES = [
     'torch', 'torchvision', 'torchaudio', 'sympy', 'pygame',
     'matplotlib', 'scipy', 'IPython', 'notebook', 'jupyter',
     'PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'tkinter.test', 'test',
+    # Removes the pkg_resources and setuptools runtime hooks from every launch.
+    # Don't add 'distutils' to this list: the build dies inside PyInstaller's own
+    # hook for it.
+    'pkg_resources', 'setuptools', '_distutils_hack',
 ]
 
 
@@ -67,6 +72,49 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
+# ── Trim ─────────────────────────────────────────────────────────────────────
+# A one-file build unpacks every bundled file on every launch while Defender scans
+# each one, and that was most of the launch time. File count matters more than
+# size (measured at about 0.9 ms per file and 9 ms per MB), so most of what comes
+# out here is small. This must run before PYZ and the splash, which read these lists.
+_DROP_PREFIXES = (
+    # Named-zone data and message catalogues for Tcl's `clock`, used only by Tk's
+    # demos. The `clock milliseconds` the splash calls doesn't need them.
+    '_tcl_data/tzdata/', '_tcl_data/msgs/',
+    # pytz's zone database. Only timezone-aware pandas would reach it, and reading
+    # a spreadsheet produces plain timestamps.
+    'pytz/zoneinfo/',
+    # The offline speech engine, never called: markitdown transcribes through
+    # recognize_google and flac-win32.exe, which stays. The non-Windows flac goes too.
+    'speech_recognition/pocketsphinx-data/',
+    'speech_recognition/flac-linux', 'speech_recognition/flac-mac',
+    # AVIF isn't in IMAGE_EXTS, and Pillow copes with the module being absent.
+    'PIL/_avif',
+    # win32ui and friends only serve makepy's progress window and COM browsers.
+    # The app drives Office through DispatchEx.
+    'Pythonwin/', 'win32com/test/', 'win32com/HTML/', 'win32com/demos/',
+    'olefile/doc/',
+)
+# Source copies collect_all puts on disk beside modules already compiled into the
+# PYZ, plus build leftovers.
+_DROP_SUFFIXES = ('.py', '.pyi', '.h', '.lib', '.md', 'py.typed')
+# tzdata itself has to stay, because extract_msg reads .msg dates through tzlocal,
+# but only the zones Windows can actually report are needed. A machine with a TZ
+# variable naming any other zone would get an error converting a .msg to Markdown.
+_KEEP_ZONES = {'tzdata/zoneinfo/' + zone for zone in win_tz.values()}
+
+
+def _keep_in_bundle(dest):
+    name = dest.replace('\\', '/')
+    if name.startswith(_DROP_PREFIXES) or name.endswith(_DROP_SUFFIXES):
+        return False
+    return not name.startswith('tzdata/zoneinfo/') or name in _KEEP_ZONES
+
+
+a.binaries = [entry for entry in a.binaries if _keep_in_bundle(entry[0])]
+a.datas = [entry for entry in a.datas if _keep_in_bundle(entry[0])]
+
 pyz = PYZ(a.pure)
 
 
@@ -76,16 +124,17 @@ pyz = PYZ(a.pure)
 # script only shows a still image, so splash_anim.tcl is appended to it. That
 # file holds the explanation; what's here just fills in what it needs.
 
-# How long one more file costs to unpack, expressed as bytes of file content, so
-# that the bar tracks time rather than file count: 55% of the bundle's bytes sit
-# in 10 of its 3,400 files. An estimate until it is measured from a real launch.
-SPLASH_BYTES_PER_FILE = 64 * 1024
+# What one more file costs to unpack, expressed as bytes of file content, so that
+# the bar tracks time rather than file count: the bundle's bytes sit in very few of
+# its files. Regressed from logged launches, which agreed at 176-214 KB.
+SPLASH_BYTES_PER_FILE = 180 * 1024
 
-# Share of the bar for unpacking, and where it may drift to while Python starts.
-# File.py's _splash_stage calls carry on from these numbers. Also estimates until
-# they are measured from a real launch.
-SPLASH_EXTRACT_SHARE = 60
-SPLASH_BOOT_CEILING = 75
+# Share of the bar for unpacking, and where it may drift to while Python starts,
+# from a typical logged launch of this bundle: unpacking took 2.0 s of 3.9 s and
+# Python's startup another 0.7 s. File.py's _splash_stage calls carry on from these
+# numbers. If the bundle changes much, these shares change with it.
+SPLASH_EXTRACT_SHARE = 52
+SPLASH_BOOT_CEILING = 70
 
 
 def _png_base64(image):

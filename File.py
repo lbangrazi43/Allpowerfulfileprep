@@ -42,8 +42,9 @@ def _splash_close():
 
 
 # Unpacking and Python's own startup have already happened by this line. Those
-# shares are set in BoxOfScraps.spec; the numbers here carry on from them.
-_splash_stage(75, 85)
+# shares are set in BoxOfScraps.spec; the numbers here carry on from them, and all
+# of them come from a logged launch, so that the bar keeps pace with the clock.
+_splash_stage(70, 75)
 
 import sys
 import time
@@ -5675,7 +5676,9 @@ class _ProgressTracker:
 
 class ConverterApp:
     def __init__(self):
-        _splash_stage(85, 95)
+        # Creating the Tk root is the slowest step left once Python is running: it
+        # loads Tcl and Tk, which were unpacked moments ago and so get scanned.
+        _splash_stage(75, 94)
 
         # Give the process its own AppUserModelID *before* the window exists so
         # Windows ties the taskbar button to our icon, not python/Tk's default.
@@ -5690,6 +5693,7 @@ class ConverterApp:
             self.root = TkinterDnD.Tk()
         else:
             self.root = tk.Tk()
+        _splash_stage(94, 99)
 
         # Surface (rather than silently swallow) any exception raised inside a Tk
         # callback. In the windowed build there is no console, so the default
