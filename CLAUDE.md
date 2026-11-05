@@ -596,13 +596,30 @@ path.
 
 **Packaging specifics (`BoxOfScraps.spec`).** One-file build that
 `collect_all`s pywin32/PIL/markitdown/msoffcrypto and excludes heavy ML/GUI libs
-(torch, scipy, PyQt, …) to shrink the archive and speed startup. It bundles a
-bootloader `Splash` shown during one-file unpack; the app closes it with
-`pyi_splash.close()`. **`import pyi_splash` MUST stay a static import** — a dynamic
-import makes PyInstaller omit the module, so the bootloader splash never closes
-and resurfaces over the app. A separate animated `_SplashScreen` runs during UI
-construction. Asset paths resolve through `_resource_base()` /
-`sys._MEIPASS` when frozen.
+(torch, scipy, PyQt, …) to shrink the archive and speed startup.
+
+**The loading screen is the bootloader's `Splash`, and there is only one.** It runs
+in the bootloader process on its own thread, so it keeps animating however busy
+Python is. An in-app Tk splash can't do that, and can't appear until unpacking and
+Python's startup are over, which is most of the wait. `AnimatedSplash` in the spec
+appends `splash_anim.tcl` to PyInstaller's own script and embeds the sprites, which
+is why the build needs Pillow; `splash_static.png` is just the blank frame they run
+across. `always_on_top=False` lets other windows cover it while it loads.
+
+Progress comes from two real sources, both through the Tcl variable `status_text`:
+the bootloader writes the name of each file it unpacks (weighted by size, because
+over half the bytes sit in ten files), then `_splash_stage(floor, ceiling)` in
+`File.py` reports each stage. Between events the display drifts toward the ceiling
+without reaching it. The percentages have to agree across the spec
+(`SPLASH_EXTRACT_SHARE`, `SPLASH_BOOT_CEILING`) and the `_splash_stage` calls.
+`_splash_close()` runs once the main window is painted. Running from source shows
+no splash at all.
+
+**`import pyi_splash` MUST stay a static import** — a dynamic import makes
+PyInstaller omit the module, leaving nothing to close the splash. It sits at the
+very top of `File.py`, before the other imports, because they are part of what the
+splash is waiting for, and it is skipped when `_PYI_SPLASH_IPC` isn't set so the
+diagnostic build doesn't log a warning about a splash it never had.
 
 **Document Structuring tool — organize by filetype, and nothing else.** It has
 **no options and no toggle**: the one thing it does is sort files into

@@ -1,4 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
+import base64
+import io
+import os
+
+from PIL import Image, ImageOps
 from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 datas = [
@@ -6,8 +11,6 @@ datas = [
     # used to point into a Downloads folder) builds fine on one machine and
     # fails on every other one, including a fresh clone.
     ('icon.ico', '.'),
-    ('owl_source.png', '.'),   # splash: owl sprite
-    ('logo_b.png', '.'),       # splash: 'b' logo sprite
 ]
 binaries = []
 hiddenimports = ['win32timezone']
@@ -66,14 +69,85 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
-# Built-in bootloader splash: shown by the loader *during* the one-file unpack,
-# before any Python runs — so the user sees the brand immediately instead of a
-# delay. The app closes it (pyi_splash.close()) once its own splash is on screen.
-splash = Splash(
-    'splash_static.png',
+
+# ── Splash ───────────────────────────────────────────────────────────────────
+# The bootloader's splash is the app's only loading screen: it appears before
+# any Python runs and stays up until the main window is painted. PyInstaller's
+# script only shows a still image, so splash_anim.tcl is appended to it. That
+# file holds the explanation; what's here just fills in what it needs.
+
+# How long one more file costs to unpack, expressed as bytes of file content, so
+# that the bar tracks time rather than file count: 55% of the bundle's bytes sit
+# in 10 of its 3,400 files. An estimate until it is measured from a real launch.
+SPLASH_BYTES_PER_FILE = 64 * 1024
+
+# Share of the bar for unpacking, and where it may drift to while Python starts.
+# File.py's _splash_stage calls carry on from these numbers. Also estimates until
+# they are measured from a real launch.
+SPLASH_EXTRACT_SHARE = 60
+SPLASH_BOOT_CEILING = 75
+
+
+def _png_base64(image):
+    buf = io.BytesIO()
+    image.save(buf, format='PNG')
+    return base64.b64encode(buf.getvalue()).decode('ascii')
+
+
+def _owl_sprite(height):
+    """The owl as a navy silhouette, trimmed of its white margin."""
+    gray = Image.open(os.path.join(SPECPATH, 'owl_source.png')).convert('L')
+    gray = gray.crop(ImageOps.invert(gray).getbbox())
+    owl = Image.new('RGBA', gray.size, '#073b5e')
+    owl.putalpha(ImageOps.invert(gray))
+    return owl.resize((max(1, owl.width * height // owl.height), height), Image.LANCZOS)
+
+
+def _logo_sprite(height):
+    logo = Image.open(os.path.join(SPECPATH, 'logo_b.png')).convert('RGBA')
+    return logo.resize((max(1, logo.width * height // logo.height), height), Image.LANCZOS)
+
+
+def _extraction_costs(toc):
+    """Return (cost of every file the bootloader unpacks, as a total) and the
+    Tcl list of the files that cost more than the default of 1."""
+    total, expensive = 0, []
+    for dest, src, _typecode in toc:
+        cost = 1 + os.path.getsize(src) // SPLASH_BYTES_PER_FILE
+        total += cost
+        if cost > 1:
+            expensive.append('{%s} %d' % (dest, cost))
+    return total, ' '.join(expensive)
+
+
+class AnimatedSplash(Splash):
+    def generate_script(self):
+        total, expensive = _extraction_costs(a.binaries + a.datas)
+        with open(os.path.join(SPECPATH, 'splash_anim.tcl'), encoding='utf-8') as f:
+            anim = f.read()
+        for key, value in {
+            '@EXTRACT_SHARE@': SPLASH_EXTRACT_SHARE,
+            '@BOOT_CEILING@': SPLASH_BOOT_CEILING,
+            '@FILE_COSTS@': expensive,
+            '@COST_TOTAL@': total,
+            '@OWL_PNG@': _png_base64(_owl_sprite(70)),
+            '@LOGO_PNG@': _png_base64(_logo_sprite(60)),
+        }.items():
+            anim = anim.replace(key, str(value))
+
+        script = super().generate_script() + '\n' + anim
+        # PyInstaller keeps a copy on disk so the script that ran can be read.
+        with open(self.script_name, 'w', encoding='utf-8') as f:
+            f.write(script)
+        return script
+
+
+splash = AnimatedSplash(
+    'splash_static.png',       # the blank frame the sprites run across
     binaries=a.binaries,
     datas=a.datas,
     text_pos=None,
+    always_on_top=False,       # other windows may cover it while it loads
 )
 
 exe = EXE(

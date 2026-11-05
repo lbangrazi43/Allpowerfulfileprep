@@ -6,9 +6,46 @@ HTML conversion uses Microsoft Word via COM automation.
 Requires: Microsoft Office installed on the machine.
 """
 
+# The loading screen is the bootloader's splash (see splash_anim.tcl), so connect
+# to it before the imports below, which are part of what it is waiting for. This
+# MUST be a static `import pyi_splash` — PyInstaller only bundles the module when
+# it sees a static import, so a dynamic one would leave the splash with nothing
+# to close it. The variable is only set when a splash exists; running from source
+# or as the diagnostic build, the module would just log a warning about it.
 import os
+
+pyi_splash = None
+if "_PYI_SPLASH_IPC" in os.environ:
+    try:
+        import pyi_splash  # type: ignore
+    except Exception:
+        pass
+
+
+def _splash_stage(floor, ceiling):
+    """Report startup progress: at least `floor`%, drifting toward `ceiling`%
+    until the next report. A no-op from source, and it must never stop the app
+    from starting, whatever has happened to the splash."""
+    if pyi_splash is not None:
+        try:
+            pyi_splash.update_text(f"@{floor} {ceiling}")
+        except Exception:
+            pass
+
+
+def _splash_close():
+    if pyi_splash is not None:
+        try:
+            pyi_splash.close()
+        except Exception:
+            pass
+
+
+# Unpacking and Python's own startup have already happened by this line. Those
+# shares are set in BoxOfScraps.spec; the numbers here carry on from them.
+_splash_stage(75, 85)
+
 import sys
-import math
 import time
 import threading
 import tkinter as tk
@@ -5431,121 +5468,6 @@ class _ModernDropdown(tk.Frame):
                 pass
 
 
-def _resource_base():
-    """Directory where bundled assets live (next to the script, or sys._MEIPASS
-    inside a one-file PyInstaller build)."""
-    if getattr(sys, "frozen", False):
-        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
-    return Path(__file__).parent
-
-
-def _asset_path(name):
-    return _resource_base() / name
-
-
-class _SplashScreen:
-    """Small borderless splash shown while the app initializes.
-
-    The 'b' logo runs to the left while the owl chases it from behind; the
-    progress bar fills the opposite way (left→right) and 'Loading… X%' counts up.
-    """
-    W, H = 470, 230
-    NAVY, GREEN, BG = "#073b5e", "#9aca3c", "#ffffff"
-
-    def __init__(self, root):
-        from PIL import ImageTk
-        self.root = root
-        self.win = tk.Toplevel(root)
-        self.win.overrideredirect(True)          # no title bar / borders
-        self.win.configure(bg=self.BG)
-        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
-        self.win.geometry("%dx%d+%d+%d" % (
-            self.W, self.H, (sw - self.W) // 2, (sh - self.H) // 2))
-        try:
-            self.win.attributes("-topmost", True)
-        except Exception:
-            pass
-
-        self.cv = tk.Canvas(self.win, width=self.W, height=self.H, bg=self.BG,
-                            highlightthickness=2, highlightbackground=self.NAVY)
-        self.cv.pack(fill="both", expand=True)
-
-        # sprites: navy owl silhouette + the colour logo
-        self._imgs = {}
-        self.ground_y = 92
-        owl = ImageTk.PhotoImage(self._owl_sprite(70))
-        logo = ImageTk.PhotoImage(self._logo_sprite(60))
-        self._imgs["owl"], self._imgs["logo"] = owl, logo
-        self.owl_w, self.logo_w = owl.width(), logo.width()
-        self.logo_id = self.cv.create_image(-200, self.ground_y, image=logo)
-        self.owl_id = self.cv.create_image(-200, self.ground_y, image=owl)
-
-        # loading text below the sprites
-        self.pct_id = self.cv.create_text(self.W // 2, 170,
-                                          text="Loading… 0%", fill=self.NAVY,
-                                          font=("Segoe UI", 11))
-        self._render(0, 0)          # place sprites on-screen before first paint
-        self.win.update()
-
-    def _owl_sprite(self, h):
-        from PIL import Image, ImageOps
-        g = Image.open(_asset_path("owl_source.png")).convert("L")
-        g = g.crop(ImageOps.invert(g).getbbox())   # trim white space
-        alpha = ImageOps.invert(g)                  # dark owl -> opaque
-        owl = Image.new("RGBA", g.size, self.NAVY)
-        owl.putalpha(alpha)
-        w = max(1, int(owl.width * h / owl.height))
-        return owl.resize((w, h), Image.LANCZOS)
-
-    def _logo_sprite(self, h):
-        from PIL import Image
-        logo = Image.open(_asset_path("logo_b.png")).convert("RGBA")
-        w = max(1, int(logo.width * h / logo.height))
-        return logo.resize((w, h), Image.LANCZOS)
-
-    def _render(self, pct, frame):
-        self.cv.itemconfigure(self.pct_id, text="Loading… %d%%" % int(pct))
-        # One clean pass right -> left tied to the load %, so it runs through
-        # exactly once (no looping) and finishes just as the app appears. At 0%
-        # the logo is just barely peeking in at the right edge; the owl chases
-        # ~140px behind (entering from off-screen right). Both exit off the left
-        # edge by 100%.
-        p = pct / 100.0
-        gap = 100
-        logo_start = self.W + self.logo_w / 2 - 12   # ~12px sliver at right edge
-        owl_end = -self.owl_w / 2 - 10               # owl just off the left at 100%
-        logo_end = owl_end - gap                      # so the trailing owl clears too
-        logo_x = logo_start + (logo_end - logo_start) * p
-        owl_x = logo_x + gap
-        # slight hop as they run; owl bobs slightly out of phase with the logo
-        A = 8
-        logo_y = self.ground_y - A * abs(math.sin(frame * 0.30))
-        owl_y = self.ground_y - A * abs(math.sin(frame * 0.30 + 0.9))
-        self.cv.coords(self.logo_id, logo_x, logo_y)
-        self.cv.coords(self.owl_id, owl_x, owl_y)
-
-    def run(self, min_ms=1500):
-        import time
-        start = time.time()
-        frame = 0
-        while True:
-            elapsed = (time.time() - start) * 1000.0
-            self._render(min(100.0, elapsed / min_ms * 100.0), frame)
-            self.root.update()
-            if elapsed >= min_ms:
-                break
-            time.sleep(0.016)
-            frame += 1
-        self._render(100.0, frame)
-        self.root.update()
-
-    def close(self):
-        try:
-            self.win.destroy()
-        except Exception:
-            pass
-
-
 class _OpTimer:
     """Live elapsed-time display for an operation: a 'Total Time Elapsed' timer
     plus a per-file timer, shown as small stacked labels under a progress bar.
@@ -5753,6 +5675,8 @@ class _ProgressTracker:
 
 class ConverterApp:
     def __init__(self):
+        _splash_stage(85, 95)
+
         # Give the process its own AppUserModelID *before* the window exists so
         # Windows ties the taskbar button to our icon, not python/Tk's default.
         try:
@@ -5783,26 +5707,6 @@ class ConverterApp:
         self.root.minsize(860, 600)
         self.root.configure(bg=APP_BG)
         self._set_icon()
-
-        # Show an animated splash while we build the UI.
-        splash = None
-        try:
-            splash = _SplashScreen(self.root)
-        except Exception:
-            splash = None
-
-        # Close PyInstaller's built-in bootloader splash (shown during the
-        # one-file unpack) now that our own splash is on screen. This MUST be a
-        # static `import pyi_splash` — PyInstaller only bundles the pyi_splash
-        # runtime module when it sees a static import, so a dynamic import would
-        # leave it out of the build and the bootloader splash would never close
-        # (it then resurfaces on top of the app). The module is absent in
-        # dev/editor, hence the guard; the type-ignore silences that editor hint.
-        try:
-            import pyi_splash  # type: ignore
-            pyi_splash.close()
-        except Exception:
-            pass
 
         # PDF page state
         self.files    = []
@@ -5873,13 +5777,7 @@ class ConverterApp:
 
         self._build_shell()
         self._show_page("pdf")
-
-        # Run the splash animation, then reveal the main window.
-        if splash is not None:
-            try:
-                splash.run(min_ms=1500)
-            except Exception:
-                pass
+        _splash_stage(100, 100)
 
         # Reveal the main window fully painted *before* removing the splash, so
         # no blank/white frame shows in between: position it, map it invisible
@@ -5896,8 +5794,7 @@ class ConverterApp:
         except Exception:
             pass
         self.root.lift()
-        if splash is not None:
-            splash.close()
+        _splash_close()
 
     def _on_tk_error(self, exc, val, tb):
         """Handle an uncaught exception from any Tk callback: log the traceback
@@ -9287,7 +9184,12 @@ def _emit_version_and_exit(argv) -> bool:
 def main():
     if _emit_version_and_exit(sys.argv[1:]):
         return
-    app = ConverterApp()
+    try:
+        app = ConverterApp()
+    except BaseException:
+        # Don't leave "Loading…" sitting beside the crash dialog.
+        _splash_close()
+        raise
     app.run()
 
 
