@@ -14,6 +14,13 @@ Format is `## <version> — <YYYY-MM-DD>`, newest first. Prerelease sections are
 kept for the record but never shown in the app, which is only ever offered
 stable releases.
 
+## 1.8.3 — 2026-11-05
+
+- The app starts in about half the time.
+- The loading screen shows progress for the whole launch, and other windows can
+  now cover it.
+- Clear All also resets the output folder to the page's default.
+
 ## 1.8.2 — 2026-08-17
 
 - SQLite `.db` files convert to PDF, one sheet per table. Values are kept

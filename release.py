@@ -432,7 +432,7 @@ def main():
 
     run(["git", "add", "File.py"])
     msg = (f"Release {tag}\n\nBump APP_VERSION to {new}.\n\n"
-           f"Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n")
+           f"Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n")
     run(["git", "commit", "-m", msg])
     ok("committed")
     run(["git", "tag", tag])
