@@ -65,7 +65,7 @@ from collections import deque, namedtuple
 # decide whether an update exists. MUST be bumped before every release build —
 # leaving it stale makes the freshly-installed exe still believe it is the old
 # version, so it offers the same update forever.
-APP_VERSION = "1.8.4"
+APP_VERSION = "1.8.5"
 
 # The date APP_VERSION was published, shown beside it on the About & Updates
 # page. Deliberately baked into the build rather than fetched: it describes the
@@ -75,7 +75,7 @@ APP_VERSION = "1.8.4"
 # release.py writes this at the same moment it writes APP_VERSION, taking the
 # date from that version's CHANGELOG.md heading — the two must always describe
 # the same release, so they are bumped together rather than left to drift.
-APP_RELEASE_DATE = "2026-11-05"
+APP_RELEASE_DATE = "2026-11-19"
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
