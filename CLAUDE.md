@@ -222,6 +222,26 @@ has its own parallel pair (`_extract_*_attachments` → `_email_attachments_to_m
 into `<stem>_attachments`) which uses pure-Python `extract_msg` instead of COM and
 drops image attachments, since images are noise in a text extraction.
 
+**One shared `Attachments` folder, behind a switch.** Both PDF features have a
+`_ToggleSwitch` (`SHARED_ATTACHMENTS_TOGGLE_TEXT`) that saves every email's
+attachments into one `Attachments` folder in the output location, instead of a
+folder per email. Off is the default, which is the original layout. On the PDF page
+it is greyed out in modes that can't take an email. On Folder Unzipping it sits
+indented under auto-PDF and is greyed out while auto-PDF is off.
+`convert_file(..., attachments_dir=)` passes the folder down to both savers, and
+`None` means a folder per email. Every attachment is named through `_attachment_dest`,
+so `invoice.pdf` from two emails becomes `invoice.pdf` and `invoice_2.pdf`. That
+check is the only protection against overwriting, because Outlook's `SaveAsFile`
+overwrites silently. The two pages choose the folder differently, on purpose.
+The PDF page's `_shared_attachments_dir` *reuses* an existing `Attachments` folder,
+since output folders are reused between batches. `_unzip_worker` uses `_unique_dir`
+instead. Its output folder was empty when the run started, so an `Attachments`
+folder already there came out of an archive (`Attachments.zip`), and the run's
+attachments must not be mixed into the user's extracted files. Both savers create
+the folder only when the first attachment is written, and `_save_msg_attachments`
+only removes a folder that it created itself. AI Preparation's Markdown
+attachments are not affected.
+
 What was missing was the loop: `_auto_pdf_scan_and_convert` built its work list
 *once*, so attachments written during the run were never converted — the
 spreadsheet inside the email, which is usually the thing the user actually wanted,

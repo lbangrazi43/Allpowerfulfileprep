@@ -153,10 +153,56 @@ def _attachments_dir(out_path: Path) -> Path:
     return out_path.parent / out_path.stem
 
 
-def _save_eml_attachments(src_path: Path, out_path: Path) -> list:
+# The folder every email's attachments go into when the user turns on the
+# "one Attachments folder" switch, instead of a folder per email. Both PDF
+# features offer it: the PDF page and Folder Unzipping's auto-PDF.
+SHARED_ATTACHMENTS_FOLDER = "Attachments"
+SHARED_ATTACHMENTS_TOGGLE_TEXT = (
+    f"Put all email attachments in one \"{SHARED_ATTACHMENTS_FOLDER}\" folder"
+    f"  (otherwise one folder per email)")
+
+
+def _shared_attachments_dir(base: Path) -> Path:
+    """The shared attachments folder for PDFs written to `base`.
+
+    An existing folder of that name is reused, so a second batch into the same
+    output folder adds to it. Nothing is overwritten, because every attachment
+    is saved under a unique name (see _attachment_dest). Only when a *file*
+    holds the name does this move on to Attachments_2 and so on. The answer is
+    the same on every call, which matters on the PDF page: it asks once per
+    email, and two emails must not end up in two different folders.
+
+    Not created here. The savers create it when the first attachment is
+    written, so a batch with no attachments leaves no empty folder behind.
+    """
+    candidate = base / SHARED_ATTACHMENTS_FOLDER
+    counter = 2
+    while candidate.exists() and not candidate.is_dir():
+        candidate = base / f"{SHARED_ATTACHMENTS_FOLDER}_{counter}"
+        counter += 1
+    return candidate
+
+
+def _attachment_dest(att_dir: Path, fname: str) -> Path:
+    """Where to save attachment `fname` in att_dir without overwriting anything.
+
+    The shared folder collects attachments from a whole batch, and possibly
+    from earlier batches too, so two emails each carrying an invoice.pdf is
+    normal there. The second becomes invoice_2.pdf. Outlook's SaveAsFile
+    overwrites silently, so this check is the only protection.
+    """
+    name = Path(_safe_filename(fname))
+    return _unique_output_path(att_dir, name.stem, name.suffix)
+
+
+def _save_eml_attachments(src_path: Path, out_path: Path, att_dir=None) -> list:
     """
     Extract real (non-inline) attachments from a .eml file and save them
     into a subfolder named after the PDF. Returns the list of files written.
+
+    att_dir: save into this folder instead. It is the shared folder that
+    collects a whole batch's attachments (see _shared_attachments_dir), and it
+    is created on the first save if it doesn't exist yet.
 
     The caller gets paths rather than a count so auto-PDF can feed them back
     into its own conversion queue — see _auto_pdf_scan_and_convert.
@@ -177,7 +223,8 @@ def _save_eml_attachments(src_path: Path, out_path: Path) -> list:
         msg = emaillib.message_from_binary_file(f, policy=emaillib.policy.compat32)
 
     saved = []
-    att_dir = None
+    if att_dir is None:
+        att_dir = _attachments_dir(out_path)
 
     for part in msg.walk():
         if part.is_multipart():
@@ -202,24 +249,21 @@ def _save_eml_attachments(src_path: Path, out_path: Path) -> list:
             ext = ct.split("/")[-1].split(";")[0].strip()
             fname = f"attachment_{len(saved) + 1}.{ext}"
 
-        if att_dir is None:
-            att_dir = _attachments_dir(out_path)
-            att_dir.mkdir(parents=True, exist_ok=True)
-
-        dest = att_dir / _safe_filename(fname)
-        # Avoid overwriting if two attachments share a name
-        if dest.exists():
-            dest = att_dir / f"{dest.stem}_{len(saved) + 1}{dest.suffix}"
+        att_dir.mkdir(parents=True, exist_ok=True)
+        dest = _attachment_dest(att_dir, fname)
         dest.write_bytes(payload)
         saved.append(dest)
 
     return saved
 
 
-def _save_msg_attachments(mail, out_path: Path) -> list:
+def _save_msg_attachments(mail, out_path: Path, att_dir=None) -> list:
     """
     Extract attachments from an open Outlook COM mail item and save them
     into a subfolder named after the PDF. Returns the list of files written.
+
+    att_dir: save into this folder instead. It is the shared folder that
+    collects a whole batch's attachments (see _shared_attachments_dir).
 
     The caller gets paths rather than a count so auto-PDF can feed them back
     into its own conversion queue — see _auto_pdf_scan_and_convert.
@@ -233,7 +277,13 @@ def _save_msg_attachments(mail, out_path: Path) -> list:
     if count == 0:
         return []
 
-    att_dir = _attachments_dir(out_path)
+    if att_dir is None:
+        att_dir = _attachments_dir(out_path)
+    # Remembered so that only a folder made here is removed when nothing could
+    # be saved. The shared folder may already exist and hold earlier emails'
+    # attachments. rmdir would refuse a non-empty folder anyway, but an empty
+    # one the user made themselves is theirs to keep.
+    created_dir = not att_dir.exists()
     att_dir.mkdir(parents=True, exist_ok=True)
     saved = []
 
@@ -254,18 +304,14 @@ def _save_msg_attachments(mail, out_path: Path) -> list:
             except Exception:
                 pass
 
-            fname = _safe_filename(att.FileName or f"attachment_{i}")
-            dest = att_dir / fname
-            if dest.exists():
-                dest = att_dir / f"{dest.stem}_{i}{dest.suffix}"
-
+            dest = _attachment_dest(att_dir, att.FileName or f"attachment_{i}")
             att.SaveAsFile(str(dest.resolve()))
             saved.append(dest)
         except Exception:
             pass   # skip attachments that can't be saved
 
-    # Remove the folder if nothing was actually saved
-    if not saved:
+    # Remove the folder if this call made it and nothing was actually saved
+    if not saved and created_dir:
         try:
             att_dir.rmdir()
         except Exception:
@@ -382,16 +428,19 @@ def _fit_word_doc_to_page(doc, word):
             pass
 
 
-def _msg_to_pdf(src_path: Path, out_path: Path, outlook, word, attachments_out=None):
+def _msg_to_pdf(src_path: Path, out_path: Path, outlook, word, attachments_out=None,
+                attachments_dir=None):
     """Convert a .msg file to PDF and extract attachments via Outlook COM.
 
     attachments_out: optional list; the paths of every saved attachment are
     appended to it, so a caller can act on them (auto-PDF converts them too).
+    attachments_dir: the batch's shared attachments folder, or None for a
+    folder named after this email's PDF.
     """
     mail = outlook.Session.OpenSharedItem(str(src_path.resolve()))
     try:
         _print_mail_to_pdf(mail, out_path, word)
-        saved = _save_msg_attachments(mail, out_path)
+        saved = _save_msg_attachments(mail, out_path, attachments_dir)
         if attachments_out is not None:
             attachments_out.extend(saved)
     finally:
@@ -518,7 +567,8 @@ def _parse_eml_to_html(src_path: Path) -> str:
     return _inject_print_css(full_html)
 
 
-def _eml_to_pdf(src_path: Path, out_path: Path, word, attachments_out=None):
+def _eml_to_pdf(src_path: Path, out_path: Path, word, attachments_out=None,
+                attachments_dir=None):
     """
     Convert a .eml file to PDF and extract attachments.
     Parses the .eml directly in Python (no Outlook involvement) then
@@ -526,6 +576,8 @@ def _eml_to_pdf(src_path: Path, out_path: Path, word, attachments_out=None):
 
     attachments_out: optional list; the paths of every saved attachment are
     appended to it, so a caller can act on them (auto-PDF converts them too).
+    attachments_dir: the batch's shared attachments folder, or None for a
+    folder named after this email's PDF.
     """
     if word is None:
         raise RuntimeError(
@@ -570,8 +622,9 @@ def _eml_to_pdf(src_path: Path, out_path: Path, word, attachments_out=None):
                 pass
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # Extract attachments into a subfolder alongside the PDF
-    saved = _save_eml_attachments(src_path, out_path)
+    # Extract attachments into a subfolder alongside the PDF, or into the
+    # batch's shared folder when the user asked for one
+    saved = _save_eml_attachments(src_path, out_path, attachments_dir)
     if attachments_out is not None:
         attachments_out.extend(saved)
 
@@ -3099,7 +3152,7 @@ def _filetype_folder(ext: str) -> str:
 
 
 def convert_file(src_path: Path, out_dir: Path, mode: str, apps: dict, outlook=None,
-                 attachments_out=None) -> Path:
+                 attachments_out=None, attachments_dir=None) -> Path:
     """
     Convert a single file to PDF.
 
@@ -3117,6 +3170,9 @@ def convert_file(src_path: Path, out_dir: Path, mode: str, apps: dict, outlook=N
     attachments_out: optional list. Email mode appends the path of every
           attachment it saved beside the PDF, so a caller can act on them —
           auto-PDF queues them for conversion. Ignored by every other mode.
+    attachments_dir: email mode only. None saves each email's attachments in a
+          folder named after its PDF, which is the default. A path saves them
+          all into that one folder instead (see _shared_attachments_dir).
 
     Returns the path of the created PDF. Never overwrites an existing PDF.
     """
@@ -3128,9 +3184,10 @@ def convert_file(src_path: Path, out_dir: Path, mode: str, apps: dict, outlook=N
 
     if mode == "email":
         if ext == ".msg":
-            _msg_to_pdf(src_path, out_path, outlook, word, attachments_out)
+            _msg_to_pdf(src_path, out_path, outlook, word, attachments_out,
+                        attachments_dir)
         elif ext == ".eml":
-            _eml_to_pdf(src_path, out_path, word, attachments_out)
+            _eml_to_pdf(src_path, out_path, word, attachments_out, attachments_dir)
         else:
             raise ValueError(f"Unsupported file type for Email mode: {ext}")
     elif mode == "html":
@@ -3825,8 +3882,13 @@ def _expand_attached_archive(src: Path) -> list:
     return [p for p in dest.rglob("*") if p.is_file()]
 
 
-def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
+def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None,
+                               attachments_dir=None):
     """Convert each file in candidate_files to PDF.
+
+    attachments_dir: when set, every email's attachments are saved into this
+    one folder instead of a folder per email. That includes emails that were
+    themselves attachments. See _unzip_worker for how the folder is picked.
 
     candidate_files is the explicit list of files that were extracted from the
     zip(s). Only these are ever touched — unrelated files that happen to share
@@ -3987,6 +4049,7 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
                                 {f: _app(f) for f in mode_def.families},
                                 outlook,
                                 attachments_out=attachments,
+                                attachments_dir=attachments_dir,
                             )
 
                     # Only delete the original if the PDF was actually written
@@ -4034,12 +4097,14 @@ def _auto_pdf_scan_and_convert(candidate_files, status_cb, cancel_event=None):
 
 def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
                   status_cb, progress_cb, finish_cb, cancel_event=None,
-                  item_cb=None):
+                  item_cb=None, shared_attachments=False):
     """Thread worker: extract archives, handle flat vs structured output, then
     optionally auto-convert all non-PDF files to PDF.
 
     Accepts every format in ARCHIVE_EXTS, mixed freely in one batch.
     cancel_event: optional threading.Event; when set, stop before the next item.
+    shared_attachments: auto-PDF saves every email's attachments into one
+    Attachments folder in output_dir rather than a folder per email.
     """
     def cancelled():
         return cancel_event is not None and cancel_event.is_set()
@@ -4113,7 +4178,15 @@ def _unzip_worker(zip_paths, output_dir, separate_folders, auto_pdf,
     pdf_failed = []
     if auto_pdf and success > 0 and not cancelled():
         status_cb("Auto-PDF: converting extracted files…")
-        pdf_failed = _auto_pdf_scan_and_convert(extracted_files, status_cb, cancel_event)
+        # The output folder was empty when the run started, so an Attachments
+        # folder already there came out of an archive (Attachments.zip, say).
+        # Those are the user's own files, so this run's attachments get a new
+        # folder of their own, Attachments_2, instead of being mixed in.
+        # Unlike _shared_attachments_dir, this never reuses an existing folder.
+        att_dir = (_unique_dir(output_dir, SHARED_ATTACHMENTS_FOLDER)
+                   if shared_attachments else None)
+        pdf_failed = _auto_pdf_scan_and_convert(extracted_files, status_cb, cancel_event,
+                                                attachments_dir=att_dir)
 
     finish_cb(success, failed, pdf_failed, protected)
 
@@ -6136,6 +6209,17 @@ class ConverterApp:
             padx=8, pady=2, cursor="hand2",
         ).pack(side="left", padx=4)
 
+        # Email attachments: one shared folder, or a folder per email
+        att_frame = tk.Frame(parent, bg=APP_BG)
+        att_frame.pack(fill="x", padx=18, pady=(6, 2))
+        self._pdf_shared_att = tk.BooleanVar(value=False)
+        self._pdf_att_toggle = _ToggleSwitch(
+            att_frame, text=SHARED_ATTACHMENTS_TOGGLE_TEXT,
+            variable=self._pdf_shared_att,
+        )
+        self._pdf_att_toggle.pack(side="left")
+        self._pdf_sync_att_toggle()
+
         # Progress bar
         self.progress = ttk.Progressbar(parent, mode="determinate")
         self.progress.pack(fill="x", padx=18, pady=(4, 2))
@@ -6302,7 +6386,22 @@ class ConverterApp:
             uz_autopdf_frame,
             text="Auto-convert files to PDF after unzipping  (originals deleted on success)",
             variable=self._uz_auto_pdf,
+            command=self._uz_sync_att_toggle,
         ).pack(side="left")
+
+        # Email attachments: a sub-option of auto-PDF, which is the only part of
+        # this page that converts emails. The extra 40px of left padding (the
+        # switch's width plus its label gap) lines this switch up under the
+        # label above it.
+        uz_att_frame = tk.Frame(parent, bg=APP_BG)
+        uz_att_frame.pack(fill="x", padx=(58, 18), pady=(2, 2))
+        self._uz_shared_att = tk.BooleanVar(value=False)
+        self._uz_att_toggle = _ToggleSwitch(
+            uz_att_frame, text=SHARED_ATTACHMENTS_TOGGLE_TEXT,
+            variable=self._uz_shared_att,
+        )
+        self._uz_att_toggle.pack(side="left")
+        self._uz_sync_att_toggle()
 
         # Progress bar
         self._uz_progress = ttk.Progressbar(parent, mode="determinate")
@@ -6343,6 +6442,12 @@ class ConverterApp:
         )
         self._uz_cancel_btn.pack(side="left", padx=(10, 0))
         self._set_cancel_state(self._uz_cancel_btn, False)
+
+    def _uz_sync_att_toggle(self):
+        """The attachments switch only matters when auto-PDF is converting
+        emails, so it is greyed out while auto-PDF is off."""
+        self._uz_att_toggle.config(
+            state="normal" if self._uz_auto_pdf.get() else "disabled")
 
     def _uz_add_files(self):
         paths = filedialog.askopenfilenames(
@@ -6448,6 +6553,7 @@ class ConverterApp:
         self._uz_tracker.start(len(self._zip_files))
         separate  = self._uz_separate.get()
         auto_pdf  = self._uz_auto_pdf.get()
+        shared_att = self._uz_shared_att.get()
         self._uz_timer.start()
         threading.Thread(
             target=_unzip_worker,
@@ -6462,6 +6568,7 @@ class ConverterApp:
                 self._cancel_unzip,
                 lambda name: (self._uz_timer.set_file(name), self._uz_tracker.begin_item()),
             ),
+            kwargs={"shared_attachments": shared_att},
             daemon=True,
         ).start()
 
@@ -8730,6 +8837,16 @@ class ConverterApp:
         # Clear files when mode changes — they may be wrong type
         self._clear_files()
         self._update_drop_label()
+        self._pdf_sync_att_toggle()
+
+    def _pdf_sync_att_toggle(self):
+        """Grey out the attachments switch in modes that can't take an email,
+        since it has nothing to act on there. It keeps its setting, so it is
+        still set when the user switches back to Email or All Types."""
+        mode = self._current_mode()
+        takes_email = any(_mode_takes_ext(mode, ext)
+                          for ext in PDF_MODE_BY_KEY["email"].exts)
+        self._pdf_att_toggle.config(state="normal" if takes_email else "disabled")
 
     # ── file management ──────────────────────
     def _add_files(self):
@@ -8881,6 +8998,9 @@ class ConverterApp:
         # Read once: Clear All can reset this while a file is being set up, and
         # that must not send the file somewhere other than the folder chosen.
         chosen_out = self._out_dir
+        # Also read once, so flipping the switch mid-run can't split one
+        # batch's attachments across two layouts.
+        shared_att = self._pdf_shared_att.get()
         # The mixed-batch mode owns no converter: each file is routed by its own
         # extension, and the applications it needs are started lazily as those
         # files come up rather than all at once up front.
@@ -9044,11 +9164,16 @@ class ConverterApp:
                 # really part of it, so EXTRACT.20260813 and EXTRACT.20260814
                 # don't both land on EXTRACT.pdf.
                 out_path = _unique_pdf_path(out_dir, _pdf_stem_for(src))
+                # With "Same as source file", files from different folders get
+                # an Attachments folder each, next to their own PDFs.
+                att_dir = (_shared_attachments_dir(out_dir)
+                           if shared_att and file_mode.key == "email" else None)
                 # Bound this file so one stuck conversion can't hang the batch.
                 wd = _FileWatchdog(self._pdf_app_pids)
                 try:
                     with wd:
-                        convert_file(src, out_dir, file_mode.key, file_apps, outlook)
+                        convert_file(src, out_dir, file_mode.key, file_apps, outlook,
+                                     attachments_dir=att_dir)
                     success += 1
                 except Exception as exc:
                     # Drop any partial PDF a force-kill may have left behind.
