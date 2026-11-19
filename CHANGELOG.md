@@ -16,8 +16,13 @@ stable releases.
 
 ## 1.8.5 — 2026-11-19
 
-- PDF Conversion and Folder Unzipping can put all email attachments in one
-  "Attachments" folder instead of a folder per email.
+- To put all email attachments in one "Attachments" folder instead of a folder
+  per email, turn on the new switch below the output folder on PDF Conversion,
+  or below the auto-convert switch on Folder Unzipping.
+- Pictures inside an email, like signature icons and logos, now show in the PDF
+  and are no longer saved as separate attachments.
+- Attachments with the same name are saved as name_2, name_3 and so on, instead
+  of replacing each other.
 
 ## 1.8.4 — 2026-11-05
 

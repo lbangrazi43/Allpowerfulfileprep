@@ -216,11 +216,43 @@ without returning PIDs to track is a bug, not a shortcut.
 **Email attachments, and auto-PDF's work queue.** The email converters have
 always extracted attachments beside the PDF — `_save_msg_attachments` (Outlook
 COM, skipping `olEmbeddeditem`/`olOLE`) and `_save_eml_attachments` (pure Python,
-skipping body parts and inline images by Content-ID) write into
+skipping body parts) write into
 `_attachments_dir(out_path)`, i.e. a folder named after the PDF. AI Preparation
 has its own parallel pair (`_extract_*_attachments` → `_email_attachments_to_markdown`,
 into `<stem>_attachments`) which uses pure-Python `extract_msg` instead of COM and
 drops image attachments, since images are noise in a text extraction.
+
+**Images in the body are not attachments.** To a mail file, signature icons,
+logos and screenshots pasted into the body are attachments like any other. The
+body shows them through `cid:` links to their Content-ID. Both savers follow one
+rule: **an image is left out only when the body links to it, and the PDF then
+draws it in place**. Anything else is extracted, so nothing can be missing from
+both. Each email type keeps the renderer and the saver reading the same links
+(`_CID_REF_RE`, `_norm_cid`, `_cid_refs`). If they disagreed, an image could be
+neither drawn nor extracted.
+- **`.msg`:** `_msg_body_image_cid` is the test. It needs an image with a
+  Content-ID (`PR_ATTACH_CONTENT_ID` via `PropertyAccessor`) that `HTMLBody`
+  actually links to. A Content-ID alone is not enough, because Outlook on iOS
+  and Mac give ordinary attached photos one too. Until the fix (shipped in a
+  same-day rebuild of 1.8.5; the first 1.8.5 build lacks it) the `.msg` PDF drew
+  none of these images: `_mail_to_pdf_via_word` handed Word the raw
+  `HTMLBody`, whose `cid:` links only Outlook can follow, so each picture was a
+  4×5-pixel broken box. The extracted copy was the only one. Now
+  `_msg_resolve_body_images` saves them beside the temp HTML and relinks them by
+  file name. Without that step, skipping them in the saver would delete pasted
+  screenshots from the output entirely.
+- **`.eml`:** `_save_eml_attachments` skips an image the first HTML part links
+  to, whatever its `Content-Disposition` says, since some mailers label body
+  images `attachment`. `_parse_eml_to_html` draws from that same first HTML part,
+  as data URIs, which Word renders. The old test skipped any image that had a
+  Content-ID and wasn't labelled `attachment`, even when the body never showed it.
+  Such images were in neither the PDF nor the extracted files, and are now
+  extracted.
+
+Verified with `pdfminer`, comparing the pixel sizes of the images in the output
+PDF. Counting images isn't enough, because the broken boxes count too. The
+`.msg` side was tested with a stand-in mail object rendered through a real Word,
+not with a `.msg` opened in Outlook.
 
 **One shared `Attachments` folder, behind a switch.** Both PDF features have a
 `_ToggleSwitch` (`SHARED_ATTACHMENTS_TOGGLE_TEXT`) that saves every email's

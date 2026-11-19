@@ -195,6 +195,125 @@ def _attachment_dest(att_dir: Path, fname: str) -> Path:
     return _unique_output_path(att_dir, name.stem, name.suffix)
 
 
+# ── Images in the body vs. real attachments ────────────────────────────────
+# An HTML email shows a picture in its body by pointing at one of its own parts
+# by Content-ID: <img src="cid:image001.png@01DB3A2C.5F1E0B20">. Signature icons,
+# logos and screenshots pasted into the body all work this way, and to a mail
+# file they are attachments like any other. The rule both email types follow:
+# an image is left out of the extracted attachments only when the body displays
+# it, and the PDF then draws it in place. Everything else is extracted, so
+# nothing can drop out of both.
+#
+# The value of a cid: link runs to the closing quote, whitespace, > or ).
+_CID_REF_RE = re.compile(r"""cid:([^"'\s>)]+)""", re.IGNORECASE)
+
+# MAPI properties read off an Outlook attachment through its PropertyAccessor.
+_PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+_PR_ATTACH_MIME_TAG   = "http://schemas.microsoft.com/mapi/proptag/0x370E001F"
+
+
+def _norm_cid(value) -> str:
+    """A Content-ID in the form used for comparison.
+
+    The header writes <id@host>, the body writes cid:id@host, and either may
+    URL-escape it or change its case, so all of that is removed before comparing.
+    """
+    from urllib.parse import unquote
+    return unquote(str(value or "")).strip().strip("<>").strip().lower()
+
+
+def _cid_refs(html) -> set:
+    """The Content-IDs of every image an HTML email body displays. Never holds
+    "", so an attachment with no Content-ID can't match a malformed link."""
+    return {c for c in map(_norm_cid, _CID_REF_RE.findall(html or "")) if c}
+
+
+def _is_image_name(fname, mime="") -> bool:
+    """Whether an attachment is a picture, by its extension or MIME type."""
+    return (Path(str(fname or "")).suffix.lower() in IMAGE_EXTS
+            or str(mime or "").lower().startswith("image/"))
+
+
+def _msg_att_prop(att, tag):
+    """One MAPI property of an Outlook attachment, or None when it isn't set.
+    GetProperty raises for a missing property rather than returning empty."""
+    try:
+        return att.PropertyAccessor.GetProperty(tag)
+    except Exception:
+        return None
+
+
+def _msg_body_image_cid(att, body_cids) -> str:
+    """The Content-ID by which the email body displays this attachment, or ""
+    when it is a real attachment.
+
+    Only an image qualifies, and only when it has a Content-ID that the body
+    actually links to. Having a Content-ID is not enough on its own: Outlook on
+    iOS and Mac give ordinary attached photos one too, and those must still be
+    extracted. A file that isn't an image is always a real attachment.
+    """
+    try:
+        if att.Type in (5, 6):          # olEmbeddeditem, olOLE: never body images
+            return ""
+    except Exception:
+        pass
+    cid = _norm_cid(_msg_att_prop(att, _PR_ATTACH_CONTENT_ID))
+    if not cid or cid not in body_cids:
+        return ""
+    try:
+        fname = att.FileName
+    except Exception:
+        fname = ""
+    if not _is_image_name(fname, _msg_att_prop(att, _PR_ATTACH_MIME_TAG)):
+        return ""
+    return cid
+
+
+def _msg_resolve_body_images(mail, html: str, folder: Path) -> str:
+    """Point the body's cid: image links at copies saved in `folder`.
+
+    Outlook's HTMLBody refers to the pictures in the body by Content-ID, a link
+    only Outlook can follow. Written to disk for Word, each one was drawn as a
+    broken-picture box, so signature icons and pasted screenshots were missing
+    from every .msg PDF. They were saved only as extracted attachments. Saving
+    them beside the temp HTML and linking to them by file name puts them in the
+    PDF, which is what lets _save_msg_attachments leave them out. An image that
+    can't be saved here keeps its broken link. The saver would have hit the same
+    SaveAsFile failure, and it has always skipped attachments it can't save.
+    """
+    import mimetypes
+    body_cids = _cid_refs(html)
+    if not body_cids:
+        return html
+    try:
+        attachments = mail.Attachments
+        count = attachments.Count
+    except Exception:
+        return html
+    local = {}
+    for i in range(1, count + 1):
+        try:
+            att = attachments.Item(i)
+            cid = _msg_body_image_cid(att, body_cids)
+            if not cid or cid in local:
+                continue
+            # Named here rather than after the attachment, so the link needs no
+            # escaping. Word reads the picture by its extension.
+            ext = Path(str(att.FileName or "")).suffix.lower()
+            if not re.fullmatch(r"\.[a-z0-9]{1,5}", ext):
+                ext = (mimetypes.guess_extension(
+                    str(_msg_att_prop(att, _PR_ATTACH_MIME_TAG) or "")) or ".png")
+            dest = folder / f"body_image_{i}{ext}"
+            att.SaveAsFile(str(dest.resolve()))
+            local[cid] = dest.name
+        except Exception:
+            continue
+    if not local:
+        return html
+    return _CID_REF_RE.sub(
+        lambda m: local.get(_norm_cid(m.group(1)), m.group(0)), html)
+
+
 def _save_eml_attachments(src_path: Path, out_path: Path, att_dir=None) -> list:
     """
     Extract real (non-inline) attachments from a .eml file and save them
@@ -226,17 +345,30 @@ def _save_eml_attachments(src_path: Path, out_path: Path, att_dir=None) -> list:
     if att_dir is None:
         att_dir = _attachments_dir(out_path)
 
+    # The images the body displays. _parse_eml_to_html draws them in the PDF
+    # from the same body (the first HTML part), so they aren't extracted. That
+    # holds whatever the part's Content-Disposition says: some mail programs
+    # label a signature icon "attachment" even though the body shows it.
+    body_cids = set()
+    for part in msg.walk():
+        if (part.get_content_type() == "text/html"
+                and "attachment" not in str(part.get("Content-Disposition") or "")):
+            payload = part.get_payload(decode=True) or b""
+            # latin-1 never fails, and a cid: link is plain ASCII in any charset.
+            body_cids = _cid_refs(payload.decode("latin-1"))
+            break
+
     for part in msg.walk():
         if part.is_multipart():
             continue
         ct  = part.get_content_type()
         cd  = str(part.get("Content-Disposition") or "")
-        cid = part.get("Content-ID", "").strip("<>")
+        cid = part.get("Content-ID", "")
 
-        # Skip inline images (embedded in the body) and body text parts
-        is_inline_image = ct.startswith("image/") and cid and "attachment" not in cd
+        # Skip images the body shows (they're in the PDF) and body text parts
+        is_body_image = ct.startswith("image/") and _norm_cid(cid) in body_cids
         is_body = ct in ("text/html", "text/plain") and "attachment" not in cd
-        if is_inline_image or is_body:
+        if is_body_image or is_body:
             continue
 
         payload = part.get_payload(decode=True)
@@ -287,9 +419,18 @@ def _save_msg_attachments(mail, out_path: Path, att_dir=None) -> list:
     att_dir.mkdir(parents=True, exist_ok=True)
     saved = []
 
+    # Images the body displays (signature icons, logos, pasted screenshots) are
+    # drawn in the PDF by _msg_resolve_body_images, so they aren't extracted.
+    try:
+        body_cids = _cid_refs(mail.HTMLBody)
+    except Exception:
+        body_cids = set()
+
     for i in range(1, count + 1):   # COM collections are 1-indexed
         try:
             att = attachments.Item(i)
+            if _msg_body_image_cid(att, body_cids):
+                continue
 
             # OlAttachmentType: 1 olByValue, 4 olByReference,
             # 5 olEmbeddeditem, 6 olOLE.
@@ -498,21 +639,22 @@ def _parse_eml_to_html(src_path: Path) -> str:
             html_body = _decode(part)
         elif ct == "text/plain" and "attachment" not in cd and plain_body is None:
             plain_body = _decode(part)
-        elif ct.startswith("image/") and cid:
+        elif ct.startswith("image/") and _norm_cid(cid):
             payload = part.get_payload(decode=True)
             if payload:
                 b64 = base64.b64encode(payload).decode()
-                cid_map[cid] = f"data:{ct};base64,{b64}"
+                cid_map[_norm_cid(cid)] = f"data:{ct};base64,{b64}"
         elif "attachment" in cd:
             fname = part.get_filename() or "attachment"
             attachments.append(decode_str(fname))
 
-    # Inline CID images
+    # Inline CID images. Matched link by link, through the same parsing
+    # _save_eml_attachments uses to decide what not to extract. If the two
+    # disagreed, an image could end up neither drawn nor extracted. The old
+    # substring replace also let cid:img1 rewrite the front of cid:img10.
     if html_body and cid_map:
-        for cid, data_uri in cid_map.items():
-            html_body = re.sub(
-                re.escape(f"cid:{cid}"), data_uri, html_body, flags=re.IGNORECASE
-            )
+        html_body = _CID_REF_RE.sub(
+            lambda m: cid_map.get(_norm_cid(m.group(1)), m.group(0)), html_body)
 
     # Build header block
     def hrow(label, value):
@@ -683,6 +825,9 @@ def _mail_to_pdf_via_word(mail, out_path: Path, word) -> bool:
                 plain_body = mail.Body
             except Exception:
                 pass
+        else:
+            # Without this the body's pictures are broken-picture boxes.
+            html_body = _msg_resolve_body_images(mail, html_body, tmp_dir)
 
         def safe_get(attr):
             try:
